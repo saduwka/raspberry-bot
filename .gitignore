@@ -1,0 +1,17 @@
+# Секреты
+.env
+
+# База данных и логи
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.log.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Архив
+archive/
