@@ -205,9 +205,3 @@ async def check_price(url):
             return price, "OLX (Категория)", items
         return await get_olx_price(url), "OLX", None
     return None, None, None
-
-def get_kaspi_category_cheapest(url):
-    # This was used in some parts but we should migrate to check_price or async
-    # For compatibility during migration I'll leave it as a wrapper if needed, 
-    # but bot.py should use await check_price
-    pass

@@ -289,3 +289,17 @@ async def save_price_alert(watch_id, price, item_name, item_url):
                              (watch_id, price, item_name, item_url))
             await db.commit()
     await log_event("price_alert", {"watch_id": watch_id, "price": price})
+
+async def cleanup_old_data():
+    """Чистит старые записи чтобы не раздувать память и БД."""
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            # Логи здоровья старше 7 дней
+            await db.execute("DELETE FROM events_log WHERE created_at < datetime('now', '-7 days')")
+            # Pending новости старше 3 дней (уже не актуальны)
+            await db.execute("DELETE FROM pending WHERE created_at < datetime('now', '-3 days')")
+            # Posted старше 60 дней (для дедупликации достаточно 60 дней)
+            await db.execute("DELETE FROM posted WHERE posted_at < datetime('now', '-60 days')")
+            await db.commit()
+            logger.info("Database cleanup completed.")

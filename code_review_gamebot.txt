@@ -1,0 +1,85 @@
+Code Review: GameBot v2.0
+=========================
+
+🟢 ЧТО ХОРОШО
+--------------
+
+Архитектура — модули разделены логично: bot.py (handlers), jobs.py (background tasks),
+database.py (data layer), price_monitor.py (scraping), ai_utils.py (AI). Чисто.
+
+database.py — глобальный db_lock + WAL везде + aiosqlite — правильно, именно так
+избегают "database is locked" на RPi.
+
+ai_utils.py — extract_json с исправлением умных кавычек и запятых перед } — умно,
+Gemini часто это ломает. 3 retry — правильно.
+
+price_monitor.py — rate limiting через _wait() с random.uniform, multiple fallback
+стратегии парсинга (meta tags → JSON-LD → CSS classes) — профессионально.
+
+
+🟡 ЗАМЕЧАНИЯ
+------------
+
+1. config.py — ADMIN_ID хардкодится как fallback:
+
+   БЫЛО:
+   ADMIN_ID = int(os.getenv("ADMIN_ID", "67044176"))
+
+   Твой реальный Telegram ID торчит в публичном репо. Убери дефолт:
+   ADMIN_ID = int(os.getenv("ADMIN_ID"))
+
+
+2. bot.py — save_pending не импортирован:
+
+   В callback_handler используется:
+       pid = await save_pending(...)
+   Но в импортах bot.py его нет!
+
+   Это баг — при нажатии "🔍 Новости" через callback упадёт с NameError.
+
+
+3. database.py — db_lock не используется в jobs.py и bot.py:
+
+   В jobs.py и bot.py есть прямые подключения к БД без db_lock:
+       async with aiosqlite.connect(DB_PATH, timeout=30) as db:  # bot.py, process_edit_price_step
+
+   Весь смысл db_lock теряется если часть кода его не использует.
+
+
+4. price_monitor.py — мёртвый код:
+
+   def get_kaspi_category_cheapest(url):
+       # This was used in some parts...
+       pass
+
+   Можно удалить.
+
+
+5. __pycache__ в репо — папка уже закоммичена, удалить:
+
+   git rm -r --cached __pycache__
+   git commit -m "remove pycache"
+
+
+🔴 КРИТИЧНО
+-----------
+
+Баг с импортом save_pending в bot.py — реальная ошибка которая может сломать
+кнопку новостей. Проверь работает ли она сейчас.
+
+Фикс — добавить в импорты bot.py:
+    from database import (
+        ...
+        save_pending,   # <-- добавить
+        ...
+    )
+
+
+ИТОГ
+----
+
+Код качественный, видно что рефакторился. Основное что стоит пофиксить:
+  - Убрать ADMIN_ID из дефолтов в config.py
+  - Пофиксить импорт save_pending в bot.py
+  - Прогнать db_lock через весь код единообразно
+  - Удалить мёртвый код и __pycache__ из репо

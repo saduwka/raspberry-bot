@@ -479,6 +479,7 @@ def main():
     jq.run_daily(fetch_job, time=dt_time(9, 0, tzinfo=ALMATY_TZ))
     jq.run_daily(fetch_job, time=dt_time(15, 0, tzinfo=ALMATY_TZ))
     jq.run_daily(fetch_job, time=dt_time(21, 0, tzinfo=ALMATY_TZ))
+    jq.run_daily(lambda ctx: asyncio.create_task(cleanup_old_data()), time=dt_time(4, 0, tzinfo=ALMATY_TZ))
     jq.run_daily(send_weekly_digest, time=dt_time(20, 0, tzinfo=ALMATY_TZ), days=(6,))
     jq.run_repeating(price_check_job, interval=1200, first=60)
     jq.run_repeating(send_price_digest, interval=1800, first=90)
