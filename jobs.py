@@ -7,6 +7,8 @@ import psutil
 import json
 import feedparser
 import httpx
+import gc
+from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
@@ -70,17 +72,21 @@ def get_uptime():
         return "N/A"
 
 def get_stats():
-    cpu = psutil.cpu_percent(interval=1)
+    # interval=None не блокирует поток
+    cpu = psutil.cpu_percent(interval=None)
     ram = psutil.virtual_memory()
     disk = psutil.disk_usage("/")
     temp = get_cpu_temp()
     _, throttled = get_throttled_data()
     uptime = get_uptime()
-    ram_used = ram.used // (1024 * 1024)
+    
+    # Используем available вместо used для более точного понимания свободной памяти на Linux
+    ram_used = (ram.total - ram.available) // (1024 * 1024)
     ram_total = ram.total // (1024 * 1024)
     disk_used = disk.used // (1024 * 1024 * 1024)
     disk_total = disk.total // (1024 * 1024 * 1024)
     temp_display = f"{temp}°C" if temp is not None else "N/A"
+    
     return (
         f"🖥 <b>Состояние малинки</b>\n\n"
         f"🌡 Температура: <code>{temp_display}</code>\n"
@@ -118,48 +124,54 @@ async def check_health_alert(context: ContextTypes.DEFAULT_TYPE):
 async def price_check_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Checking prices...")
     watches = await get_watches()
-    for watch in watches:
-        watch_id, user_id, name, url, target_price, last_price, service = watch
-        current_price, srv_type, items = await price_monitor.check_price(url)
-        
-        if items: # Категория
-            new_items_count = 0
-            for item in items:
-                if item['price'] <= target_price:
-                    if not await is_posted(item['url']):
-                        await save_price_alert(watch_id, item['price'], item['name'], item['url'])
-                        await mark_posted(item['url'])
-                        new_items_count += 1
+    if not watches:
+        return
+
+    async with httpx.AsyncClient(headers=price_monitor.HEADERS, timeout=15) as client:
+        for watch in watches:
+            watch_id, user_id, name, url, target_price, last_price, service = watch
+            current_price, srv_type, items = await price_monitor.check_price(url, client=client)
             
-            if new_items_count > 0:
-                logger.info(f"Saved {new_items_count} alerts for {name}")
-            
-            if current_price is not None:
-                await update_watch_price(watch_id, current_price)
-        
-        elif current_price is not None: # Одиночный товар
-            if last_price is None or current_price != last_price:
-                await update_watch_price(watch_id, current_price)
+            if items: # Категория
+                new_items_count = 0
+                for item in items:
+                    if item['price'] <= target_price:
+                        if not await is_posted(item['url']):
+                            await save_price_alert(watch_id, item['price'], item['name'], item['url'])
+                            await mark_posted(item['url'])
+                            new_items_count += 1
                 
-                if current_price <= target_price:
-                    await save_price_alert(watch_id, current_price, name, url)
-                    safe_name = html.escape(name)
-                    safe_service = html.escape(srv_type or service)
-                    safe_url = html.escape(url)
-                    text = (f"🎯 <b>Цена упала!</b> ({safe_service})\n\n"
-                            f"📦 {safe_name}\n"
-                            f"💰 Текущая цена: <code>{current_price}</code>\n"
-                            f"📉 Цель: <code>{target_price}</code>\n\n"
-                            f"🔗 {safe_url}")
-                    try:
-                        await context.bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
-                        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-                            await db.execute("PRAGMA journal_mode=WAL")
-                            await db.execute("UPDATE price_alerts SET sent_at=CURRENT_TIMESTAMP WHERE watch_id=? AND sent_at IS NULL", (watch_id,))
-                            await db.commit()
-                    except Exception as e:
-                        logger.error(f"Error sending drop notification: {e}")
-        await asyncio.sleep(2)
+                if new_items_count > 0:
+                    logger.info(f"Saved {new_items_count} alerts for {name}")
+                
+                if current_price is not None:
+                    await update_watch_price(watch_id, current_price)
+            
+            elif current_price is not None: # Одиночный товар
+                if last_price is None or current_price != last_price:
+                    await update_watch_price(watch_id, current_price)
+                    
+                    if current_price <= target_price:
+                        await save_price_alert(watch_id, current_price, name, url)
+                        safe_name = html.escape(name)
+                        safe_service = html.escape(srv_type or service)
+                        safe_url = html.escape(url)
+                        text = (f"🎯 <b>Цена упала!</b> ({safe_service})\n\n"
+                                f"📦 {safe_name}\n"
+                                f"💰 Текущая цена: <code>{current_price}</code>\n"
+                                f"📉 Цель: <code>{target_price}</code>\n\n"
+                                f"🔗 {safe_url}")
+                        try:
+                            await context.bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
+                            async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+                                await db.execute("PRAGMA journal_mode=WAL")
+                                await db.execute("UPDATE price_alerts SET sent_at=CURRENT_TIMESTAMP WHERE watch_id=? AND sent_at IS NULL", (watch_id,))
+                                await db.commit()
+                        except Exception as e:
+                            logger.error(f"Error sending drop notification: {e}")
+            await asyncio.sleep(2)
+    
+    gc.collect() # Очистка после цикла мониторинга
 
 async def send_price_digest(context: ContextTypes.DEFAULT_TYPE):
     async with aiosqlite.connect(DB_PATH, timeout=30) as db:
@@ -206,7 +218,6 @@ async def send_price_digest(context: ContextTypes.DEFAULT_TYPE):
 async def is_gaming(text):
     text_lower = text.lower()
     keywords = await get_gaming_keywords()
-    # Если база пуста, считаем всё игровым (или можно оставить дефолт)
     if not keywords:
         return True 
     return any(kw in text_lower for kw in keywords)
@@ -225,10 +236,37 @@ def get_image_from_entry(entry):
         return summary[start:end]
     return None
 
+async def fetch_full_content(client, url):
+    """Пытается получить полный текст статьи, если RSS-описание слишком короткое."""
+    try:
+        # Устанавливаем таймаут чуть больше для парсинга
+        r = await client.get(url, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, 'html.parser')
+        
+        # Удаляем мусор
+        for s in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'form', 'iframe']):
+            s.decompose()
+            
+        # Собираем осмысленные абзацы
+        paragraphs = soup.find_all('p')
+        text = "\n".join([p.get_text().strip() for p in paragraphs if len(p.get_text().strip()) > 30])
+        
+        if len(text) < 100: # Если совсем мало текста, попробуем поискать в div.content и т.п. (упрощенно)
+            content = soup.find(['article', 'main', 'div[class*="content"]'])
+            if content:
+                text = content.get_text(separator="\n").strip()
+        
+        return text[:4000] # Больше Gemini и не надо
+    except Exception as e:
+        logger.debug(f"Scrape error for {url}: {e}")
+        return ""
+
 async def fetch_single_feed(client, feed_url, keywords):
     try:
         response = await client.get(feed_url, timeout=10)
         response.raise_for_status()
+        # parse теперь работает со строкой, а не делает сетевой запрос сам
         feed = feedparser.parse(response.text)
         results = []
         for entry in feed.entries[:5]:
@@ -238,10 +276,15 @@ async def fetch_single_feed(client, feed_url, keywords):
             if not url or await is_posted(url) or await is_pending(url):
                 continue
             
-            # Проверка ключевых слов
             text_to_check = (title + " " + summary).lower()
             if keywords and not any(kw in text_to_check for kw in keywords):
                 continue
+            
+            # Если описание короткое, попробуем вытянуть больше данных из самой статьи
+            if len(summary) < 400:
+                full_text = await fetch_full_content(client, url)
+                if full_text and len(full_text) > len(summary):
+                    summary = full_text
                 
             image_url = get_image_from_entry(entry)
             results.append({"title": title, "url": url, "summary": summary, "image_url": image_url})
@@ -258,8 +301,15 @@ async def fetch_news():
         logger.warning("No RSS feeds configured in database.")
         return []
 
-    async with httpx.AsyncClient(headers={"User-Agent": "GameBot/1.0"}) as client:
-        tasks = [fetch_single_feed(client, url, keywords) for url in feeds]
+    # Семафор на 3 одновременных запроса, чтобы не забивать память
+    sem = asyncio.Semaphore(3)
+
+    async def sem_fetch(client, url, keywords):
+        async with sem:
+            return await fetch_single_feed(client, url, keywords)
+
+    async with httpx.AsyncClient(headers={"User-Agent": "GameBot/1.0"}, timeout=15) as client:
+        tasks = [sem_fetch(client, url, keywords) for url in feeds]
         results = await asyncio.gather(*tasks)
     
     news = [item for sublist in results for item in sublist]
@@ -269,6 +319,8 @@ async def fetch_news():
         if item['url'] not in seen_urls:
             unique_news.append(item)
             seen_urls.add(item['url'])
+    
+    gc.collect() # Очистка после сбора новостей
     return unique_news
 
 async def process_and_filter_news(bot, item):
@@ -308,7 +360,8 @@ async def fetch_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Fetching news...")
     news = await fetch_news()
     count = 0
-    for item in news[:5]:
+    # Берем больше новостей на проверку (до 15), но не больше 8 за раз
+    for item in news[:15]:
         processed_text = await process_and_filter_news(context.bot, item)
         if not processed_text:
             continue
@@ -317,7 +370,9 @@ async def fetch_job(context: ContextTypes.DEFAULT_TYPE):
         await send_for_approval(context.bot, item, processed_text, pending_id)
         count += 1
         await asyncio.sleep(2)
-        if count >= 3: break
+        if count >= 8: break
+    
+    gc.collect()
 
 async def post_to_channel(bot, pending_id):
     item = await get_pending(pending_id)
@@ -397,3 +452,5 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Error sending weekly digest: {e}")
+    finally:
+        gc.collect()

@@ -290,6 +290,19 @@ async def save_price_alert(watch_id, price, item_name, item_url):
             await db.commit()
     await log_event("price_alert", {"watch_id": watch_id, "price": price})
 
+async def update_target_price(watch_id, new_price):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("UPDATE watches SET target_price=? WHERE id=?", (new_price, watch_id))
+            await db.commit()
+
+async def get_watch_info(watch_id):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("SELECT name, target_price FROM watches WHERE id=?", (watch_id,)) as cursor:
+                return await cursor.fetchone()
+
 async def cleanup_old_data():
     """Чистит старые записи чтобы не раздувать память и БД."""
     async with db_lock:

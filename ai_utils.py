@@ -6,6 +6,8 @@ import asyncio
 import google.generativeai as genai
 from config import GEMINI_API_KEY
 
+from bs4 import BeautifulSoup
+
 logger = logging.getLogger(__name__)
 
 genai.configure(api_key=GEMINI_API_KEY)
@@ -13,14 +15,36 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
 def clean_html(text):
-    """Превращает markdown **жирный** в HTML <b> и экранирует остальное."""
-    # Сначала экранируем всё
-    text = html.escape(text)
-    # Потом возвращаем только разрешенные теги (если они были в оригинале как ** или <b>)
+    """Очищает текст от всех HTML-тегов, кроме разрешенных Telegram."""
+    if not text:
+        return ""
+    
+    # Сначала обрабатываем markdown жирный, если он пролез
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
-    # Если Gemini вернул <b> в ответе, они уже экранированы как &lt;b&gt;
-    text = text.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
-    return text
+    
+    # Разрешенные теги в Telegram
+    allowed_tags = ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'a', 'code', 'pre']
+    
+    try:
+        soup = BeautifulSoup(text, "html.parser")
+        for tag in soup.find_all(True):
+            if tag.name not in allowed_tags:
+                tag.unwrap() # Удаляем тег, но оставляем его содержимое
+            elif tag.name in ['strong', 'em', 'ins', 'strike', 'del']:
+                # Маппинг синонимов в стандартные теги
+                mapping = {'strong': 'b', 'em': 'i', 'ins': 'u', 'strike': 's', 'del': 's'}
+                tag.name = mapping[tag.name]
+        
+        # Получаем очищенный HTML
+        cleaned_text = str(soup)
+        
+        # Telegram требует, чтобы <, > и & были экранированы, если они не являются частью тегов
+        # Но BeautifulSoup при выводе str(soup) обычно сам делает базовое экранирование спецсимволов внутри текста.
+        return cleaned_text
+    except Exception as e:
+        logger.error(f"Error cleaning HTML: {e}")
+        # Фолбэк на простое экранирование, если BS4 упал
+        return html.escape(text)
 
 def extract_json(text):
     """Пытается вытащить JSON из текста, даже если там есть лишний мусор."""
@@ -44,32 +68,43 @@ def extract_json(text):
         return None
 
 async def process_with_gemini(title, summary, retries=2):
-    """Пересказывает новость через Gemini с повторными попытками."""
-    prompt = f"""Ты — экспертный игровой журналист. Перескажи новость на русском языке.
-Пиши профессионально, выделяй суть. Используй <b>жирный текст</b> для фактов.
+    """Пересказывает новость через Gemini в стиле авторской аналитики."""
+    prompt = f"""Ты — ведущий аналитик игровой индустрии. Подготовь сжатую авторскую заметку по новости на русском языке.
+Стиль: серьезный, профессиональный, "человеческий" (без топорных шаблонов и формальных заголовков). 
+Никаких эмодзи. Объем: до 1200 символов.
+
+Текст должен быть связным и делиться на 2-3 логических абзаца:
+1. Начни сразу с сути события, без вводных фраз. Опиши самое важное максимально прямо и профессионально.
+2. Раскрой критические детали и факты, вплетая их в контекст. Используй <b>жирный текст</b> для названий игр, компаний и ключевых показателей.
+3. Заверши коротким экспертным выводом: почему это важно для рынка или как это изменит пользовательский опыт в будущем.
+
+Избегай фраз типа "Суть события", "Ключевые тезисы" и прочей бюрократии. Пиши как живой эксперт для своей аудитории.
+Весь текст должен быть в поле "summary".
+
 Верни ТОЛЬКО JSON без markdown оформления:
 {{
   "title": "заголовок",
-  "summary": "пересказанный текст с HTML тегами <b></b>",
-  "tags": ["pc", "console", "mobile", "nft", "esports", "indie", "rpg", "action"] 
+  "summary": "связный аналитический текст с HTML тегами <b></b>",
+  "tags": ["pc", "ps5", "xbox", "industry", "finance", "development"] 
 }}
 
 Заголовок: {title}
-Текст: {summary[:3000]}"""
+Текст: {summary[:4000]}"""
 
     for attempt in range(retries + 1):
         try:
-            response = model.generate_content(prompt)
+            response = await model.generate_content_async(prompt)
             if not response or not response.text:
                 continue
                 
             data = extract_json(response.text.strip())
             
             if data:
-                # Валидация полей
+                # Валидация и очистка полей
+                raw_summary = str(data.get("summary", f"<b>{title}</b>"))
                 return {
                     "title": str(data.get("title", title)),
-                    "summary": str(data.get("summary", f"<b>{title}</b>")),
+                    "summary": clean_html(raw_summary),
                     "tags": list(data.get("tags", []))
                 }
             
@@ -83,6 +118,6 @@ async def process_with_gemini(title, summary, retries=2):
     # Если всё провалилось, возвращаем заглушку
     return {
         "title": title,
-        "summary": f"🎮 <b>{html.escape(title)}</b>\n\nНе удалось сгенерировать пересказ.",
+        "summary": f"🎮 <b>{clean_html(title)}</b>\n\nНе удалось сгенерировать пересказ.",
         "tags": []
     }
