@@ -92,6 +92,44 @@ async def init_db():
                     added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            # ТАБЛИЦЫ ДЛЯ ТОРГОВЛИ
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pair TEXT,
+                    side TEXT,
+                    price REAL,
+                    qty REAL,
+                    pnl REAL,
+                    signal TEXT,
+                    sentiment TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS trade_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+
+            # ТАБЛИЦА ДЛЯ ВАКАНСИЙ
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS job_vacancies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT,
+                    company TEXT,
+                    url TEXT UNIQUE,
+                    salary_raw TEXT,
+                    is_remote INTEGER,
+                    score INTEGER,
+                    match_verdict TEXT,
+                    has_salary INTEGER,
+                    dismissed INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             
             await db.commit()
 
@@ -302,6 +340,99 @@ async def get_watch_info(watch_id):
         async with aiosqlite.connect(DB_PATH, timeout=30) as db:
             async with db.execute("SELECT name, target_price FROM watches WHERE id=?", (watch_id,)) as cursor:
                 return await cursor.fetchone()
+
+# --- Trading Functions ---
+async def save_trade(pair, side, price, qty, pnl, signal, sentiment):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("""
+                INSERT INTO trades (pair, side, price, qty, pnl, signal, sentiment) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (pair, side, price, qty, pnl, signal, sentiment))
+            await db.commit()
+
+def _decode_trade_state_value(val):
+    """Поддерживает как новые JSON-значения, так и старые сырые строки из БД."""
+    if val is None or not isinstance(val, str):
+        return val
+
+    raw = val.strip()
+    if raw == "":
+        return None
+
+    try:
+        return json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return raw
+
+async def get_open_position():
+    """Возвращает текущую открытую позицию из trade_state."""
+    return await get_trade_state("current_position")
+
+async def get_trade_stats(days=7):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("""
+                SELECT COUNT(*), SUM(pnl) FROM trades 
+                WHERE created_at > datetime('now', ?)
+            """, (f'-{days} days',)) as cursor:
+                return await cursor.fetchone()
+
+async def set_trade_state(key, val):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            json_val = json.dumps(val)
+            await db.execute("INSERT OR REPLACE INTO trade_state (key, value) VALUES (?, ?)", (key, json_val))
+            await db.commit()
+
+async def get_trade_state(key):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("SELECT value FROM trade_state WHERE key=?", (key,)) as cursor:
+                row = await cursor.fetchone()
+                return _decode_trade_state_value(row[0]) if row else None
+
+# --- Job Hunter Functions ---
+async def save_vacancy(title, company, url, salary_raw, is_remote, score, verdict, has_salary):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            try:
+                await db.execute("""
+                    INSERT INTO job_vacancies (title, company, url, salary_raw, is_remote, score, match_verdict, has_salary)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (title, company, url, salary_raw, is_remote, score, verdict, int(has_salary)))
+                await db.commit()
+                return True
+            except:
+                return False
+
+async def is_vacancy_seen(url):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("SELECT id FROM job_vacancies WHERE url=?", (url,)) as cursor:
+                row = await cursor.fetchone()
+                return row is not None
+
+async def get_top_vacancies(limit=10):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("""
+                SELECT * FROM job_vacancies 
+                WHERE dismissed = 0 
+                ORDER BY score DESC, created_at DESC 
+                LIMIT ?
+            """, (limit,)) as cursor:
+                return await cursor.fetchall()
+
+async def dismiss_vacancy(vacancy_id):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("UPDATE job_vacancies SET dismissed = 1 WHERE id = ?", (vacancy_id,))
+            await db.commit()
 
 async def cleanup_old_data():
     """Чистит старые записи чтобы не раздувать память и БД."""

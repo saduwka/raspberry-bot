@@ -15,20 +15,28 @@ from telegram.ext import (
 )
 
 import price_monitor
-from config import BOT_TOKEN, ADMIN_ID, DB_PATH, RSS_FEEDS, GAMING_KEYWORDS
+from config import BOT_TOKEN, ADMIN_ID, DB_PATH, RSS_FEEDS, GAMING_KEYWORDS, TRADE_INTERVAL_SECONDS
 from database import (
     init_db, add_watch, get_watches, remove_watch, 
     add_blocked_tag, remove_blocked_tag, get_blocked_tags,
     get_pending, delete_pending, mark_posted, log_event,
     add_rss_feed, remove_rss_feed, get_rss_feeds,
     add_keyword, remove_keyword, get_gaming_keywords,
-    save_pending, cleanup_old_data, update_target_price, get_watch_info
+    save_pending, cleanup_old_data, update_target_price, get_watch_info,
+    get_trade_state, set_trade_state
 )
 from ai_utils import clean_html
 from jobs import (
     price_check_job, send_price_digest, check_health_alert,
     fetch_news, process_and_filter_news, send_for_approval,
-    fetch_job, post_to_channel, send_weekly_digest, get_stats
+    fetch_job, post_to_channel, send_weekly_digest, get_stats,
+    trade_job
+)
+import trade_handlers
+import job_handlers
+from job_handlers import (
+    job_fetch_job, list_jobs_handler, dismiss_job_callback,
+    job_query_handler, jobs_refresh_handler
 )
 
 # --- Logging ---
@@ -50,7 +58,7 @@ logger = logging.getLogger(__name__)
 ALMATY_TZ = ZoneInfo("Asia/Almaty")
 
 # Состояния диалога
-SELECT_SERVICE, INPUT_URL, INPUT_PRICE, EDIT_PRICE, ADD_RSS, ADD_KW = range(6)
+SELECT_SERVICE, INPUT_URL, INPUT_PRICE, EDIT_PRICE, ADD_RSS, ADD_KW, JOB_QUERY_INPUT = range(7)
 
 # --- Decorators ---
 def admin_only(func):
@@ -67,9 +75,36 @@ def admin_only(func):
 def reply_keyboard():
     return ReplyKeyboardMarkup([
         ["🔍 Новости", "📊 Статус"],
-        ["🛍 Мониторинг", "📋 Мои товары"],
+        ["🛍 Мониторинг", "📈 Трейдинг"],
+        ["📋 Мои товары", "💼 Вакансии"],
         ["⚙️ Настройки"]
     ], resize_keyboard=True)
+
+def jobs_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Список", callback_data="jobs_list"),
+         InlineKeyboardButton("🔄 Обновить", callback_data="jobs_refresh")],
+        [InlineKeyboardButton("🔎 Текущий запрос", callback_data="jobs_query_show"),
+         InlineKeyboardButton("✏️ Изменить запрос", callback_data="jobs_query_edit")],
+    ])
+
+def trade_keyboard():
+    return trade_handlers.trade_keyboard()
+
+@admin_only
+async def show_jobs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "💼 <b>Вакансии</b>\n\n"
+        "Управление поиском вакансий через кнопки."
+    )
+    if update.callback_query:
+        await update.callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=jobs_keyboard())
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=jobs_keyboard())
+
+@admin_only
+async def show_trade_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await trade_handlers.show_trade_menu(update, context)
 
 # --- Command Handlers ---
 @admin_only
@@ -216,7 +251,7 @@ async def list_rss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not feeds:
         await update.message.reply_text("Список RSS-лент пуст.")
     else:
-        await update.message.reply_text("📋 <b>Активные RSS-ленты:</b>\n\n" + "\n".join(feeds), parse_mode="HTML")
+        await update.message.reply_text("📋 <b>Активные RSS-ленты:</b>\n\n" + "\n".join([html.escape(f) for f in feeds]), parse_mode="HTML")
 
 @admin_only
 async def add_kw(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -244,7 +279,7 @@ async def list_kw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not kws:
         await update.message.reply_text("Список ключевых слов пуст.")
     else:
-        text = "📋 <b>Ключевые слова:</b>\n\n" + ", ".join(kws)
+        text = "📋 <b>Ключевые слова:</b>\n\n" + ", ".join([html.escape(k) for k in kws])
         if len(text) > 4000:
             for i in range(0, len(text), 4000):
                 await update.message.reply_text(text[i:i+4000], parse_mode="HTML")
@@ -274,21 +309,21 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.delete()
     elif data == "set_rss":
         feeds = await get_rss_feeds()
-        text = "📰 <b>RSS-ленты:</b>\n\n" + ("\n".join([f"• {f}" for f in feeds]) if feeds else "Пусто")
+        text = "📰 <b>RSS-ленты:</b>\n\n" + ("\n".join([f"• {html.escape(f)}" for f in feeds]) if feeds else "Пусто")
         kb = [[InlineKeyboardButton("➕ Добавить ленту", callback_data="add_rss_ui")],
               [InlineKeyboardButton("🗑 Удалить ленту", callback_data="del_rss_ui")],
               [InlineKeyboardButton("⬅️ Назад", callback_data="set_back")]]
         await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML", disable_web_page_preview=True)
     elif data == "set_kw":
         kws = await get_gaming_keywords()
-        text = "🔑 <b>Ключевые слова:</b>\n\n" + (", ".join(kws) if kws else "Пусто")
+        text = "🔑 <b>Ключевые слова:</b>\n\n" + (", ".join([html.escape(k) for k in kws]) if kws else "Пусто")
         kb = [[InlineKeyboardButton("➕ Добавить слово", callback_data="add_kw_ui")],
               [InlineKeyboardButton("🗑 Удалить слово", callback_data="del_kw_ui")],
               [InlineKeyboardButton("⬅️ Назад", callback_data="set_back")]]
         await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     elif data == "set_tags":
         tags = await get_blocked_tags()
-        text = "🚫 <b>Заблокированные теги:</b>\n\n" + (", ".join(tags) if tags else "Пусто")
+        text = "🚫 <b>Заблокированные теги:</b>\n\n" + (", ".join([html.escape(t) for t in tags]) if tags else "Пусто")
         kb = [[InlineKeyboardButton("⬅️ Назад", callback_data="set_back")]]
         await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     elif data == "set_back":
@@ -448,6 +483,33 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "cmd_status":
         await query.message.reply_text(get_stats(), parse_mode="HTML")
+    elif data == "trade_menu":
+        await show_trade_menu(update, context)
+    elif data == "trade_stats":
+        await trade_handlers.trade_stats_handler(update, context)
+    elif data == "jobs_menu":
+        await show_jobs_menu(update, context)
+    elif data == "jobs_list":
+        await job_handlers.list_jobs_handler(update, context)
+    elif data == "jobs_refresh":
+        await query.message.reply_text("🔎 Запускаю поиск вакансий...")
+        await job_fetch_job(context)
+        await query.message.reply_text("✅ Поиск завершен.", reply_markup=jobs_keyboard())
+    elif data == "jobs_query_show":
+        current = await get_trade_state("job_search_query")
+        current = current if current else "Vue TypeScript Frontend"
+        await query.message.reply_text(
+            f"🔎 <b>Текущий поисковый запрос:</b>\n<code>{html.escape(current)}</code>",
+            parse_mode="HTML",
+            reply_markup=jobs_keyboard(),
+        )
+    elif data == "jobs_query_edit":
+        await query.message.reply_text("Введите новый поисковый запрос для вакансий:")
+        return JOB_QUERY_INPUT
+    elif data == "trade_refresh":
+        await trade_handlers.trade_stats_handler(update, context)
+    elif data == "trade_signal":
+        await trade_handlers.trade_signal_handler(update, context)
     elif data == "cmd_fetch":
         await query.message.reply_text("🔍 Ищу новости...")
         news = await fetch_news()
@@ -503,6 +565,24 @@ async def process_edit_price_step(update: Update, context: ContextTypes.DEFAULT_
     except:
         return EDIT_PRICE
 
+async def process_job_query_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    new_query = update.message.text.strip()
+    if not new_query or new_query.startswith("/"):
+        await update.message.reply_text("❌ Изменение отменено.", reply_markup=reply_keyboard())
+        return ConversationHandler.END
+
+    await set_trade_state("job_search_query", new_query)
+    await update.message.reply_text(
+        f"✅ <b>Запрос изменен!</b>\nТеперь бот ищет: <code>{html.escape(new_query)}</code>",
+        parse_mode="HTML",
+        reply_markup=reply_keyboard(),
+    )
+    await update.message.reply_text("💼 Меню вакансий:", parse_mode="HTML", reply_markup=jobs_keyboard())
+    return ConversationHandler.END
+
 @admin_only
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -510,10 +590,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await fetch_job(context)
     elif text == "📊 Статус":
         await update.message.reply_text(get_stats(), parse_mode="HTML")
+    elif text == "📈 Трейдинг":
+        await show_trade_menu(update, context)
     elif text == "🛍 Мониторинг":
         return await start_monitoring_interactive(update, context)
     elif text == "📋 Мои товары":
         await list_watches(update, context)
+    elif text == "💼 Вакансии":
+        await show_jobs_menu(update, context)
     elif text == "⚙️ Настройки":
         await show_settings(update, context)
 
@@ -550,7 +634,7 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^🛍 Мониторинг$"), start_monitoring_interactive),
-            CallbackQueryHandler(callback_handler, pattern="^(editpr_|add_rss_ui|add_kw_ui)")
+            CallbackQueryHandler(callback_handler, pattern="^(editpr_|add_rss_ui|add_kw_ui|jobs_query_edit)")
         ],
         states={
             SELECT_SERVICE: [CallbackQueryHandler(service_choice, pattern="^step_")],
@@ -559,6 +643,7 @@ def main():
             EDIT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_edit_price_step)],
             ADD_RSS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_rss_step)],
             ADD_KW: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_kw_step)],
+            JOB_QUERY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_job_query_step)],
         },
         fallbacks=[CommandHandler("cancel", cancel_interactive), CallbackQueryHandler(service_choice, pattern="^step_cancel$")],
     )
@@ -577,19 +662,26 @@ def main():
     app.add_handler(CommandHandler("addkw", add_kw))
     app.add_handler(CommandHandler("delkw", del_kw))
     app.add_handler(CommandHandler("listkw", list_kw))
+    app.add_handler(CommandHandler("jobs", list_jobs_handler))
+    app.add_handler(CommandHandler("jobs_refresh", jobs_refresh_handler))
+    app.add_handler(CommandHandler("job_query", job_query_handler))
 
+    app.add_handler(CallbackQueryHandler(dismiss_job_callback, pattern="^dismiss_job_"))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     
     jq = app.job_queue
-    jq.run_daily(fetch_job, time=dt_time(9, 0, tzinfo=ALMATY_TZ))
-    jq.run_daily(fetch_job, time=dt_time(15, 0, tzinfo=ALMATY_TZ))
-    jq.run_daily(fetch_job, time=dt_time(21, 0, tzinfo=ALMATY_TZ))
+    # jq.run_daily(fetch_job, time=dt_time(9, 0, tzinfo=ALMATY_TZ))
+    # jq.run_daily(fetch_job, time=dt_time(15, 0, tzinfo=ALMATY_TZ))
+    # jq.run_daily(fetch_job, time=dt_time(21, 0, tzinfo=ALMATY_TZ))
+    jq.run_daily(job_fetch_job, time=dt_time(10, 0, tzinfo=ALMATY_TZ))
+    jq.run_daily(job_fetch_job, time=dt_time(18, 0, tzinfo=ALMATY_TZ))
     jq.run_daily(lambda ctx: asyncio.create_task(cleanup_old_data()), time=dt_time(4, 0, tzinfo=ALMATY_TZ))
     jq.run_daily(send_weekly_digest, time=dt_time(20, 0, tzinfo=ALMATY_TZ), days=(6,))
     jq.run_repeating(price_check_job, interval=1200, first=60)
     jq.run_repeating(send_price_digest, interval=1800, first=90)
     jq.run_repeating(check_health_alert, interval=300, first=10)
+    jq.run_repeating(trade_job, interval=TRADE_INTERVAL_SECONDS, first=30)
     
     logger.info("Bot started!")
     app.run_polling()

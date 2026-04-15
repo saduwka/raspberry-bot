@@ -8,6 +8,20 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 
+# Binance & Trade Settings
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_SECRET = os.getenv("BINANCE_SECRET")
+TRADE_PAIR = os.getenv("TRADE_PAIR", "BTC/USDT")
+PAPER_MODE = os.getenv("PAPER_MODE", "True").lower() == "true"
+TRADE_TIMEFRAME = os.getenv("TRADE_TIMEFRAME", "15m")
+TRADE_INTERVAL_SECONDS = int(os.getenv("TRADE_INTERVAL_SECONDS", "900"))
+TRADE_QTY = float(os.getenv("TRADE_QTY", "0.001"))
+TRADE_STOP_LOSS_PCT = float(os.getenv("TRADE_STOP_LOSS_PCT", "0.015"))
+TRADE_TAKE_PROFIT_PCT = float(os.getenv("TRADE_TAKE_PROFIT_PCT", "0.03"))
+GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.65"))
+JOB_MIN_SCORE = int(os.getenv("JOB_MIN_SCORE", "7"))
+JOB_REQUIRE_WORLDWIDE = os.getenv("JOB_REQUIRE_WORLDWIDE", "True").lower() == "true"
+
 DB_PATH = "bot.db"
 
 GAMING_KEYWORDS = [

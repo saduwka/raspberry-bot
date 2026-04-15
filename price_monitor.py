@@ -20,6 +20,7 @@ async def _wait():
     await asyncio.sleep(random.uniform(1.5, 3.5))
 
 async def get_kaspi_price(url, client: httpx.AsyncClient):
+    soup = None
     try:
         await _wait()
         response = await client.get(url)
@@ -29,9 +30,7 @@ async def get_kaspi_price(url, client: httpx.AsyncClient):
         # 1. Try Meta Tags
         price_meta = soup.find("meta", property="product:price:amount")
         if price_meta and price_meta.get("content"):
-            res = int(float(price_meta["content"]))
-            soup.decompose()
-            return res
+            return int(float(price_meta["content"]))
         
         # 2. Try JSON-LD
         scripts = soup.find_all('script', type='application/ld+json')
@@ -43,13 +42,9 @@ async def get_kaspi_price(url, client: httpx.AsyncClient):
                     if item.get('@type') == 'Product' and 'offers' in item:
                         offers = item['offers']
                         if isinstance(offers, dict) and 'price' in offers:
-                            res = int(float(offers['price']))
-                            soup.decompose()
-                            return res
+                            return int(float(offers['price']))
                         elif isinstance(offers, list) and len(offers) > 0:
-                            res = int(float(offers[0].get('price', 0)))
-                            soup.decompose()
-                            return res
+                            return int(float(offers[0].get('price', 0)))
             except:
                 continue
 
@@ -58,19 +53,21 @@ async def get_kaspi_price(url, client: httpx.AsyncClient):
         if not price_tag:
             price_tag = soup.find("span", class_="offer-view__price")
             
-        res = None
         if price_tag:
             price_text = re.sub(r'[^\d]', '', price_tag.text)
             if price_text:
-                res = int(price_text)
+                return int(price_text)
         
-        soup.decompose()
-        return res
+        return None
     except Exception as e:
         logger.error(f"Error fetching Kaspi price from {url}: {e}")
         return None
+    finally:
+        if soup:
+            soup.decompose()
 
 async def get_olx_price(url, client: httpx.AsyncClient):
+    soup = None
     try:
         if "/rss/" in url or url.endswith(".rss"):
             response = await client.get(url)
@@ -101,8 +98,12 @@ async def get_olx_price(url, client: httpx.AsyncClient):
     except Exception as e:
         logger.error(f"Error fetching OLX price from {url}: {e}")
         return None
+    finally:
+        if soup:
+            soup.decompose()
 
 async def get_kaspi_category_items(url, client: httpx.AsyncClient):
+    soup = None
     try:
         await _wait()
         response = await client.get(url)
@@ -141,9 +142,13 @@ async def get_kaspi_category_items(url, client: httpx.AsyncClient):
     except Exception as e:
         logger.error(f"Error fetching Kaspi category {url}: {e}")
         return []
+    finally:
+        if soup:
+            soup.decompose()
 
 async def get_olx_category_items(url, client: httpx.AsyncClient):
     items = []
+    soup = None
     try:
         rss_url = url
         if "/rss/" not in url and not url.endswith(".rss"):
@@ -155,18 +160,21 @@ async def get_olx_category_items(url, client: httpx.AsyncClient):
                 else:
                     rss_url = url.replace("olx.kz/", "olx.kz/rss/")
         
-        response = await client.get(rss_url)
-        feed = feedparser.parse(response.text)
-        if feed.entries:
-            for entry in feed.entries:
-                title = entry.get("title", "")
-                link = entry.get("link", "")
-                price_match = re.search(r'(\d[\d\s]*)\s*(?:тг|₸|грн|\$)', title)
-                if price_match:
-                    price = int(re.sub(r'\s', '', price_match.group(1)))
-                    items.append({"name": title, "price": price, "url": link})
-            if items:
-                return items
+        try:
+            response = await client.get(rss_url)
+            feed = feedparser.parse(response.text)
+            if feed.entries:
+                for entry in feed.entries:
+                    title = entry.get("title", "")
+                    link = entry.get("link", "")
+                    price_match = re.search(r'(\d[\d\s]*)\s*(?:тг|₸|грн|\$)', title)
+                    if price_match:
+                        price = int(re.sub(r'\s', '', price_match.group(1)))
+                        items.append({"name": title, "price": price, "url": link})
+                if items:
+                    return items
+        except:
+            pass
 
         await _wait()
         response = await client.get(url)
@@ -196,6 +204,9 @@ async def get_olx_category_items(url, client: httpx.AsyncClient):
     except Exception as e:
         logger.error(f"Error fetching OLX items from {url}: {e}")
         return []
+    finally:
+        if soup:
+            soup.decompose()
 
 async def check_price(url, client: httpx.AsyncClient = None):
     # Если клиент не передан (например, вызвано вручную из bot.py), создаем временный
