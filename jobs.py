@@ -15,6 +15,8 @@ from telegram.ext import ContextTypes
 
 import price_monitor
 import trade_engine
+
+logger = logging.getLogger(__name__)
 from config import (
     DB_PATH,
     ADMIN_ID,
@@ -26,11 +28,31 @@ from database import (
     get_watches, is_posted, is_pending, mark_posted, save_price_alert, 
     update_watch_price, save_pending, get_pending, delete_pending, 
     log_event, get_blocked_tags, get_rss_feeds, get_gaming_keywords,
-    get_open_position, save_trade, set_trade_state, get_trade_state
+    get_open_position, save_trade, set_trade_state, get_trade_state,
+    get_pending_follow_ups, mark_follow_up_sent
 )
 from ai_utils import process_with_gemini, evaluate_trade_with_gemini
 
-logger = logging.getLogger(__name__)
+async def check_job_follow_ups(context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет вакансии, на которые вы откликнулись 7 дней назад."""
+    pending = await get_pending_follow_ups(days=7)
+    if not pending:
+        return
+
+    for vid, title, company, url, applied_at in pending:
+        text = (
+            f"🔔 <b>Пора спросить фидбек!</b>\n\n"
+            f"Прошло 7 дней с вашего отклика на вакансию:\n"
+            f"📦 <b>{html.escape(title)}</b>\n"
+            f"🏢 {html.escape(company)}\n"
+            f"📅 Дата отклика: {applied_at[:10]}\n\n"
+            f"🔗 {html.escape(url)}"
+        )
+        try:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+            await mark_follow_up_sent(vid)
+        except Exception as e:
+            logger.error(f"Error sending follow-up for {vid}: {e}")
 
 TEMP_WARN = 65.0
 TEMP_CRIT = 75.0
@@ -475,9 +497,17 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
             technical_signal=technical_signal,
             avg_sentiment=avg_sentiment,
         )
+        
+        # АГРЕССИВНОЕ РЕШЕНИЕ:
+        # 1. Если ИИ совпал с техникой — берем.
+        # 2. Если техника BUY/SELL, а ИИ говорит HOLD, но с низкой уверенностью (<0.5) — всё равно берем.
         if (
             gemini_decision["action"] == technical_signal
             and gemini_decision["confidence"] >= GEMINI_MIN_CONFIDENCE
+        ) or (
+            technical_signal != "HOLD" 
+            and gemini_decision["action"] == "HOLD" 
+            and gemini_decision["confidence"] < 0.5
         ):
             signal = technical_signal
         else:
@@ -508,9 +538,12 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 6. Исполняем
+    logger.info(f"Attempting to execute trade: {signal}")
     success = await trade_engine.execute_trade(signal, last_price, avg_sentiment)
+    logger.info(f"Trade execution result: {success}")
     
     if success:
+        logger.info(f"Sending trade notification to ADMIN_ID: {ADMIN_ID}")
         # Уведомляем админа
         side_emoji = "🚀" if signal == "BUY" else "🔻"
         text = (
@@ -524,7 +557,13 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
             f"Причина Gemini: <code>{html.escape(gemini_decision['reason'])}</code>\n"
             f"Режим: {'🧪 PAPER' if trade_engine.PAPER_MODE else '💰 LIVE'}"
         )
-        await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+        try:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+            logger.info("Trade notification sent successfully")
+        except Exception as e:
+            logger.error(f"Failed to send trade notification: {e}")
+    else:
+        logger.warning("Trade execution was not successful, skipping notification")
 
 async def post_to_channel(bot, pending_id):
     item = await get_pending(pending_id)

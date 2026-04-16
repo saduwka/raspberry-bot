@@ -1,4 +1,6 @@
 import logging
+import ccxt.async_support as ccxt
+import pandas as pd
 from config import (
     BINANCE_API_KEY,
     BINANCE_SECRET,
@@ -14,40 +16,48 @@ from database import save_trade, set_trade_state, get_trade_state
 logger = logging.getLogger(__name__)
 
 async def fetch_ohlcv(symbol=TRADE_PAIR, timeframe=TRADE_TIMEFRAME, limit=100):
-    """Получает исторические данные (свечи) с Binance."""
-    import ccxt.async_support as ccxt
-    import pandas as pd
-    
+    """Получает исторические данные (свечи) с Binance с повторными попытками."""
     exchange = ccxt.binance({
         'apiKey': BINANCE_API_KEY,
         'secret': BINANCE_SECRET,
         'enableRateLimit': True,
+        'timeout': 20000,
         'options': {'defaultType': 'spot'}
     })
+    
     try:
         if PAPER_MODE:
             exchange.set_sandbox_mode(True)
             
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df
+        for attempt in range(3):
+            try:
+                ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                return df
+            except Exception as e:
+                if attempt == 2:
+                    raise e
+                logger.warning(f"Attempt {attempt+1} failed to fetch OHLCV: {e}")
+                import asyncio
+                await asyncio.sleep(1)
+                
     except Exception as e:
-        logger.error(f"Error fetching OHLCV: {e}")
+        logger.error(f"Error fetching OHLCV after retries: {e}")
         return None
     finally:
         await exchange.close()
 
 def calc_indicators(df):
-    """Рассчитывает EMA5, EMA13 и RSI14."""
+    """Рассчитывает EMA3, EMA8 и RSI14."""
     if df is None or df.empty:
         return None
         
     from ta.trend import EMAIndicator
     from ta.momentum import RSIIndicator
     
-    df['ema_fast'] = EMAIndicator(close=df['close'], window=5).ema_indicator()
-    df['ema_slow'] = EMAIndicator(close=df['close'], window=13).ema_indicator()
+    df['ema_fast'] = EMAIndicator(close=df['close'], window=3).ema_indicator()
+    df['ema_slow'] = EMAIndicator(close=df['close'], window=8).ema_indicator()
     df['rsi'] = RSIIndicator(close=df['close'], window=14).rsi()
     return df
 
@@ -55,8 +65,8 @@ def get_signal(df, sentiment=0):
     """
     Генерирует сигнал.
     Агрессивный режим:
-    BUY: EMA5 > EMA13 + RSI < 80 (или пересечение)
-    SELL: EMA5 < EMA13 OR RSI > 85
+    BUY: EMA3 > EMA8 + RSI < 80 (или пересечение)
+    SELL: EMA3 < EMA8 OR RSI > 85
     """
     if df is None or len(df) < 2:
         return "HOLD"

@@ -127,9 +127,23 @@ async def init_db():
                     match_verdict TEXT,
                     has_salary INTEGER,
                     dismissed INTEGER DEFAULT 0,
+                    applied_at TIMESTAMP,
+                    follow_up_sent INTEGER DEFAULT 0,
+                    description TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            
+            # Миграция: добавляем новые колонки если их нет
+            try:
+                await db.execute("ALTER TABLE job_vacancies ADD COLUMN applied_at TIMESTAMP")
+            except: pass
+            try:
+                await db.execute("ALTER TABLE job_vacancies ADD COLUMN follow_up_sent INTEGER DEFAULT 0")
+            except: pass
+            try:
+                await db.execute("ALTER TABLE job_vacancies ADD COLUMN description TEXT")
+            except: pass
             
             await db.commit()
 
@@ -395,19 +409,27 @@ async def get_trade_state(key):
                 return _decode_trade_state_value(row[0]) if row else None
 
 # --- Job Hunter Functions ---
-async def save_vacancy(title, company, url, salary_raw, is_remote, score, verdict, has_salary):
+async def save_vacancy(title, company, url, salary_raw, is_remote, score, verdict, has_salary, description=""):
     async with db_lock:
         async with aiosqlite.connect(DB_PATH, timeout=30) as db:
             await db.execute("PRAGMA journal_mode=WAL")
             try:
                 await db.execute("""
-                    INSERT INTO job_vacancies (title, company, url, salary_raw, is_remote, score, match_verdict, has_salary)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (title, company, url, salary_raw, is_remote, score, verdict, int(has_salary)))
+                    INSERT INTO job_vacancies (title, company, url, salary_raw, is_remote, score, match_verdict, has_salary, description)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (title, company, url, salary_raw, is_remote, score, verdict, int(has_salary), description))
                 await db.commit()
                 return True
-            except:
+            except Exception as e:
+                logger.error(f"Error saving vacancy: {e}")
                 return False
+
+async def get_vacancy_details(vacancy_id):
+    """Возвращает полную информацию о вакансии для генерации письма."""
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("SELECT title, company, description FROM job_vacancies WHERE id = ?", (vacancy_id,)) as cursor:
+                return await cursor.fetchone()
 
 async def is_vacancy_seen(url):
     async with db_lock:
@@ -433,6 +455,75 @@ async def dismiss_vacancy(vacancy_id):
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("UPDATE job_vacancies SET dismissed = 1 WHERE id = ?", (vacancy_id,))
             await db.commit()
+
+async def mark_vacancy_applied(vacancy_id):
+    """Помечает вакансию как откликнутую."""
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("""
+                UPDATE job_vacancies 
+                SET applied_at = CURRENT_TIMESTAMP, dismissed = 1 
+                WHERE id = ?
+            """, (vacancy_id,))
+            await db.commit()
+
+async def get_pending_follow_ups(days=7):
+    """Возвращает отклики без напоминания, которым больше X дней."""
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("""
+                SELECT id, title, company, url, applied_at FROM job_vacancies 
+                WHERE applied_at IS NOT NULL 
+                AND follow_up_sent = 0
+                AND applied_at < datetime('now', ?)
+            """, (f'-{days} days',)) as cursor:
+                return await cursor.fetchall()
+
+async def mark_follow_up_sent(vacancy_id):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("UPDATE job_vacancies SET follow_up_sent = 1 WHERE id = ?", (vacancy_id,))
+            await db.commit()
+
+async def get_applied_vacancies(limit=20):
+    """Возвращает список вакансий, на которые был сделан отклик."""
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("""
+                SELECT id, title, company, url, applied_at, follow_up_sent 
+                FROM job_vacancies 
+                WHERE applied_at IS NOT NULL 
+                ORDER BY applied_at DESC 
+                LIMIT ?
+            """, (limit,)) as cursor:
+                return await cursor.fetchall()
+
+async def get_recent_job_history(applied_limit=3, dismissed_limit=3):
+    """Возвращает краткую историю предпочтений (что понравилось, а что нет)."""
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            # Что понравилось (Applied)
+            async with db.execute("""
+                SELECT title, company, match_verdict FROM job_vacancies 
+                WHERE applied_at IS NOT NULL 
+                ORDER BY applied_at DESC LIMIT ?
+            """, (applied_limit,)) as cursor:
+                applied_rows = await cursor.fetchall()
+            
+            # Что НЕ понравилось (Dismissed и score < 6)
+            async with db.execute("""
+                SELECT title, company, match_verdict FROM job_vacancies 
+                WHERE dismissed = 1 AND applied_at IS NULL AND score < 6
+                ORDER BY created_at DESC LIMIT ?
+            """, (dismissed_limit,)) as cursor:
+                dismissed_rows = await cursor.fetchall()
+                
+            return {
+                "liked": [{"title": r[0], "company": r[1], "reason": r[2]} for r in applied_rows],
+                "disliked": [{"title": r[0], "company": r[1], "reason": r[2]} for r in dismissed_rows]
+            }
 
 async def cleanup_old_data():
     """Чистит старые записи чтобы не раздувать память и БД."""

@@ -30,13 +30,14 @@ from jobs import (
     price_check_job, send_price_digest, check_health_alert,
     fetch_news, process_and_filter_news, send_for_approval,
     fetch_job, post_to_channel, send_weekly_digest, get_stats,
-    trade_job
+    trade_job, check_job_follow_ups
 )
 import trade_handlers
 import job_handlers
 from job_handlers import (
     job_fetch_job, list_jobs_handler, dismiss_job_callback,
-    job_query_handler, jobs_refresh_handler
+    job_query_handler, jobs_refresh_handler, list_applied_jobs_handler,
+    cover_letter_callback
 )
 
 # --- Logging ---
@@ -66,7 +67,7 @@ def admin_only(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id if update.effective_user else None
         if user_id != ADMIN_ID:
-            logger.warning(f"Unauthorized access attempt by {user_id}")
+            logger.warning(f"Unauthorized access attempt by ID: {user_id}")
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
@@ -84,8 +85,9 @@ def jobs_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📋 Список", callback_data="jobs_list"),
          InlineKeyboardButton("🔄 Обновить", callback_data="jobs_refresh")],
-        [InlineKeyboardButton("🔎 Текущий запрос", callback_data="jobs_query_show"),
-         InlineKeyboardButton("✏️ Изменить запрос", callback_data="jobs_query_edit")],
+        [InlineKeyboardButton("📝 Мои отклики", callback_data="jobs_applied"),
+         InlineKeyboardButton("🔎 Текущий запрос", callback_data="jobs_query_show")],
+        [InlineKeyboardButton("✏️ Изменить запрос", callback_data="jobs_query_edit")],
     ])
 
 def trade_keyboard():
@@ -491,6 +493,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_jobs_menu(update, context)
     elif data == "jobs_list":
         await job_handlers.list_jobs_handler(update, context)
+    elif data == "jobs_applied":
+        await job_handlers.list_applied_jobs_handler(update, context)
     elif data == "jobs_refresh":
         await query.message.reply_text("🔎 Запускаю поиск вакансий...")
         await job_fetch_job(context)
@@ -506,9 +510,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "jobs_query_edit":
         await query.message.reply_text("Введите новый поисковый запрос для вакансий:")
         return JOB_QUERY_INPUT
-    elif data == "trade_refresh":
+    elif data == "trade_stats" or data == "trade_refresh":
+        await query.answer("📊 Запрашиваю статистику...")
         await trade_handlers.trade_stats_handler(update, context)
     elif data == "trade_signal":
+        await query.answer("🧠 Анализирую сигнал...")
         await trade_handlers.trade_signal_handler(update, context)
     elif data == "cmd_fetch":
         await query.message.reply_text("🔍 Ищу новости...")
@@ -666,7 +672,8 @@ def main():
     app.add_handler(CommandHandler("jobs_refresh", jobs_refresh_handler))
     app.add_handler(CommandHandler("job_query", job_query_handler))
 
-    app.add_handler(CallbackQueryHandler(dismiss_job_callback, pattern="^dismiss_job_"))
+    app.add_handler(CallbackQueryHandler(cover_letter_callback, pattern="^cover_job_"))
+    app.add_handler(CallbackQueryHandler(dismiss_job_callback, pattern="^(dismiss_job_|apply_job_)"))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     
@@ -676,6 +683,7 @@ def main():
     # jq.run_daily(fetch_job, time=dt_time(21, 0, tzinfo=ALMATY_TZ))
     jq.run_daily(job_fetch_job, time=dt_time(10, 0, tzinfo=ALMATY_TZ))
     jq.run_daily(job_fetch_job, time=dt_time(18, 0, tzinfo=ALMATY_TZ))
+    jq.run_daily(check_job_follow_ups, time=dt_time(11, 0, tzinfo=ALMATY_TZ))
     jq.run_daily(lambda ctx: asyncio.create_task(cleanup_old_data()), time=dt_time(4, 0, tzinfo=ALMATY_TZ))
     jq.run_daily(send_weekly_digest, time=dt_time(20, 0, tzinfo=ALMATY_TZ), days=(6,))
     jq.run_repeating(price_check_job, interval=1200, first=60)

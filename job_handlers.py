@@ -5,7 +5,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from database import (
     save_vacancy, get_top_vacancies, dismiss_vacancy, is_vacancy_seen,
-    get_trade_state, set_trade_state
+    get_trade_state, set_trade_state, get_recent_job_history
 )
 from job_fetcher import fetch_all_jobs
 from ai_utils import process_job_scoring
@@ -36,19 +36,23 @@ async def job_fetch_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Starting job hunting...")
     vacancies = await fetch_all_jobs()
     
+    # Загружаем историю для персонализации (3 лайка, 3 дизлайка)
+    history = await get_recent_job_history(3, 3)
+    
     count = 0
     for v in vacancies:
         if await is_vacancy_seen(v["url"]): continue
         
-        # Gemini скоринг с учетом Worldwide Remote
-        result = await process_job_scoring(v["title"], v["company"], v.get("description", ""))
+        # Gemini скоринг с учетом истории предпочтений
+        result = await process_job_scoring(v["title"], v["company"], v.get("description", ""), history=history)
         
         if _job_passes_filters(result):
             full_verdict = _format_job_verdict(result, v.get("source", "Unknown"))
 
             await save_vacancy(
                 v["title"], v["company"], v["url"], v["salary_raw"],
-                v["is_remote"], result["score"], full_verdict, result["has_salary"]
+                v["is_remote"], result["score"], full_verdict, result["has_salary"],
+                description=v.get("description", "")
             )
             count += 1
             await asyncio.sleep(1) # Небольшая пауза для API Gemini
@@ -87,7 +91,14 @@ async def list_jobs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for v in vacancies:
-        vid, title, company, url, salary, remote, score, verdict, has_salary, _, _ = v
+        # Используем индексный доступ для надежности, так как количество колонок может меняться
+        vid = v[0]
+        title = v[1]
+        company = v[2]
+        url = v[3]
+        salary = v[4]
+        score = v[6]
+        verdict = v[7]
         
         match_emoji = "🟢" if score >= 8 else "🟡" if score >= 6 else "🔴"
         
@@ -100,17 +111,77 @@ async def list_jobs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔗 {html.escape(url)}"
         )
         
-        keyboard = [[InlineKeyboardButton("❌ Пропустить", callback_data=f"dismiss_job_{vid}")]]
+        keyboard = [
+            [InlineKeyboardButton("🔥 ГЕНЕРИРОВАТЬ ПИСЬМО", callback_data=f"cover_job_{vid}")],
+            [InlineKeyboardButton("✅ Я откликнулся", callback_data=f"apply_job_{vid}"),
+             InlineKeyboardButton("❌ Пропустить", callback_data=f"dismiss_job_{vid}")]
+        ]
         
-        await target_message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await target_message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception as e:
+            logger.error(f"Error sending job message: {e}")
+
+async def cover_letter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Генерирует и отправляет сопроводительное письмо."""
+    query = update.callback_query
+    await query.answer("✍️ Генерирую письмо...")
+    
+    vid = int(query.data.split("_")[-1])
+    from database import get_vacancy_details
+    from ai_utils import generate_cover_letter
+    
+    details = await get_vacancy_details(vid)
+    if not details:
+        await query.message.reply_text("❌ Данные вакансии не найдены в базе.")
+        return
+        
+    title, company, description = details
+    if not description:
+        await query.message.reply_text("❌ Описание вакансии пустое, не могу составить письмо.")
+        return
+        
+    letter = await generate_cover_letter(title, company, description)
+    
+    header = f"✉️ <b>Сопроводительное письмо для {html.escape(company)}:</b>\n\n"
+    await query.message.reply_text(f"{header}<code>{html.escape(letter)}</code>", parse_mode="HTML")
+
+async def list_applied_jobs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список вакансий, на которые вы уже откликнулись."""
+    target_message = update.callback_query.message if update.callback_query else update.message
+    from database import get_applied_vacancies
+    applied = await get_applied_vacancies(limit=10)
+    
+    if not applied:
+        await target_message.reply_text("📝 Вы еще не пометили ни одну вакансию как откликнутую.")
+        return
+
+    text = "📂 <b>Ваши отклики (последние 10):</b>\n\n"
+    for vid, title, company, url, applied_at, follow_up_sent in applied:
+        status = "🔔 Напомню" if not follow_up_sent else "✅ Напомнил"
+        date = applied_at[:10] if applied_at else "N/A"
+        text += (
+            f"🔹 <b>{html.escape(title)}</b> @ {html.escape(company)}\n"
+            f"📅 {date} | {status}\n"
+            f"🔗 {html.escape(url)}\n\n"
+        )
+    
+    await target_message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
 async def dismiss_job_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    vid = int(query.data.split("_")[-1])
-    await dismiss_vacancy(vid)
-    await query.message.edit_text("📁 Вакансия перенесена в архив.")
+    data = query.data
+    vid = int(data.split("_")[-1])
+    
+    if data.startswith("apply_job_"):
+        from database import mark_vacancy_applied
+        await mark_vacancy_applied(vid)
+        await query.message.edit_text("✅ Отлично! Я напомню написать им через 7 дней.")
+    else:
+        await dismiss_vacancy(vid)
+        await query.message.edit_text("📁 Вакансия перенесена в архив.")
 
 async def job_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Позволяет просматривать и менять поисковый запрос для вакансий."""

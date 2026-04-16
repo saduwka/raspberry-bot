@@ -49,6 +49,31 @@ def looks_remote(text):
     ]
     return any(marker in text_lower for marker in remote_markers)
 
+async def fetch_full_job_description(client, url):
+    """Скачивает полную страницу вакансии и извлекает текст, если его нет в API/RSS."""
+    try:
+        r = await client.get(url, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, 'html.parser')
+        
+        # Удаляем лишнее
+        for s in soup(['script', 'style', 'nav', 'header', 'footer', 'aside']):
+            s.decompose()
+            
+        # Пытаемся найти основной контент
+        main_content = soup.find(['article', 'main', 'div[class*="content"]', 'div[class*="job"]', 'div[id*="job"]'])
+        if main_content:
+            text = main_content.get_text(separator="\n").strip()
+        else:
+            text = soup.get_text(separator="\n").strip()
+            
+        # Очищаем от множественных пробелов и переносов
+        text = "\n".join([line.strip() for line in text.split("\n") if len(line.strip()) > 5])
+        return text[:5000] # Лимит для Gemini
+    except Exception as e:
+        logger.debug(f"Description scrape error for {url}: {e}")
+        return ""
+
 async def fetch_hh_jobs(query, schedule="remote"):
     """Парсинг hh.kz через открытый API."""
     url = "https://api.hh.ru/vacancies"
@@ -343,5 +368,17 @@ async def fetch_all_jobs():
             job["url"] = normalized_url
             unique_jobs.append(job)
             seen_urls.add(normalized_url)
+
+    # ДОПОЛНИТЕЛЬНЫЙ ЭТАП: Догружаем описания, если они слишком короткие
+    async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as client:
+        # Берем только лучшие вакансии для экономии ресурсов (например, первые 20)
+        for job in unique_jobs:
+            desc = job.get("description", "")
+            if len(desc) < 300: # Если описание подозрительно короткое
+                logger.info(f"Fetching full description for {job['title']} @ {job['company']}...")
+                full_desc = await fetch_full_job_description(client, job["url"])
+                if full_desc:
+                    job["description"] = full_desc
+                await asyncio.sleep(0.5)
 
     return unique_jobs

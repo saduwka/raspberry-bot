@@ -112,14 +112,21 @@ async def process_with_gemini(title, summary, retries=2):
         "sentiment": 0
     }
 
-async def process_job_scoring(job_title, company, description):
-    """Оценивает соответствие вакансии резюме Саду Нуржана с фокусом на Worldwide Remote."""
+async def process_job_scoring(job_title, company, description, history=None):
+    """Оценивает вакансию с учетом резюме и предыдущих предпочтений пользователя."""
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-2.5-flash-lite')
     
     cv_summary = "Vue 3, React, TypeScript, Microfrontends, REST API, Next.js, Git, Английский B1. Опыт: 4 года 1 мес. Локация: Казахстан (ищет Worldwide Remote)."
     
+    history_context = ""
+    if history:
+        liked = "\n".join([f"- {h['title']} в {h['company']}" for h in history.get('liked', [])])
+        disliked = "\n".join([f"- {h['title']} в {h['company']}" for h in history.get('disliked', [])])
+        if liked: history_context += f"\nПользователю РАНЕЕ ПОНРАВИЛИСЬ эти вакансии:\n{liked}"
+        if disliked: history_context += f"\nПользователь РАНЕЕ ОТКЛОНИЛ эти вакансии:\n{disliked}"
+
     prompt = f"""Ты — HR-эксперт по международному найму. Оцени вакансию для Frontend разработчика:
 {job_title} в компании {company}.
 
@@ -128,23 +135,26 @@ async def process_job_scoring(job_title, company, description):
 
 Профиль кандидата:
 {cv_summary}
+{history_context}
 
 Твоя задача:
 1. Оцени стек и опыт (0-10).
 2. ПРОВЕРЬ ЛОКАЦИЮ:
    - Является ли это Worldwide Remote (нанимают отовсюду)? 
-   - Есть ли ограничения? (Например: "US only", "Must be in EMEA", "CET +/- 3 hours", "No CIS").
-3. Если есть жесткое ограничение по стране (кроме Казахстана) или часовому поясу, который не подходит для Казахстана — СНИЖАЙ score до 0-3.
+   - Если есть жесткое ограничение по стране (кроме Казахстана), снижай score до 0-3.
+3. УЧТИ ПРЕДПОЧТЕНИЯ:
+   - Если вакансия похожа на те, что пользователю понравились, добавь +1 к score.
+   - Если вакансия похожа на те, что пользователь отклонил, снижай score.
 
 Верни ТОЛЬКО JSON:
 {{
   "score": 0,
   "is_worldwide": true/false,
-  "core_stack_match": true/false,
-  "matching_skills": ["Vue 3", "TypeScript"],
-  "missing_skills": ["React Native"],
-  "location_reason": "почему подходит или нет по локации",
-  "verdict": "общий вердикт одной строкой",
+  "core_stack_match": true,
+  "matching_skills": [],
+  "missing_skills": [],
+  "location_reason": "...",
+  "verdict": "...",
   "has_salary": false
 }}"""
 
@@ -182,14 +192,14 @@ async def process_job_scoring(job_title, company, description):
 async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, avg_sentiment, retries=1):
     """
     Просит Gemini подтвердить или отклонить торговый сигнал по рынку.
-    Возвращает строго ограниченное решение для объединения с теханализом.
+    Агрессивная настройка: Gemini теперь выступает как активный трейдер.
     """
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
-    prompt = f"""Ты — риск-менеджер алгоритмической торговли.
-Оцени только ближайшее действие по инструменту {pair}.
+    prompt = f"""Ты — профессиональный дей-трейдер, ориентированный на захват краткосрочных импульсов.
+Твоя задача — подтверждать вход в сделки при малейшем подтверждении тренда.
 
 Технический сигнал стратегии: {technical_signal}
 Средний новостной sentiment за 12 часов: {avg_sentiment:.2f}
@@ -198,17 +208,16 @@ async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, av
 {json.dumps(market_snapshot, ensure_ascii=False)}
 
 Правила:
-- Решение должно быть одним из: BUY, SELL, HOLD
-- BUY выбирай только если данные действительно поддерживают лонг
-- SELL выбирай только если данные действительно поддерживают выход/шортовый риск
-- Если уверенности недостаточно или есть конфликт между техникой и фоном, выбирай HOLD
-- Не выдумывай внешние данные, используй только переданную информацию
+- Твоя цель: НЕ упустить прибыльное движение.
+- Если технический сигнал {technical_signal} и рынок не показывает явного разворота в обратную сторону — подтверждай (BUY или SELL).
+- Будь решительным. Выбирай HOLD только если на рынке полный штиль или резкий обвал против сигнала.
+- Учитывай, что EMA 3 и 8 — это быстрые индикаторы для скальпинга.
 
 Верни ТОЛЬКО JSON:
 {{
-  "action": "BUY",
-  "confidence": 0.0,
-  "reason": "краткое объяснение на русском"
+  "action": "BUY/SELL/HOLD",
+  "confidence": 0.0-1.0,
+  "reason": "краткое объяснение"
 }}"""
 
     for attempt in range(retries + 1):
@@ -242,8 +251,39 @@ async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, av
             logger.error(f"Trade Gemini attempt {attempt+1}: {e}")
             await asyncio.sleep(1)
 
-    return {
-        "action": "HOLD",
-        "confidence": 0.0,
-        "reason": "Gemini недоступен, сигнал заблокирован до подтверждения",
-    }
+async def generate_cover_letter(job_title, company, description):
+    """Генерирует лаконичное сопроводительное письмо на языке вакансии."""
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-2.5-flash-lite')
+    
+    cv_summary = "Vue 3, React, TypeScript, Microfrontends, REST API, Next.js, Git, Английский B1. Опыт: 4 года 1 мес. Локация: Казахстан (ищет Worldwide Remote)."
+
+    prompt = f"""Ты — HR-эксперт. Напиши ОЧЕНЬ короткое сопроводительное письмо (Cover Letter).
+ВАЖНО: Пиши письмо на том же языке, на котором написана вакансия ниже.
+
+Кандидат: Sadu Nurzhan
+Стек: {cv_summary}
+
+Вакансия: {job_title} в компании {company}
+Описание вакансии:
+{description[:3000]}
+
+Требования к письму:
+1. Язык: Тот же, что в описании вакансии.
+2. Текст должен состоять СТРОГО ИЗ ОДНОГО АБЗАЦА (3-5 предложений).
+3. Акцент на: Vue 3, TypeScript и 4+ года опыта.
+4. Суть: Почему мой опыт в микрофронтендах и REST API полезен для {company}.
+5. Тон: Уверенный и лаконичный.
+6. Никаких формальных "шапок", только само письмо.
+
+Верни ТОЛЬКО текст письма."""
+
+    try:
+        response = await model.generate_content_async(prompt)
+        if response and response.text:
+            return response.text.strip()
+    except Exception as e:
+        logger.error(f"Cover letter generation error: {e}")
+        
+    return "Failed to generate cover letter. Please try again later."
