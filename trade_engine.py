@@ -4,7 +4,6 @@ import pandas as pd
 from config import (
     BINANCE_API_KEY,
     BINANCE_SECRET,
-    TRADE_PAIR,
     PAPER_MODE,
     TRADE_QTY,
     TRADE_TIMEFRAME,
@@ -15,7 +14,7 @@ from database import save_trade, set_trade_state, get_trade_state
 
 logger = logging.getLogger(__name__)
 
-async def fetch_ohlcv(symbol=TRADE_PAIR, timeframe=TRADE_TIMEFRAME, limit=100):
+async def fetch_ohlcv(symbol, timeframe=TRADE_TIMEFRAME, limit=100):
     """Получает исторические данные (свечи) с Binance с повторными попытками."""
     exchange = ccxt.binance({
         'apiKey': BINANCE_API_KEY,
@@ -105,31 +104,31 @@ def get_risk_exit_signal(current_price, entry_price):
         return "TAKE_PROFIT"
     return None
 
-async def execute_trade(signal, price, sentiment_score=0):
+async def execute_trade(signal, price, pair, sentiment_score=0):
     """Исполняет сделку (в PAPER_MODE или реальную)."""
     if signal == "HOLD":
         return
         
-    logger.info(f"Executing {signal} at {price} (Sentiment: {sentiment_score})")
+    logger.info(f"Executing {signal} for {pair} at {price} (Sentiment: {sentiment_score})")
     
     qty = TRADE_QTY
     pnl = 0.0
     
     # Расчет PnL для SELL (разница между ценой продажи и покупки)
     if signal == "SELL":
-        entry_price_raw = await get_trade_state("entry_price")
+        entry_price_raw = await get_trade_state("entry_price", pair)
         if entry_price_raw is not None:
             try:
                 entry_price = float(entry_price_raw)
                 pnl = (price - entry_price) * qty
-                logger.info(f"Closed trade with PnL: {pnl:.4f} (Entry: {entry_price}, Exit: {price})")
+                logger.info(f"Closed trade for {pair} with PnL: {pnl:.4f} (Entry: {entry_price}, Exit: {price})")
             except Exception as e:
-                logger.error(f"Error calculating PnL: {e}")
+                logger.error(f"Error calculating PnL for {pair}: {e}")
         else:
-            logger.warning("SELL signal received without entry_price in trade_state")
+            logger.warning(f"SELL signal received for {pair} without entry_price in trade_state")
 
     await save_trade(
-        pair=TRADE_PAIR,
+        pair=pair,
         side=signal,
         price=price,
         qty=qty,
@@ -140,12 +139,12 @@ async def execute_trade(signal, price, sentiment_score=0):
     
     # Сохраняем состояние позиции и цену входа
     if signal == "BUY":
-        await set_trade_state("current_position", "in_position")
-        await set_trade_state("entry_price", price)
-        await set_trade_state("position_qty", qty)
+        await set_trade_state("current_position", "in_position", pair)
+        await set_trade_state("entry_price", price, pair)
+        await set_trade_state("position_qty", qty, pair)
     else:
-        await set_trade_state("current_position", "none")
-        await set_trade_state("entry_price", None)
-        await set_trade_state("position_qty", None)
+        await set_trade_state("current_position", "none", pair)
+        await set_trade_state("entry_price", None, pair)
+        await set_trade_state("position_qty", None, pair)
 
     return True

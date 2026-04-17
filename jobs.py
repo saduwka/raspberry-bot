@@ -21,7 +21,7 @@ from config import (
     DB_PATH,
     ADMIN_ID,
     CHANNEL_ID,
-    TRADE_PAIR,
+    TRADE_PAIRS,
     GEMINI_MIN_CONFIDENCE,
 )
 from database import (
@@ -410,160 +410,145 @@ async def fetch_job(context: ContextTypes.DEFAULT_TYPE):
     gc.collect()
 
 async def trade_job(context: ContextTypes.DEFAULT_TYPE):
-    """Основной цикл трейдинга: OHLCV -> Indicators -> Signal -> Execute."""
-    logger.info(f"Starting trade cycle for {TRADE_PAIR}...")
-    
-    # 1. Получаем данные
-    df = await trade_engine.fetch_ohlcv()
-    if df is None:
-        logger.error("Failed to fetch OHLCV data")
-        return
+    """Основной цикл трейдинга: для каждой пары OHLCV -> Indicators -> Signal -> Execute."""
+    for pair in TRADE_PAIRS:
+        logger.info(f"Starting trade cycle for {pair}...")
         
-    # 2. Считаем индикаторы
-    df = trade_engine.calc_indicators(df)
-    
-    # 3. Получаем средний сентимент за последние 12 часов
-    avg_sentiment = 0
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        async with db.execute("""
-            SELECT meta FROM events_log 
-            WHERE event_type='news_sentiment' 
-            AND created_at > datetime('now', '-12 hours')
-        """) as cursor:
-            rows = await cursor.fetchall()
-            if rows:
-                sentiments = []
-                for r in rows:
-                    try:
-                        if r[0]:
-                            data = json.loads(r[0])
-                            sentiments.append(data.get('sentiment', 0))
-                    except:
-                        continue
-                if sentiments:
-                    avg_sentiment = sum(sentiments) / len(sentiments)
-    
-    if df is None or df.empty:
-        logger.warning("No data for indicators, skipping trade cycle")
-        return
+        # 1. Получаем данные
+        df = await trade_engine.fetch_ohlcv(pair)
+        if df is None:
+            logger.error(f"Failed to fetch OHLCV data for {pair}")
+            continue
+            
+        # 2. Считаем индикаторы
+        df = trade_engine.calc_indicators(df)
         
-    last_row = df.iloc[-1]
-    last_price = last_row['close']
-    current_pos = await get_open_position()
-    entry_price = await get_trade_state("entry_price")
-    risk_exit_reason = None
-    if current_pos == "in_position" and entry_price is not None:
-        try:
-            risk_exit_reason = trade_engine.get_risk_exit_signal(float(last_price), float(entry_price))
-        except (TypeError, ValueError):
-            logger.warning(f"Invalid entry_price in trade_state: {entry_price}")
-    
-    # 4. Генерируем техсигнал и отдельно спрашиваем Gemini
-    technical_signal = trade_engine.get_signal(df, sentiment=avg_sentiment)
-    if risk_exit_reason:
-        technical_signal = "SELL"
-    market_snapshot = {
-        "price": round(float(last_price), 2),
-        "ema_fast": round(float(last_row["ema_fast"]), 2),
-        "ema_slow": round(float(last_row["ema_slow"]), 2),
-        "rsi": round(float(last_row["rsi"]), 2),
-        "ema_gap": round(float(last_row["ema_fast"] - last_row["ema_slow"]), 2),
-        "previous_ema_fast": round(float(df.iloc[-2]["ema_fast"]), 2),
-        "previous_ema_slow": round(float(df.iloc[-2]["ema_slow"]), 2),
-        "technical_signal": technical_signal,
-        "position_state": current_pos or "none",
-        "entry_price": round(float(entry_price), 2) if entry_price is not None else None,
-        "risk_exit": risk_exit_reason,
-    }
-    if technical_signal == "HOLD" and not risk_exit_reason:
-        gemini_decision = {
-            "action": "HOLD",
-            "confidence": 0.0,
-            "reason": "Технический сигнал нейтральный, Gemini не вызывался",
+        # 3. Получаем средний сентимент за последние 12 часов
+        avg_sentiment = 0
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute("""
+                SELECT meta FROM events_log 
+                WHERE event_type='news_sentiment' 
+                AND created_at > datetime('now', '-12 hours')
+            """) as cursor:
+                rows = await cursor.fetchall()
+                if rows:
+                    sentiments = []
+                    for r in rows:
+                        try:
+                            if r[0]:
+                                data = json.loads(r[0])
+                                sentiments.append(data.get('sentiment', 0))
+                        except:
+                            continue
+                    if sentiments:
+                        avg_sentiment = sum(sentiments) / len(sentiments)
+        
+        if df is None or df.empty:
+            logger.warning(f"No data for indicators for {pair}, skipping")
+            continue
+            
+        last_row = df.iloc[-1]
+        last_price = last_row['close']
+        current_pos = await get_open_position(pair)
+        entry_price = await get_trade_state("entry_price", pair)
+        risk_exit_reason = None
+        if current_pos == "in_position" and entry_price is not None:
+            try:
+                risk_exit_reason = trade_engine.get_risk_exit_signal(float(last_price), float(entry_price))
+            except (TypeError, ValueError):
+                logger.warning(f"Invalid entry_price in trade_state for {pair}: {entry_price}")
+        
+        # 4. Генерируем техсигнал и отдельно спрашиваем Gemini
+        technical_signal = trade_engine.get_signal(df, sentiment=avg_sentiment)
+        if risk_exit_reason:
+            technical_signal = "SELL"
+        market_snapshot = {
+            "pair": pair,
+            "price": round(float(last_price), 2),
+            "ema_fast": round(float(last_row["ema_fast"]), 2),
+            "ema_slow": round(float(last_row["ema_slow"]), 2),
+            "rsi": round(float(last_row["rsi"]), 2),
+            "ema_gap": round(float(last_row["ema_fast"] - last_row["ema_slow"]), 2),
+            "previous_ema_fast": round(float(df.iloc[-2]["ema_fast"]), 2),
+            "previous_ema_slow": round(float(df.iloc[-2]["ema_slow"]), 2),
+            "technical_signal": technical_signal,
+            "position_state": current_pos or "none",
+            "entry_price": round(float(entry_price), 2) if entry_price is not None else None,
+            "risk_exit": risk_exit_reason,
         }
-        signal = "HOLD"
-    elif risk_exit_reason:
-        gemini_decision = {
-            "action": "SELL",
-            "confidence": 1.0,
-            "reason": f"Сработал риск-выход: {risk_exit_reason}",
-        }
-        signal = "SELL"
-    else:
-        gemini_decision = await evaluate_trade_with_gemini(
-            pair=TRADE_PAIR,
-            market_snapshot=market_snapshot,
-            technical_signal=technical_signal,
-            avg_sentiment=avg_sentiment,
-        )
-        
-        # АГРЕССИВНОЕ РЕШЕНИЕ:
-        # 1. Если ИИ совпал с техникой — берем.
-        # 2. Если техника BUY/SELL, а ИИ говорит HOLD, но с низкой уверенностью (<0.5) — всё равно берем.
-        if (
-            gemini_decision["action"] == technical_signal
-            and gemini_decision["confidence"] >= GEMINI_MIN_CONFIDENCE
-        ) or (
-            technical_signal != "HOLD" 
-            and gemini_decision["action"] == "HOLD" 
-            and gemini_decision["confidence"] < 0.5
-        ):
-            signal = technical_signal
-        else:
+        if technical_signal == "HOLD" and not risk_exit_reason:
+            gemini_decision = {
+                "action": "HOLD",
+                "confidence": 0.0,
+                "reason": "Технический сигнал нейтральный, Gemini не вызывался",
+            }
             signal = "HOLD"
+        elif risk_exit_reason:
+            gemini_decision = {
+                "action": "SELL",
+                "confidence": 1.0,
+                "reason": f"Сработал риск-выход: {risk_exit_reason}",
+            }
+            signal = "SELL"
+        else:
+            gemini_decision = await evaluate_trade_with_gemini(
+                pair=pair,
+                market_snapshot=market_snapshot,
+                technical_signal=technical_signal,
+                avg_sentiment=avg_sentiment,
+            )
+            
+            # АГРЕССИВНОЕ РЕШЕНИЕ:
+            if (
+                gemini_decision["action"] == technical_signal
+                and gemini_decision["confidence"] >= GEMINI_MIN_CONFIDENCE
+            ) or (
+                technical_signal != "HOLD" 
+                and gemini_decision["action"] == "HOLD" 
+                and gemini_decision["confidence"] < 0.5
+            ):
+                signal = technical_signal
+            else:
+                signal = "HOLD"
 
-    await set_trade_state("last_trade_signal", technical_signal)
-    await set_trade_state("last_gemini_action", gemini_decision["action"])
-    await set_trade_state("last_gemini_confidence", gemini_decision["confidence"])
-    await set_trade_state("last_gemini_reason", gemini_decision["reason"])
-    await set_trade_state("last_trade_decision", signal)
-    await set_trade_state("last_risk_exit_reason", risk_exit_reason)
-    
-    logger.info(
-        f"Technical signal: {technical_signal} | Gemini: {gemini_decision['action']} "
-        f"(conf={gemini_decision['confidence']:.2f}) | Final: {signal} | "
-        f"Price: {last_price} | EMA Fast: {last_row['ema_fast']:.2f} | "
-        f"EMA Slow: {last_row['ema_slow']:.2f} | RSI: {last_row['rsi']:.2f} | "
-        f"Sentiment: {avg_sentiment:.2f}"
-    )
-    
-    if signal == "BUY" and current_pos == "in_position":
-        logger.info("Signal is BUY, but already in position. Skipping.")
-        return
-    if signal == "SELL" and (current_pos == "none" or current_pos is None):
-        logger.info("Signal is SELL, but no position open. Skipping.")
-        return
-    if signal == "HOLD":
-        return
-
-    # 6. Исполняем
-    logger.info(f"Attempting to execute trade: {signal}")
-    success = await trade_engine.execute_trade(signal, last_price, avg_sentiment)
-    logger.info(f"Trade execution result: {success}")
-    
-    if success:
-        logger.info(f"Sending trade notification to ADMIN_ID: {ADMIN_ID}")
-        # Уведомляем админа
-        side_emoji = "🚀" if signal == "BUY" else "🔻"
-        text = (
-            f"{side_emoji} <b>Торговый сигнал: {signal}</b>\n\n"
-            f"Пара: <code>{TRADE_PAIR}</code>\n"
-            f"Цена: <code>{last_price}</code>\n"
-            f"Техсигнал: <code>{technical_signal}</code>\n"
-            f"Gemini: <code>{gemini_decision['action']}</code> ({gemini_decision['confidence']:.2f})\n"
-            f"Сентимент (12ч): <code>{avg_sentiment:.2f}</code>\n"
-            f"Риск-выход: <code>{html.escape(risk_exit_reason or 'нет')}</code>\n"
-            f"Причина Gemini: <code>{html.escape(gemini_decision['reason'])}</code>\n"
-            f"Режим: {'🧪 PAPER' if trade_engine.PAPER_MODE else '💰 LIVE'}"
+        await set_trade_state("last_trade_signal", technical_signal, pair)
+        await set_trade_state("last_gemini_action", gemini_decision["action"], pair)
+        await set_trade_state("last_gemini_confidence", gemini_decision["confidence"], pair)
+        await set_trade_state("last_gemini_reason", gemini_decision["reason"], pair)
+        await set_trade_state("last_trade_decision", signal, pair)
+        await set_trade_state("last_risk_exit_reason", risk_exit_reason, pair)
+        
+        logger.info(
+            f"[{pair}] Tech: {technical_signal} | Gemini: {gemini_decision['action']} "
+            f"(conf={gemini_decision['confidence']:.2f}) | Final: {signal} | Price: {last_price}"
         )
-        try:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
-            logger.info("Trade notification sent successfully")
-        except Exception as e:
-            logger.error(f"Failed to send trade notification: {e}")
-    else:
-        logger.warning("Trade execution was not successful, skipping notification")
+        
+        if signal == "BUY" and current_pos == "in_position":
+            continue
+        if signal == "SELL" and (current_pos == "none" or current_pos is None):
+            continue
+        if signal == "HOLD":
+            continue
+
+        # 6. Исполняем
+        success = await trade_engine.execute_trade(signal, last_price, pair, avg_sentiment)
+        
+        if success:
+            side_emoji = "🚀" if signal == "BUY" else "🔻"
+            text = (
+                f"{side_emoji} <b>Торговый сигнал: {signal}</b>\n\n"
+                f"Пара: <code>{pair}</code>\n"
+                f"Цена: <code>{last_price}</code>\n"
+                f"Gemini: <code>{gemini_decision['action']}</code> ({gemini_decision['confidence']:.2f})\n"
+                f"Причина Gemini: <code>{html.escape(gemini_decision['reason'])}</code>\n"
+                f"Режим: {'🧪 PAPER' if trade_engine.PAPER_MODE else '💰 LIVE'}"
+            )
+            try:
+                await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Failed to send trade notification for {pair}: {e}")
 
 async def post_to_channel(bot, pending_id):
     item = await get_pending(pending_id)
@@ -649,3 +634,4 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error sending weekly digest: {e}")
     finally:
         gc.collect()
+

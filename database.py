@@ -380,31 +380,34 @@ def _decode_trade_state_value(val):
     except (TypeError, json.JSONDecodeError):
         return raw
 
-async def get_open_position():
-    """Возвращает текущую открытую позицию из trade_state."""
-    return await get_trade_state("current_position")
+async def get_open_position(pair):
+    """Возвращает текущую открытую позицию из trade_state для конкретной пары."""
+    return await get_trade_state("current_position", pair)
 
-async def get_trade_stats(days=7):
+async def get_trade_stats(days=7, pair=None):
     async with db_lock:
         async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            async with db.execute("""
-                SELECT COUNT(*), SUM(pnl) FROM trades 
-                WHERE created_at > datetime('now', ?)
-            """, (f'-{days} days',)) as cursor:
+            query = "SELECT COUNT(*), SUM(pnl) FROM trades WHERE created_at > datetime('now', ?)"
+            params = [f'-{days} days']
+            if pair:
+                query += " AND pair = ?"
+                params.append(pair)
+            
+            async with db.execute(query, params) as cursor:
                 return await cursor.fetchone()
 
-async def set_trade_state(key, val):
+async def set_trade_state(key, val, pair="GLOBAL"):
     async with db_lock:
         async with aiosqlite.connect(DB_PATH, timeout=30) as db:
             await db.execute("PRAGMA journal_mode=WAL")
             json_val = json.dumps(val)
-            await db.execute("INSERT OR REPLACE INTO trade_state (key, value) VALUES (?, ?)", (key, json_val))
+            await db.execute("INSERT OR REPLACE INTO trade_state (pair, key, value) VALUES (?, ?, ?)", (pair, key, json_val))
             await db.commit()
 
-async def get_trade_state(key):
+async def get_trade_state(key, pair="GLOBAL"):
     async with db_lock:
         async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            async with db.execute("SELECT value FROM trade_state WHERE key=?", (key,)) as cursor:
+            async with db.execute("SELECT value FROM trade_state WHERE pair=? AND key=?", (pair, key)) as cursor:
                 row = await cursor.fetchone()
                 return _decode_trade_state_value(row[0]) if row else None
 
@@ -520,6 +523,25 @@ async def get_recent_job_history(applied_limit=3, dismissed_limit=3):
             """, (dismissed_limit,)) as cursor:
                 dismissed_rows = await cursor.fetchall()
                 
+            return {
+                "liked": [{"title": r[0], "company": r[1], "reason": r[2]} for r in applied_rows],
+                "disliked": [{"title": r[0], "company": r[1], "reason": r[2]} for r in dismissed_rows]
+            }
+
+async def cleanup_old_data():
+    """Чистит старые записи чтобы не раздувать память и БД."""
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            # Логи здоровья старше 7 дней
+            await db.execute("DELETE FROM events_log WHERE created_at < datetime('now', '-7 days')")
+            # Pending новости старше 3 дней (уже не актуальны)
+            await db.execute("DELETE FROM pending WHERE created_at < datetime('now', '-3 days')")
+            # Posted старше 60 дней (для дедупликации достаточно 60 дней)
+            await db.execute("DELETE FROM posted WHERE posted_at < datetime('now', '-60 days')")
+            await db.commit()
+            logger.info("Database cleanup completed.")
+        
             return {
                 "liked": [{"title": r[0], "company": r[1], "reason": r[2]} for r in applied_rows],
                 "disliked": [{"title": r[0], "company": r[1], "reason": r[2]} for r in dismissed_rows]

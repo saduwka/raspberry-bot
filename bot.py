@@ -90,9 +90,6 @@ def jobs_keyboard():
         [InlineKeyboardButton("✏️ Изменить запрос", callback_data="jobs_query_edit")],
     ])
 
-def trade_keyboard():
-    return trade_handlers.trade_keyboard()
-
 @admin_only
 async def show_jobs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -487,35 +484,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(get_stats(), parse_mode="HTML")
     elif data == "trade_menu":
         await show_trade_menu(update, context)
-    elif data == "trade_stats":
-        await trade_handlers.trade_stats_handler(update, context)
-    elif data == "jobs_menu":
-        await show_jobs_menu(update, context)
-    elif data == "jobs_list":
-        await job_handlers.list_jobs_handler(update, context)
-    elif data == "jobs_applied":
-        await job_handlers.list_applied_jobs_handler(update, context)
-    elif data == "jobs_refresh":
-        await query.message.reply_text("🔎 Запускаю поиск вакансий...")
-        await job_fetch_job(context)
-        await query.message.reply_text("✅ Поиск завершен.", reply_markup=jobs_keyboard())
-    elif data == "jobs_query_show":
-        current = await get_trade_state("job_search_query")
-        current = current if current else "Vue TypeScript Frontend"
-        await query.message.reply_text(
-            f"🔎 <b>Текущий поисковый запрос:</b>\n<code>{html.escape(current)}</code>",
-            parse_mode="HTML",
-            reply_markup=jobs_keyboard(),
-        )
-    elif data == "jobs_query_edit":
-        await query.message.reply_text("Введите новый поисковый запрос для вакансий:")
-        return JOB_QUERY_INPUT
-    elif data == "trade_stats" or data == "trade_refresh":
-        await query.answer("📊 Запрашиваю статистику...")
-        await trade_handlers.trade_stats_handler(update, context)
-    elif data == "trade_signal":
-        await query.answer("🧠 Анализирую сигнал...")
-        await trade_handlers.trade_signal_handler(update, context)
+    elif data.startswith("trade_select_"):
+        pair = data.replace("trade_select_", "")
+        await trade_handlers.trade_stats_handler(update, context, pair=pair)
+    elif data.startswith("trade_stats_"):
+        pair = data.replace("trade_stats_", "")
+        await trade_handlers.trade_stats_handler(update, context, pair=pair)
+    elif data.startswith("trade_refresh_"):
+        pair = data.replace("trade_refresh_", "")
+        await query.answer(f"📊 Обновляю {pair}...")
+        await trade_handlers.trade_stats_handler(update, context, pair=pair)
+    elif data.startswith("trade_signal_"):
+        pair = data.replace("trade_signal_", "")
+        await query.answer(f"🧠 Анализирую {pair}...")
+        await trade_handlers.trade_signal_handler(update, context, pair=pair)
     elif data == "cmd_fetch":
         await query.message.reply_text("🔍 Ищу новости...")
         news = await fetch_news()
@@ -597,6 +579,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📊 Статус":
         await update.message.reply_text(get_stats(), parse_mode="HTML")
     elif text == "📈 Трейдинг":
+        logger.info(f"DEBUG: '📈 Трейдинг' button clicked in message_handler. Calling show_trade_menu...")
         await show_trade_menu(update, context)
     elif text == "🛍 Мониторинг":
         return await start_monitoring_interactive(update, context)
@@ -606,8 +589,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_jobs_menu(update, context)
     elif text == "⚙️ Настройки":
         await show_settings(update, context)
+    elif text == "/start":
+        await start(update, context)
 
 async def on_startup(app):
+    print("DEBUG: on_startup START")
     # Первоначальная инициализация базы из конфига, если пустая
     async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         async with db.execute("SELECT COUNT(*) FROM rss_feeds") as cursor:
@@ -624,14 +610,20 @@ async def on_startup(app):
                 for kw in GAMING_KEYWORDS:
                     await db.execute("INSERT OR IGNORE INTO gaming_keywords (keyword) VALUES (?)", (kw.lower(),))
         await db.commit()
+    print("DEBUG: on_startup DATABASE INIT DONE")
 
-    await app.bot.send_message(chat_id=ADMIN_ID, text=f"🚀 <b>Бот запущен!</b>\n\n{get_stats()}", parse_mode="HTML", reply_markup=reply_keyboard())
+    try:
+        await app.bot.send_message(chat_id=ADMIN_ID, text=f"🚀 <b>Бот запущен!</b>\n\n{get_stats()}", parse_mode="HTML", reply_markup=reply_keyboard())
+    except Exception as e:
+        print(f"DEBUG: Startup message failed: {e}")
+    print("DEBUG: on_startup END")
 
 async def cancel_interactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Отменено.", reply_markup=reply_keyboard())
     return ConversationHandler.END
 
 def main():
+    print("--- BOT STARTING VERSION 3.0 ---")
     asyncio.run(init_db())
     
     app = Application.builder().token(BOT_TOKEN).build()

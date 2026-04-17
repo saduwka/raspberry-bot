@@ -11,7 +11,7 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 # Binance & Trade Settings
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
-TRADE_PAIR = os.getenv("TRADE_PAIR", "BTC/USDT")
+TRADE_PAIRS = os.getenv("TRADE_PAIRS", "BTC/USDT").split(",")
 PAPER_MODE = os.getenv("PAPER_MODE", "True").lower() == "true"
 TRADE_TIMEFRAME = os.getenv("TRADE_TIMEFRAME", "15m")
 TRADE_INTERVAL_SECONDS = int(os.getenv("TRADE_INTERVAL_SECONDS", "900"))
