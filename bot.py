@@ -30,14 +30,14 @@ from jobs import (
     price_check_job, send_price_digest, check_health_alert,
     fetch_news, process_and_filter_news, send_for_approval,
     fetch_job, post_to_channel, send_weekly_digest, get_stats,
-    trade_job, check_job_follow_ups
+    trade_job, check_job_follow_ups, restart_bot
 )
 import trade_handlers
 import job_handlers
 from job_handlers import (
     job_fetch_job, list_jobs_handler, dismiss_job_callback,
     job_query_handler, jobs_refresh_handler, list_applied_jobs_handler,
-    cover_letter_callback
+    cover_letter_callback, job_discovery_handler
 )
 
 # --- Logging ---
@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 ALMATY_TZ = ZoneInfo("Asia/Almaty")
 
 # Состояния диалога
-SELECT_SERVICE, INPUT_URL, INPUT_PRICE, EDIT_PRICE, ADD_RSS, ADD_KW, JOB_QUERY_INPUT = range(7)
+SELECT_SERVICE, INPUT_URL, INPUT_PRICE, EDIT_PRICE, ADD_RSS, ADD_KW, JOB_QUERY_INPUT, JOB_DISCOVERY_INPUT, TRADE_TARGET_INPUT = range(9)
 
 # --- Decorators ---
 def admin_only(func):
@@ -75,11 +75,46 @@ def admin_only(func):
 # --- UI Helpers ---
 def reply_keyboard():
     return ReplyKeyboardMarkup([
-        ["🔍 Новости", "📊 Статус"],
-        ["🛍 Мониторинг", "📈 Трейдинг"],
-        ["📋 Мои товары", "💼 Вакансии"],
-        ["⚙️ Настройки"]
+        ["💼 Вакансии", "📈 Трейдинг"],
+        ["🛍 Мониторинг", "🔍 Новости"],
+        ["⚙️ Система"]
     ], resize_keyboard=True)
+
+def monitoring_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Мои товары", callback_data="cmd_watches")],
+        [InlineKeyboardButton("➕ Добавить Kaspi", callback_data="step_kaspi"),
+         InlineKeyboardButton("➕ Добавить OLX", callback_data="step_olx")],
+    ])
+
+def system_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Статус RPi", callback_data="cmd_status")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="set_back"),
+         InlineKeyboardButton("🔄 Перезапуск", callback_data="set_restart")],
+    ])
+
+def news_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Искать новости сейчас", callback_data="cmd_fetch")],
+        [InlineKeyboardButton("📰 Настроить RSS", callback_data="set_rss"),
+         InlineKeyboardButton("🔑 Ключевые слова", callback_data="set_kw")],
+    ])
+
+@admin_only
+async def show_monitoring_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "🛍 <b>Управление мониторингом цен</b>\n\nПросматривайте активные товары или добавляйте новые ссылки с Kaspi и OLX."
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=monitoring_keyboard())
+
+@admin_only
+async def show_system_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "⚙️ <b>Системное меню</b>\n\nПроверка состояния оборудования и управление основными настройками бота."
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=system_keyboard())
+
+@admin_only
+async def show_news_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "🔍 <b>Игровые новости</b>\n\nРучной запуск парсера или настройка источников и фильтров."
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=news_keyboard())
 
 def jobs_keyboard():
     return InlineKeyboardMarkup([
@@ -87,7 +122,8 @@ def jobs_keyboard():
          InlineKeyboardButton("🔄 Обновить", callback_data="jobs_refresh")],
         [InlineKeyboardButton("📝 Мои отклики", callback_data="jobs_applied"),
          InlineKeyboardButton("🔎 Текущий запрос", callback_data="jobs_query_show")],
-        [InlineKeyboardButton("✏️ Изменить запрос", callback_data="jobs_query_edit")],
+        [InlineKeyboardButton("✏️ Изменить запрос", callback_data="jobs_query_edit"),
+         InlineKeyboardButton("🕵️ Найти компании", callback_data="jobs_discovery_edit")],
     ])
 
 @admin_only
@@ -293,7 +329,8 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🔑 Ключевые слова", callback_data="set_kw")],
         [InlineKeyboardButton("🚫 Стоп-теги", callback_data="set_tags"),
          InlineKeyboardButton("🧹 Очистка БД", callback_data="set_cleanup")],
-        [InlineKeyboardButton("❌ Закрыть", callback_data="set_close")]
+        [InlineKeyboardButton("🔄 ПЕРЕЗАПУСК", callback_data="set_restart"),
+         InlineKeyboardButton("❌ Закрыть", callback_data="set_close")]
     ]
     await update.message.reply_text("⚙️ <b>Настройки бота</b>\n\nВыберите раздел для управления:", 
                                    reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
@@ -331,10 +368,19 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("🔑 Ключевые слова", callback_data="set_kw")],
             [InlineKeyboardButton("🚫 Стоп-теги", callback_data="set_tags"),
              InlineKeyboardButton("🧹 Очистка БД", callback_data="set_cleanup")],
-            [InlineKeyboardButton("❌ Закрыть", callback_data="set_close")]
+            [InlineKeyboardButton("🔄 ПЕРЕЗАПУСК", callback_data="set_restart"),
+             InlineKeyboardButton("❌ Закрыть", callback_data="set_close")]
         ]
         await query.message.edit_text("⚙️ <b>Настройки бота</b>\n\nВыберите раздел для управления:", 
                                      reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+    elif data == "set_restart":
+        kb = [[InlineKeyboardButton("✅ ДА, ПЕРЕЗАГРУЗИТЬ", callback_data="confirm_restart")],
+              [InlineKeyboardButton("⬅️ НАЗАД", callback_data="set_back")]]
+        await query.message.edit_text("⚠️ <b>Вы уверены, что хотите перезагрузить бота?</b>", 
+                                     reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    elif data == "confirm_restart":
+        await query.message.delete()
+        await restart_bot(context=context)
     elif data == "set_cleanup":
         await cleanup_old_data()
         await query.message.edit_text("✅ База данных очищена (удалены старые логи и новости).", 
@@ -477,8 +523,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     # Обработка настроек
-    if data.startswith(("set_", "add_", "del_", "drss_", "dkw_")):
+    if data.startswith(("set_", "add_", "del_", "drss_", "dkw_", "confirm_")):
         return await settings_callback(update, context)
+
+    # Обработка вакансий
+    if data == "jobs_list":
+        await list_jobs_handler(update, context)
+    elif data == "jobs_refresh":
+        await jobs_refresh_handler(update, context)
+    elif data == "jobs_applied":
+        await list_applied_jobs_handler(update, context)
+    elif data == "jobs_query_show":
+        await job_query_handler(update, context)
+    elif data == "jobs_query_edit":
+        await query.message.reply_text("Введите новый поисковый запрос (например: React Senior):")
+        return JOB_QUERY_INPUT
+    elif data == "jobs_discovery_edit":
+        await query.message.reply_text("Опишите, какие компании искать (например: Финтех компании СНГ похожие на Каспи):")
+        return JOB_DISCOVERY_INPUT
 
     if data == "cmd_status":
         await query.message.reply_text(get_stats(), parse_mode="HTML")
@@ -487,6 +549,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("trade_select_"):
         pair = data.replace("trade_select_", "")
         await trade_handlers.trade_stats_handler(update, context, pair=pair)
+    elif data.startswith("trade_target_"):
+        pair = data.replace("trade_target_", "")
+        context.user_data["target_pair"] = pair
+        await query.message.reply_text(f"🎯 Введите целевую цену покупки для <b>{pair}</b>:\n(Бот купит только если цена будет ниже или равна этой)", parse_mode="HTML")
+        return TRADE_TARGET_INPUT
     elif data.startswith("trade_stats_"):
         pair = data.replace("trade_stats_", "")
         await trade_handlers.trade_stats_handler(update, context, pair=pair)
@@ -571,24 +638,28 @@ async def process_job_query_step(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text("💼 Меню вакансий:", parse_mode="HTML", reply_markup=jobs_keyboard())
     return ConversationHandler.END
 
+async def process_job_discovery_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    
+    # Мы можем просто вызвать существующий хендлер, передав текст сообщения в context.args
+    context.args = update.message.text.strip().split()
+    await job_discovery_handler(update, context)
+    return ConversationHandler.END
+
 @admin_only
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == "🔍 Новости":
-        await fetch_job(context)
-    elif text == "📊 Статус":
-        await update.message.reply_text(get_stats(), parse_mode="HTML")
+        await show_news_menu(update, context)
+    elif text == "⚙️ Система":
+        await show_system_menu(update, context)
     elif text == "📈 Трейдинг":
-        logger.info(f"DEBUG: '📈 Трейдинг' button clicked in message_handler. Calling show_trade_menu...")
         await show_trade_menu(update, context)
     elif text == "🛍 Мониторинг":
-        return await start_monitoring_interactive(update, context)
-    elif text == "📋 Мои товары":
-        await list_watches(update, context)
+        await show_monitoring_menu(update, context)
     elif text == "💼 Вакансии":
         await show_jobs_menu(update, context)
-    elif text == "⚙️ Настройки":
-        await show_settings(update, context)
     elif text == "/start":
         await start(update, context)
 
@@ -609,6 +680,23 @@ async def on_startup(app):
                 logger.info("Populating initial keywords...")
                 for kw in GAMING_KEYWORDS:
                     await db.execute("INSERT OR IGNORE INTO gaming_keywords (keyword) VALUES (?)", (kw.lower(),))
+        
+        async with db.execute("SELECT COUNT(*) FROM target_companies") as cursor:
+            row = await cursor.fetchone()
+            if row[0] == 0:
+                logger.info("Populating initial target companies...")
+                initial_cos = [
+                    ("Т-Банк", "https://www.tbank.ru/career/it/", ["Frontend", "Vue", "React", "TypeScript"]),
+                    ("Островок", "https://ostrovok.team/vacancies", ["Frontend", "Vue", "React", "TypeScript"]),
+                    ("Додо", "https://dodobrands.com/career", ["Frontend", "React", "TypeScript"]),
+                    ("Aviasales", "https://www.aviasales.ru/about/vacancies", ["Frontend", "React", "Vue"]),
+                    ("Kaspi", "https://kaspi.kz/guide/career/", ["Frontend", "Vue", "TypeScript"]),
+                ]
+                for name, url, kws in initial_cos:
+                    import json
+                    await db.execute("INSERT OR IGNORE INTO target_companies (name, url, keywords) VALUES (?, ?, ?)",
+                                     (name, url, json.dumps(kws)))
+        
         await db.commit()
     print("DEBUG: on_startup DATABASE INIT DONE")
 
@@ -622,6 +710,19 @@ async def cancel_interactive(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("❌ Отменено.", reply_markup=reply_keyboard())
     return ConversationHandler.END
 
+async def process_trade_target_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    try:
+        raw_text = update.message.text.replace(",", ".")
+        new_target = float(re.sub(r'[^\d.]', '', raw_text))
+        pair = context.user_data.get("target_pair")
+        await set_trade_state("target_buy_price", new_target, pair)
+        await update.message.reply_text(f"✅ Целевая цена для {pair} установлена: <b>{new_target}</b>", parse_mode="HTML", reply_markup=reply_keyboard())
+        return ConversationHandler.END
+    except:
+        await update.message.reply_text("❌ Ошибка. Введите число (например: 85.50)")
+        return TRADE_TARGET_INPUT
+
 def main():
     print("--- BOT STARTING VERSION 3.0 ---")
     asyncio.run(init_db())
@@ -631,8 +732,8 @@ def main():
 
     conv_handler = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.Regex("^🛍 Мониторинг$"), start_monitoring_interactive),
-            CallbackQueryHandler(callback_handler, pattern="^(editpr_|add_rss_ui|add_kw_ui|jobs_query_edit)")
+            CallbackQueryHandler(service_choice, pattern="^step_"),
+            CallbackQueryHandler(callback_handler, pattern="^(editpr_|add_rss_ui|add_kw_ui|jobs_query_edit|jobs_discovery_edit|trade_target_)")
         ],
         states={
             SELECT_SERVICE: [CallbackQueryHandler(service_choice, pattern="^step_")],
@@ -642,6 +743,8 @@ def main():
             ADD_RSS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_rss_step)],
             ADD_KW: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_kw_step)],
             JOB_QUERY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_job_query_step)],
+            JOB_DISCOVERY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_job_discovery_step)],
+            TRADE_TARGET_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_trade_target_step)],
         },
         fallbacks=[CommandHandler("cancel", cancel_interactive), CallbackQueryHandler(service_choice, pattern="^step_cancel$")],
     )
@@ -652,6 +755,7 @@ def main():
     app.add_handler(CommandHandler("watch_olx", watch_olx))
     app.add_handler(CommandHandler("watches", list_watches))
     app.add_handler(CommandHandler("unwatch", unwatch))
+    app.add_handler(CommandHandler("restart", restart_bot))
     
     # Команды управления источниками (остаются как запасной вариант)
     app.add_handler(CommandHandler("addrss", add_rss))
@@ -663,6 +767,7 @@ def main():
     app.add_handler(CommandHandler("jobs", list_jobs_handler))
     app.add_handler(CommandHandler("jobs_refresh", jobs_refresh_handler))
     app.add_handler(CommandHandler("job_query", job_query_handler))
+    app.add_handler(CommandHandler("discovery", job_discovery_handler))
 
     app.add_handler(CallbackQueryHandler(cover_letter_callback, pattern="^cover_job_"))
     app.add_handler(CallbackQueryHandler(dismiss_job_callback, pattern="^(dismiss_job_|apply_job_)"))

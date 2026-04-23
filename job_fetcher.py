@@ -4,22 +4,34 @@ import logging
 import asyncio
 import urllib.parse
 from bs4 import BeautifulSoup
-from database import is_vacancy_seen, get_trade_state
+from database import is_vacancy_seen, get_trade_state, get_target_companies
 
 logger = logging.getLogger(__name__)
 
-HEADERS = {"User-Agent": "JobHuntBot/1.0"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
-# Список целевых международных компаний для прямого мониторинга
-TARGET_COMPANIES = [
-    {"name": "GitLab", "url": "https://about.gitlab.com/jobs/all-jobs/", "keywords": ["Engineer", "Frontend", "Vue", "Fullstack"]},
-    {"name": "Revolut", "url": "https://www.revolut.com/careers/search-jobs/", "keywords": ["Engineer", "Backend", "Frontend"]},
-    {"name": "Doist", "url": "https://doist.com/careers/", "keywords": ["Engineer", "Product"]},
-    {"name": "Canonical", "url": "https://canonical.com/careers/all-vacancies", "keywords": ["Engineer", "Python", "Go"]},
-    {"name": "JetBrains", "url": "https://www.jetbrains.com/careers/jobs/", "keywords": ["Engineer", "Frontend"]},
-    {"name": "Elastic", "url": "https://www.elastic.co/about/careers", "keywords": ["Engineer"]},
-    {"name": "Grafana Labs", "url": "https://grafana.com/about/careers/open-positions/", "keywords": ["Engineer"]},
-]
+async def fetch_with_playwright(url):
+    """Открывает страницу через реальный браузер (Playwright) для обхода JS-защиты и рендеринга."""
+    from playwright.async_api import async_playwright
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(user_agent=HEADERS["User-Agent"])
+            page = await context.new_page()
+            
+            # Устанавливаем таймаут и ждем загрузки сети
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            
+            # Прокрутка вниз для динамического контента
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(2)
+            
+            content = await page.content()
+            await browser.close()
+            return content
+    except Exception as e:
+        logger.error(f"Playwright error for {url}: {e}")
+        return None
 
 LEVER_COMPANIES = [
     {"name": "Plaid", "board": "plaid"},
@@ -121,8 +133,8 @@ async def fetch_hh_jobs(query, schedule="remote"):
         logger.error(f"HH Error: {e}")
         return []
 
-async def fetch_rss_jobs(rss_url, source_name):
-    """Универсальный парсер для RSS (LinkedIn, Habr, WWR)."""
+async def fetch_rss_jobs(rss_url, source_name, filter_keywords=None):
+    """Универсальный парсер для RSS с поддержкой фильтрации по ключевым словам."""
     try:
         async with httpx.AsyncClient(headers=HEADERS, timeout=15) as client:
             r = await client.get(rss_url)
@@ -134,6 +146,15 @@ async def fetch_rss_jobs(rss_url, source_name):
             
             jobs = []
             for entry in feed.entries[:15]:
+                title = getattr(entry, "title", "")
+                summary = getattr(entry, "summary", "")
+                
+                # Если заданы ключевые слова, проверяем заголовок и описание
+                if filter_keywords:
+                    text_blob = (title + " " + summary).lower()
+                    if not any(kw.lower() in text_blob for kw in filter_keywords):
+                        continue
+
                 entry_url = normalize_job_url(getattr(entry, "link", None))
                 if not entry_url:
                     continue
@@ -141,13 +162,13 @@ async def fetch_rss_jobs(rss_url, source_name):
                     continue
                 
                 jobs.append({
-                    "title": entry.title,
+                    "title": title,
                     "company": entry.get("author", "N/A"),
                     "url": entry_url,
                     "salary_raw": "See website",
                     "is_remote": True,
                     "source": source_name,
-                    "description": entry.get("summary", "")
+                    "description": summary
                 })
             return jobs
     except Exception as e:
@@ -160,7 +181,7 @@ async def fetch_remotive_jobs(query):
         async with httpx.AsyncClient(headers=HEADERS, timeout=20) as client:
             r = await client.get(
                 "https://remotive.com/api/remote-jobs",
-                params={"search": query, "category": "software-dev", "limit": 30},
+                params={"search": query, "category": "front-end", "limit": 30},
             )
             r.raise_for_status()
             data = r.json()
@@ -295,28 +316,48 @@ async def fetch_ashby_jobs():
     return jobs
 
 async def fetch_career_page_jobs():
-    """Сканер для поиска новых ссылок на карьерных страницах компаний."""
+    """Сканер для поиска новых ссылок на карьерных страницах компаний с использованием Playwright при необходимости."""
+    all_targets = await get_target_companies()
+    
     jobs = []
     async with httpx.AsyncClient(headers=HEADERS, timeout=25, follow_redirects=True) as client:
-        for company in TARGET_COMPANIES:
+        for company in all_targets:
             try:
-                r = await client.get(company["url"])
-                if r.status_code != 200: continue
+                html_content = None
+                # Сначала пробуем обычный быстрый запрос
+                try:
+                    r = await client.get(company["url"])
+                    # Если 403 или пусто — используем "тяжелую артиллерию" (Playwright)
+                    if r.status_code in [403, 401] or len(r.text) < 500:
+                        logger.info(f"Using Playwright for {company['name']} (HTTP {r.status_code})...")
+                        html_content = await fetch_with_playwright(company["url"])
+                    else:
+                        html_content = r.text
+                except Exception as e:
+                    logger.warning(f"Fast fetch failed for {company['name']}, trying Playwright: {e}")
+                    html_content = await fetch_with_playwright(company["url"])
                 
-                soup = BeautifulSoup(r.text, 'html.parser')
+                if not html_content: continue
+                
+                soup = BeautifulSoup(html_content, 'html.parser')
                 links = soup.find_all('a', href=True)
                 
                 for link in links:
                     text = link.get_text().strip()
                     href = link['href']
                     
+                    if not text or len(text) < 5: continue
+                    
                     # Простейший фильтр по ключевым словам
-                    if any(kw.lower() in text.lower() for kw in company["keywords"]):
+                    match = False
+                    for kw in company["keywords"]:
+                        if kw.lower() in text.lower():
+                            match = True
+                            break
+                    
+                    if match:
                         full_url = normalize_job_url(urllib.parse.urljoin(company["url"], href))
-                        if not full_url:
-                            continue
-                        
-                        if await is_vacancy_seen(full_url): continue
+                        if not full_url or await is_vacancy_seen(full_url): continue
                         
                         jobs.append({
                             "title": text,
@@ -327,7 +368,7 @@ async def fetch_career_page_jobs():
                             "source": "Direct Career Page",
                             "description": f"Direct opportunity from {company['name']}"
                         })
-                await asyncio.sleep(1) # Небольшая пауза между компаниями
+                await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"Error scanning {company['name']}: {e}")
     return jobs
@@ -339,21 +380,23 @@ async def fetch_all_jobs():
     
     encoded_query = urllib.parse.quote(query)
     
+    # Глобальные (Remote-first)
     tasks = [
         # Локальные / СНГ
         fetch_hh_jobs(query),
         fetch_rss_jobs(f"https://career.habr.com/vacancies/rss?q={encoded_query}&remote=true", "Habr Career"),
         fetch_remotive_jobs(query),
         
-        # Прямой мониторинг
+        # Прямой мониторинг (из БД и статического списка)
         fetch_career_page_jobs(),
         fetch_lever_jobs(),
         fetch_greenhouse_jobs(),
         fetch_ashby_jobs(),
         
-        # Глобальные (Remote-first)
-        fetch_rss_jobs("https://weworkremotely.com/categories/remote-programming-jobs.rss", "WeWorkRemotely"),
-        fetch_rss_jobs("https://remoteok.com/remote-jobs.rss", "Remote OK"),
+        # Глобальные (Remote-first, только бесплатные для отклика)
+        fetch_rss_jobs("https://jsremotely.com/remote-jobs.rss", "JSRemotely", ["Frontend", "React", "Vue", "TypeScript", "JavaScript"]),
+        fetch_rss_jobs("https://workanywhere.pro/rss/frontend.xml", "WorkAnywhere"),
+        fetch_rss_jobs("https://himalayas.app/jobs.rss", "Himalayas", ["Frontend", "React", "Vue", "TypeScript"]),
     ]
     results = await asyncio.gather(*tasks)
     unique_jobs = []
@@ -365,6 +408,14 @@ async def fetch_all_jobs():
                 continue
             if not job.get("title") or not job.get("company"):
                 continue
+            
+            # Базовая фильтрация по названию, чтобы отсечь явный бэкенд до AI-скоринга
+            title_lower = job["title"].lower()
+            if "backend" in title_lower and "frontend" not in title_lower:
+                continue
+            if "devops" in title_lower or "qa engineer" in title_lower:
+                continue
+
             job["url"] = normalized_url
             unique_jobs.append(job)
             seen_urls.add(normalized_url)

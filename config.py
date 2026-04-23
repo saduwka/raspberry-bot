@@ -11,11 +11,17 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 # Binance & Trade Settings
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
-TRADE_PAIRS = os.getenv("TRADE_PAIRS", "BTC/USDT").split(",")
+TRADE_PAIRS = [p.strip() for p in os.getenv("TRADE_PAIRS", "BTC/USDT").split(",")]
 PAPER_MODE = os.getenv("PAPER_MODE", "True").lower() == "true"
 TRADE_TIMEFRAME = os.getenv("TRADE_TIMEFRAME", "15m")
 TRADE_INTERVAL_SECONDS = int(os.getenv("TRADE_INTERVAL_SECONDS", "900"))
-TRADE_QTY = float(os.getenv("TRADE_QTY", "0.001"))
+TRADE_QTY = float(os.getenv("TRADE_QTY", "0.001"))  # дефолт, если пара не найдена
+TRADE_QTY_MAP = {}
+for pair in TRADE_PAIRS:
+    base = pair.split("/")[0]  # ETH, SOL, BTC
+    qty = os.getenv(f"TRADE_QTY_{base}")
+    if qty:
+        TRADE_QTY_MAP[pair] = float(qty)
 TRADE_STOP_LOSS_PCT = float(os.getenv("TRADE_STOP_LOSS_PCT", "0.015"))
 TRADE_TAKE_PROFIT_PCT = float(os.getenv("TRADE_TAKE_PROFIT_PCT", "0.03"))
 GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.25"))

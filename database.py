@@ -109,8 +109,10 @@ async def init_db():
             """)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS trade_state (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
+                    pair TEXT,
+                    key TEXT,
+                    value TEXT,
+                    PRIMARY KEY (pair, key)
                 )
             """)
 
@@ -127,10 +129,21 @@ async def init_db():
                     match_verdict TEXT,
                     has_salary INTEGER,
                     dismissed INTEGER DEFAULT 0,
-                    applied_at TIMESTAMP,
+                    applied_at TEXT,
                     follow_up_sent INTEGER DEFAULT 0,
                     description TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # ТАБЛИЦА ДЛЯ ДИНАМИЧЕСКИХ КОМПАНИЙ
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS target_companies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT,
+                    url TEXT UNIQUE,
+                    keywords TEXT, -- JSON list
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
@@ -527,6 +540,35 @@ async def get_recent_job_history(applied_limit=3, dismissed_limit=3):
                 "liked": [{"title": r[0], "company": r[1], "reason": r[2]} for r in applied_rows],
                 "disliked": [{"title": r[0], "company": r[1], "reason": r[2]} for r in dismissed_rows]
             }
+
+# --- Dynamic Companies Management ---
+async def add_target_company(name, url, keywords=None):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            kw_json = json.dumps(keywords if keywords else [])
+            try:
+                await db.execute("INSERT OR REPLACE INTO target_companies (name, url, keywords) VALUES (?, ?, ?)",
+                                 (name, url, kw_json))
+                await db.commit()
+                return True
+            except Exception as e:
+                logger.error(f"Error adding target company: {e}")
+                return False
+
+async def get_target_companies():
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("SELECT name, url, keywords FROM target_companies") as cursor:
+                rows = await cursor.fetchall()
+                return [{"name": r[0], "url": r[1], "keywords": json.loads(r[2])} for r in rows]
+
+async def remove_target_company(company_id):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("DELETE FROM target_companies WHERE id = ?", (company_id,))
+            await db.commit()
 
 async def cleanup_old_data():
     """Чистит старые записи чтобы не раздувать память и БД."""

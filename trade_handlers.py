@@ -27,6 +27,7 @@ def trade_keyboard(pair=None):
             
     # Кнопки действий
     keyboard.append([
+        InlineKeyboardButton("🎯 Уст. цель", callback_data=f"trade_target_{active_pair}"),
         InlineKeyboardButton("📊 Статистика", callback_data=f"trade_stats_{active_pair}"),
         InlineKeyboardButton("🧠 Сигнал", callback_data=f"trade_signal_{active_pair}")
     ])
@@ -130,15 +131,10 @@ async def trade_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         count30 = int(count30) if count30 is not None else 0
         
         current_pos = await get_open_position(active_pair)
+        target_buy_price = await get_trade_state("target_buy_price", active_pair)
         pos_text = "💰 В позиции" if current_pos == "in_position" else "💤 Вне рынка"
-        last_trade_signal = await get_trade_state("last_trade_signal", active_pair)
-        last_gemini_action = await get_trade_state("last_gemini_action", active_pair)
-        last_gemini_confidence = await get_trade_state("last_gemini_confidence", active_pair)
-        last_gemini_reason = await get_trade_state("last_gemini_reason", active_pair)
-        last_trade_decision = await get_trade_state("last_trade_decision", active_pair)
-        last_risk_exit_reason = await get_trade_state("last_risk_exit_reason", active_pair)
-        entry_price = await get_trade_state("entry_price", active_pair)
-        position_qty = await get_trade_state("position_qty", active_pair)
+        
+        target_text = f"\n🎯 Цель покупки: <code>{target_buy_price}</code>" if target_buy_price else ""
         
         mode_text = "🧪 PAPER" if PAPER_MODE else "💰 LIVE"
         position_text = ""
@@ -147,11 +143,13 @@ async def trade_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             current_price = float(df.iloc[-1]["close"])
             entry_price_value = float(entry_price)
             unrealized_pnl = (current_price - entry_price_value) * qty
+            unrealized_pnl_pct = (current_price - entry_price_value) / entry_price_value * 100
+            plus_minus = "+" if unrealized_pnl > 0 else ""
             position_text = (
                 f"\n💼 <b>Открытая позиция:</b>\n"
                 f"Вход: <code>{entry_price_value:.2f}</code>\n"
                 f"Объем: <code>{qty}</code>\n"
-                f"Плавающий PnL: <code>{unrealized_pnl:.2f}</code>\n"
+                f"Плавающий PnL: <code>{plus_minus}{unrealized_pnl:.2f} ({plus_minus}{unrealized_pnl_pct:.2f}%)</code>\n"
             )
         gemini_text = ""
         if last_trade_signal or last_gemini_action or last_trade_decision:
@@ -174,7 +172,8 @@ async def trade_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         text = (
             f"📈 <b>Торговая статистика: {active_pair}</b>\n\n"
             f"Текущий статус: <b>{pos_text}</b>\n"
-            f"Режим: <code>{mode_text}</code>\n"
+            f"Режим: <code>{mode_text}</code>"
+            f"{target_text}\n"
             f"{position_text}"
             f"{indicators_text}\n"
             f"{gemini_text}"

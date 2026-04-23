@@ -48,6 +48,15 @@ def extract_json(text):
         logger.warning(f"Failed to extract JSON from: {text[:100]}... Error: {e}")
         return None
 
+def get_personal_experience():
+    """Читает базу знаний кандидата из файла."""
+    try:
+        with open("knowledge_base.md", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        logger.error(f"Error reading knowledge_base.md: {e}")
+        return "Sadu Nurzhan. Frontend Developer (Vue/React/TS)."
+
 async def process_with_gemini(title, summary, retries=2):
     """Пересказывает новость через Gemini в стиле аналитики и оценивает сентимент для трейдинга."""
     import google.generativeai as genai
@@ -118,7 +127,7 @@ async def process_job_scoring(job_title, company, description, history=None):
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-2.5-flash-lite')
     
-    cv_summary = "Vue 3, React, TypeScript, Microfrontends, REST API, Next.js, Git, Английский B1. Опыт: 4 года 1 мес. Локация: Казахстан (ищет Worldwide Remote)."
+    cv_summary = get_personal_experience()
     
     history_context = ""
     if history:
@@ -127,7 +136,7 @@ async def process_job_scoring(job_title, company, description, history=None):
         if liked: history_context += f"\nПользователю РАНЕЕ ПОНРАВИЛИСЬ эти вакансии:\n{liked}"
         if disliked: history_context += f"\nПользователь РАНЕЕ ОТКЛОНИЛ эти вакансии:\n{disliked}"
 
-    prompt = f"""Ты — HR-эксперт по международному найму. Оцени вакансию для Frontend разработчика:
+    prompt = f"""Ты — HR-эксперт по международному найму. Оцени вакансию для FRONTEND РАЗРАБОТЧИКА:
 {job_title} в компании {company}.
 
 Описание/Стек:
@@ -138,13 +147,18 @@ async def process_job_scoring(job_title, company, description, history=None):
 {history_context}
 
 Твоя задача:
-1. Оцени стек и опыт (0-10).
-2. ПРОВЕРЬ ЛОКАЦИЮ:
-   - Является ли это Worldwide Remote (нанимают отовсюду)? 
-   - Если есть жесткое ограничение по стране (кроме Казахстана), снижай score до 0-3.
-3. УЧТИ ПРЕДПОЧТЕНИЯ:
-   - Если вакансия похожа на те, что пользователю понравились, добавь +1 к score.
-   - Если вакансия похожа на те, что пользователь отклонил, снижай score.
+1. ПРОВЕРЬ РОЛЬ: 
+   - Если это Backend, DevOps, QA, Mobile (Flutter/Swift) или чисто системное программирование — ставь score 0.
+   - Если это Fullstack, где Backend занимает >50% (например, PHP/Laravel, Python/Django, Java/Spring) — ставь score 0-2.
+   - Пользователь ищет ТОЛЬКО Frontend (Vue/React/Next.js).
+2. Оцени стек и опыт (0-10):
+   - Идеально: Vue 3, TypeScript, Microfrontends.
+   - Хорошо: React, Next.js.
+3. ПРОВЕРЬ ЛОКАЦИЮ:
+   - Если есть жесткое ограничение по стране (кроме Казахстана) — ставь score 0-2.
+   - Worldwide Remote — это приоритет.
+4. УЧТИ ПРЕДПОЧТЕНИЯ:
+   - Если вакансия похожа на те, что пользователю понравились (+1 к score).
 
 Верни ТОЛЬКО JSON:
 {{
@@ -226,6 +240,7 @@ async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, av
             if not response or not response.text:
                 continue
 
+            logger.info(f"Trade Gemini raw: {response.text.strip()[:300]}")
             data = extract_json(response.text.strip())
             if data:
                 action = str(data.get("action", "HOLD")).upper()
@@ -250,6 +265,53 @@ async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, av
         except Exception as e:
             logger.error(f"Trade Gemini attempt {attempt+1}: {e}")
             await asyncio.sleep(1)
+            # Fallback если все попытки провалились
+    return {
+        "action": "HOLD",
+        "confidence": 0.0,
+        "reason": "Gemini не ответил"
+    }
+
+from database import add_target_company
+
+async def suggest_new_companies(prompt_context):
+    """Использует Gemini для поиска и добавления новых компаний в мониторинг."""
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-2.5-flash-lite')
+    
+    prompt = f"""Ты — эксперт по рынку труда в IT. Твоя задача: найти 5-10 компаний, которые соответствуют запросу пользователя.
+Для каждой компании найди ПРЯМУЮ ссылку на страницу с вакансиями (career page) или на их профиль в Greenhouse/Lever/Ashby.
+
+Запрос пользователя: {prompt_context}
+
+Верни ТОЛЬКО JSON список объектов:
+[
+  {{
+    "name": "Название компании",
+    "url": "https://company.com/careers",
+    "keywords": ["Frontend", "Vue", "React"]
+  }}
+]
+
+Важно:
+- Ссылки должны быть максимально точными.
+- Ключевые слова должны включать стек (например: Vue 3, TypeScript).
+- Ориентируйся на крупные IT компании, финтех или перспективные стартапы."""
+
+    try:
+        response = await model.generate_content_async(prompt)
+        if response and response.text:
+            companies = extract_json(response.text.strip())
+            if companies and isinstance(companies, list):
+                added_count = 0
+                for c in companies:
+                    if await add_target_company(c['name'], c['url'], c.get('keywords', [])):
+                        added_count += 1
+                return added_count, companies
+    except Exception as e:
+        logger.error(f"Discovery error: {e}")
+    return 0, []
 
 async def generate_cover_letter(job_title, company, description):
     """Генерирует лаконичное сопроводительное письмо на языке вакансии."""
@@ -257,24 +319,25 @@ async def generate_cover_letter(job_title, company, description):
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-2.5-flash-lite')
     
-    cv_summary = "Vue 3, React, TypeScript, Microfrontends, REST API, Next.js, Git, Английский B1. Опыт: 4 года 1 мес. Локация: Казахстан (ищет Worldwide Remote)."
+    cv_summary = get_personal_experience()
 
     prompt = f"""Ты — HR-эксперт. Напиши ОЧЕНЬ короткое сопроводительное письмо (Cover Letter).
 ВАЖНО: Пиши письмо на том же языке, на котором написана вакансия ниже.
 
 Кандидат: Sadu Nurzhan
-Стек: {cv_summary}
+Опыт и кейсы:
+{cv_summary}
 
-Вакансия: {job_title} в компании {company}
+Вакансия: {job_title} in {company}
 Описание вакансии:
 {description[:3000]}
 
-Требования к письму:
-1. Язык: Тот же, что в описании вакансии.
-2. Текст должен состоять СТРОГО ИЗ ОДНОГО АБЗАЦА (3-5 предложений).
-3. Акцент на: Vue 3, TypeScript и 4+ года опыта.
-4. Суть: Почему мой опыт в микрофронтендах и REST API полезен для {company}.
-5. Тон: Уверенный и лаконичный.
+Твоя задача:
+1. Выбери из "Опыта и кейсов" ОДИН наиболее подходящий проект/задачу для этой вакансии.
+2. Язык: Тот же, что в описании вакансии.
+3. Текст должен состоять СТРОГО ИЗ ОДНОГО АБЗАЦА (3-5 предложений).
+4. Суть: Почему мой конкретный опыт (например, в Module Federation или рендеринге документов) принесет пользу {company}.
+5. Тон: Уверенный и профессиональный.
 6. Никаких формальных "шапок", только само письмо.
 
 Верни ТОЛЬКО текст письма."""

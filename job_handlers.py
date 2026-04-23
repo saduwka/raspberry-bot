@@ -8,7 +8,7 @@ from database import (
     get_trade_state, set_trade_state, get_recent_job_history
 )
 from job_fetcher import fetch_all_jobs
-from ai_utils import process_job_scoring
+from ai_utils import process_job_scoring, suggest_new_companies
 from config import ADMIN_ID, JOB_MIN_SCORE, JOB_REQUIRE_WORLDWIDE
 
 logger = logging.getLogger(__name__)
@@ -77,13 +77,14 @@ async def job_fetch_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def jobs_refresh_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ручной запуск поиска вакансий."""
-    await update.message.reply_text("🔎 Запускаю поиск вакансий...")
+    target_msg = update.effective_message
+    await target_msg.reply_text("🔎 Запускаю поиск вакансий...")
     await job_fetch_job(context)
-    await update.message.reply_text("✅ Поиск завершен. Используйте /jobs.")
+    await target_msg.reply_text("✅ Поиск завершен. Используйте /jobs.")
 
 async def list_jobs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выводит топ подходящих вакансий."""
-    target_message = update.callback_query.message if update.callback_query else update.message
+    target_message = update.effective_message
     vacancies = await get_top_vacancies(limit=5)
     
     if not vacancies:
@@ -148,7 +149,7 @@ async def cover_letter_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def list_applied_jobs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список вакансий, на которые вы уже откликнулись."""
-    target_message = update.callback_query.message if update.callback_query else update.message
+    target_message = update.effective_message
     from database import get_applied_vacancies
     applied = await get_applied_vacancies(limit=10)
     
@@ -185,10 +186,11 @@ async def dismiss_job_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def job_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Позволяет просматривать и менять поисковый запрос для вакансий."""
+    target_msg = update.effective_message
     if not context.args:
         current = await get_trade_state("job_search_query")
         current = current if current else "Vue TypeScript Frontend (по умолчанию)"
-        await update.message.reply_text(
+        await target_msg.reply_text(
             f"🔎 <b>Текущий поисковый запрос:</b>\n<code>{html.escape(current)}</code>\n\n"
             f"Чтобы изменить, напишите: <code>/job_query React Senior</code>",
             parse_mode="HTML"
@@ -197,7 +199,38 @@ async def job_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     new_query = " ".join(context.args)
     await set_trade_state("job_search_query", new_query)
-    await update.message.reply_text(
+    await target_msg.reply_text(
         f"✅ <b>Запрос изменен!</b>\nТеперь бот ищет: <code>{html.escape(new_query)}</code>",
         parse_mode="HTML"
     )
+
+async def job_discovery_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Поиск и добавление новых компаний через Gemini."""
+    target_msg = update.effective_message
+    if not context.args:
+        await target_msg.reply_text(
+            "🔎 <b>Discovery Mode</b>\n\n"
+            "Напишите, какие компании искать. Например:\n"
+            "<code>/discovery Финтех компании СНГ похожие на Каспи</code>\n"
+            "<code>/discovery Стартапы в Европе с фокусом на AI и React</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    prompt = " ".join(context.args)
+    status_msg = await target_msg.reply_text("🤖 Gemini исследует рынок и ищет прямые ссылки на вакансии...")
+    
+    added_count, companies = await suggest_new_companies(prompt)
+    
+    if added_count > 0:
+        names = ", ".join([c['name'] for c in companies])
+        text = (
+            f"✅ <b>Найдено и добавлено компаний: {added_count}</b>\n\n"
+            f"Список: <i>{html.escape(names)}</i>\n\n"
+            f"Теперь при каждом поиске (раз в день или через /jobs_refresh) "
+            f"я буду проверять их карьерные страницы."
+        )
+    else:
+        text = "😔 К сожалению, не удалось найти новые подходящие компании или они уже есть в списке."
+        
+    await status_msg.edit_text(text, parse_mode="HTML")

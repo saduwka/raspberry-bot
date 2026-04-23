@@ -33,6 +33,19 @@ from database import (
 )
 from ai_utils import process_with_gemini, evaluate_trade_with_gemini
 
+async def restart_bot(update: Update = None, context: ContextTypes.DEFAULT_TYPE = None):
+    """Отправляет сообщение о перезапуске и завершает процесс."""
+    msg_text = "🔄 <b>Перезапуск бота...</b>\n\nЕсли бот запущен через systemd/pm2, он поднимется через несколько секунд."
+    if update and update.message:
+        await update.message.reply_text(msg_text, parse_mode="HTML")
+    elif context:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=msg_text, parse_mode="HTML")
+    
+    # Небольшая задержка, чтобы сообщение успело уйти
+    await asyncio.sleep(1)
+    import os
+    os._exit(0)
+
 async def check_job_follow_ups(context: ContextTypes.DEFAULT_TYPE):
     """Проверяет вакансии, на которые вы откликнулись 7 дней назад."""
     pending = await get_pending_follow_ups(days=7)
@@ -525,6 +538,13 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
             f"(conf={gemini_decision['confidence']:.2f}) | Final: {signal} | Price: {last_price}"
         )
         
+        # 5. Проверка целевой цены (если установлена)
+        target_buy_price = await get_trade_state("target_buy_price", pair)
+        if signal == "BUY" and target_buy_price is not None:
+            if last_price > float(target_buy_price):
+                logger.info(f"[{pair}] Signal BUY ignored: price {last_price} > target {target_buy_price}")
+                signal = "HOLD"
+
         if signal == "BUY" and current_pos == "in_position":
             continue
         if signal == "SELL" and (current_pos == "none" or current_pos is None):
@@ -533,18 +553,46 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         # 6. Исполняем
-        success = await trade_engine.execute_trade(signal, last_price, pair, avg_sentiment)
+        trade_result = await trade_engine.execute_trade(signal, last_price, pair, avg_sentiment)
         
-        if success:
+        if trade_result and trade_result.get("success"):
             side_emoji = "🚀" if signal == "BUY" else "🔻"
+            side_text = "ПОКУПКА" if signal == "BUY" else "ПРОДАЖА"
+            pnl_text = ""
+            
+            exec_price = trade_result.get("price", last_price)
+            exec_qty = trade_result.get("qty", 0)
+            total_amount = exec_price * exec_qty
+
+            if signal == "SELL":
+                pnl = trade_result.get("pnl", 0.0)
+                entry_p = trade_result.get("entry_price")
+                if entry_p:
+                    pnl_pct = (exec_price - entry_p) / entry_p * 100
+                    plus_minus = "+" if pnl > 0 else ""
+                    pnl_text = (
+                        f"\nВход: <code>{entry_p:.2f}</code>"
+                        f"\nРезультат: <b>{plus_minus}{pnl:.2f} USDT ({plus_minus}{pnl_pct:.2f}%)</b>"
+                    )
+                else:
+                    pnl_text = f"\nРезультат: <b>{pnl:.2f} USDT</b>"
+
+            target_text = f"\nЦель: <code>{target_buy_price}</code>" if signal == "BUY" and target_buy_price else ""
+            
             text = (
-                f"{side_emoji} <b>Торговый сигнал: {signal}</b>\n\n"
-                f"Пара: <code>{pair}</code>\n"
-                f"Цена: <code>{last_price}</code>\n"
+                f"{side_emoji} <b>{side_text}: {pair}</b>\n\n"
+                f"Цена {'входа' if signal == 'BUY' else 'выхода'}: <code>{exec_price}</code>\n"
+                f"Объем: <code>{exec_qty}</code>\n"
+                f"Сумма: <code>{total_amount:.2f} USDT</code>"
+                f"{target_text}\n"
                 f"Gemini: <code>{gemini_decision['action']}</code> ({gemini_decision['confidence']:.2f})\n"
-                f"Причина Gemini: <code>{html.escape(gemini_decision['reason'])}</code>\n"
+                f"Причина: <code>{html.escape(gemini_decision['reason'])}</code>{pnl_text}\n"
                 f"Режим: {'🧪 PAPER' if trade_engine.PAPER_MODE else '💰 LIVE'}"
             )
+            
+            # Сбрасываем целевую цену после покупки
+            if signal == "BUY":
+                await set_trade_state("target_buy_price", None, pair)
             try:
                 await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
             except Exception as e:

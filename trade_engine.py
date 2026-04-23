@@ -111,17 +111,23 @@ async def execute_trade(signal, price, pair, sentiment_score=0):
         
     logger.info(f"Executing {signal} for {pair} at {price} (Sentiment: {sentiment_score})")
     
-    qty = TRADE_QTY
+    from config import TRADE_QTY_MAP
+    qty = TRADE_QTY_MAP.get(pair, TRADE_QTY)
     pnl = 0.0
     
+    entry_price = None
     # Расчет PnL для SELL (разница между ценой продажи и покупки)
+    trade_qty = qty
     if signal == "SELL":
         entry_price_raw = await get_trade_state("entry_price", pair)
+        stored_qty = await get_trade_state("position_qty", pair)
         if entry_price_raw is not None:
             try:
                 entry_price = float(entry_price_raw)
-                pnl = (price - entry_price) * qty
-                logger.info(f"Closed trade for {pair} with PnL: {pnl:.4f} (Entry: {entry_price}, Exit: {price})")
+                # Используем сохраненный объем, если он есть, иначе текущий
+                trade_qty = float(stored_qty) if stored_qty is not None else qty
+                pnl = (price - entry_price) * trade_qty
+                logger.info(f"Closed trade for {pair} with PnL: {pnl:.4f} (Entry: {entry_price}, Exit: {price}, Qty: {trade_qty})")
             except Exception as e:
                 logger.error(f"Error calculating PnL for {pair}: {e}")
         else:
@@ -131,7 +137,7 @@ async def execute_trade(signal, price, pair, sentiment_score=0):
         pair=pair,
         side=signal,
         price=price,
-        qty=qty,
+        qty=trade_qty,
         pnl=pnl,
         signal=f"AGGRESSIVE_{signal}",
         sentiment=str(sentiment_score)
@@ -147,4 +153,4 @@ async def execute_trade(signal, price, pair, sentiment_score=0):
         await set_trade_state("entry_price", None, pair)
         await set_trade_state("position_qty", None, pair)
 
-    return True
+    return {"success": True, "pnl": pnl, "entry_price": entry_price, "price": price, "qty": trade_qty}
