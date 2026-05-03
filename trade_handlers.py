@@ -27,7 +27,6 @@ def trade_keyboard(pair=None):
             
     # Кнопки действий
     keyboard.append([
-        InlineKeyboardButton("🎯 Уст. цель", callback_data=f"trade_target_{active_pair}"),
         InlineKeyboardButton("📊 Статистика", callback_data=f"trade_stats_{active_pair}"),
         InlineKeyboardButton("🧠 Сигнал", callback_data=f"trade_signal_{active_pair}")
     ])
@@ -40,14 +39,18 @@ def trade_keyboard(pair=None):
 
 async def show_trade_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # По умолчанию показываем первую пару
-    logger.info(f"DEBUG: show_trade_menu called. TRADE_PAIRS: {TRADE_PAIRS}")
     pair = TRADE_PAIRS[0]
     text = (
         f"📈 <b>Трейдинг: {pair}</b>\n\n"
         "Управление торговым модулем через кнопки. Выберите пару для просмотра деталей."
     )
     if update.callback_query:
-        await update.callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=trade_keyboard(pair))
+        try:
+            await update.callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=trade_keyboard(pair))
+        except BadRequest:
+            # Если не получается отредактировать, удаляем старое и шлем новое
+            await update.callback_query.message.delete()
+            await context.bot.send_message(update.effective_chat.id, text, parse_mode="HTML", reply_markup=trade_keyboard(pair))
     else:
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=trade_keyboard(pair))
 
@@ -68,19 +71,18 @@ async def trade_signal_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             gemini_reason = await get_trade_state("last_gemini_reason", active_pair)
             risk_exit = await get_trade_state("last_risk_exit_reason", active_pair)
 
-            confidence_text = f"{float(gemini_confidence):.2f}" if gemini_confidence is not None else "0.00"
+            confidence_text = f"{int(float(gemini_confidence)*100)}%" if gemini_confidence is not None else "0%"
+            
+            # Упрощенные названия для индикаторов
             text = (
-                f"🧠 <b>Текущий сигнал: {active_pair}</b>\n\n"
-                f"Цена: <code>{float(last['close']):.2f}</code>\n"
-                f"EMA Fast: <code>{float(last['ema_fast']):.2f}</code>\n"
-                f"EMA Slow: <code>{float(last['ema_slow']):.2f}</code>\n"
-                f"RSI: <code>{float(last['rsi']):.2f}</code>\n\n"
-                f"Техсигнал: <code>{html.escape(str(technical_signal or 'N/A'))}</code>\n"
-                f"Gemini: <code>{html.escape(str(gemini_action or 'N/A'))}</code> "
-                f"(<code>{confidence_text}</code>)\n"
-                f"Итог: <code>{html.escape(str(final_decision or 'HOLD'))}</code>\n"
-                f"Риск-выход: <code>{html.escape(str(risk_exit or 'нет'))}</code>\n"
-                f"Причина: <code>{html.escape(str(gemini_reason or 'нет объяснения'))}</code>"
+                f"🧠 <b>Анализ рынка: {active_pair}</b>\n\n"
+                f"💰 Текущая цена: <code>{float(last['close']):.2f}</code>\n"
+                f"📈 Средняя цена (быстрая): <code>{float(last['ema_fast']):.2f}</code>\n"
+                f"📉 Средняя цена (тренд): <code>{float(last['ema_slow']):.2f}</code>\n"
+                f"🌡 Настроение рынка (RSI): <code>{float(last['rsi']):.1f}</code>\n\n"
+                f"🤖 <b>Вердикт ИИ: {gemini_action or 'HOLD'}</b>\n"
+                f"🎯 Уверенность: <code>{confidence_text}</code>\n"
+                f"📝 <b>Почему так:</b>\n<i>{html.escape(str(gemini_reason or 'Анализирую данные...'))}</i>"
             )
 
         if update.callback_query:
@@ -131,13 +133,14 @@ async def trade_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         count30 = int(count30) if count30 is not None else 0
         
         current_pos = await get_open_position(active_pair)
-        target_buy_price = await get_trade_state("target_buy_price", active_pair)
         pos_text = "💰 В позиции" if current_pos == "in_position" else "💤 Вне рынка"
-        
-        target_text = f"\n🎯 Цель покупки: <code>{target_buy_price}</code>" if target_buy_price else ""
         
         mode_text = "🧪 PAPER" if PAPER_MODE else "💰 LIVE"
         position_text = ""
+        
+        entry_price = await get_trade_state("entry_price", active_pair)
+        position_qty = await get_trade_state("position_qty", active_pair)
+        
         if current_pos == "in_position" and df is not None and not df.empty and entry_price is not None:
             qty = float(position_qty) if position_qty is not None else TRADE_QTY
             current_price = float(df.iloc[-1]["close"])
@@ -151,6 +154,14 @@ async def trade_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"Объем: <code>{qty}</code>\n"
                 f"Плавающий PnL: <code>{plus_minus}{unrealized_pnl:.2f} ({plus_minus}{unrealized_pnl_pct:.2f}%)</code>\n"
             )
+
+        last_trade_signal = await get_trade_state("last_trade_signal", active_pair)
+        last_gemini_action = await get_trade_state("last_gemini_action", active_pair)
+        last_gemini_confidence = await get_trade_state("last_gemini_confidence", active_pair)
+        last_trade_decision = await get_trade_state("last_trade_decision", active_pair)
+        last_gemini_reason = await get_trade_state("last_gemini_reason", active_pair)
+        last_risk_exit_reason = await get_trade_state("last_risk_exit_reason", active_pair)
+
         gemini_text = ""
         if last_trade_signal or last_gemini_action or last_trade_decision:
             confidence_text = (
@@ -173,7 +184,6 @@ async def trade_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"📈 <b>Торговая статистика: {active_pair}</b>\n\n"
             f"Текущий статус: <b>{pos_text}</b>\n"
             f"Режим: <code>{mode_text}</code>"
-            f"{target_text}\n"
             f"{position_text}"
             f"{indicators_text}\n"
             f"{gemini_text}"
@@ -194,7 +204,8 @@ async def trade_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             except BadRequest as e:
                 if "Message is not modified" not in str(e):
-                    raise
+                    await update.callback_query.message.delete()
+                    await context.bot.send_message(update.effective_chat.id, text, parse_mode="HTML", reply_markup=trade_keyboard(active_pair))
         else:
             await update.message.reply_text(text, parse_mode="HTML", reply_markup=trade_keyboard(active_pair))
             

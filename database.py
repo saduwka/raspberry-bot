@@ -232,6 +232,35 @@ async def mark_posted(url):
             await db.execute("INSERT OR IGNORE INTO posted (url, posted_at) VALUES (?, ?)",
                              (url, datetime.now().isoformat()))
             await db.commit()
+            seven_days_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+            async with db.execute("SELECT COUNT(*) FROM events_log WHERE event_type='post_approved' AND created_at > ?", (seven_days_ago,)) as cursor:
+                approved = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM events_log WHERE event_type='post_rejected' AND created_at > ?", (seven_days_ago,)) as cursor:
+                rejected = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM watches") as cursor:
+                watches = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM events_log WHERE event_type='price_alert' AND created_at > ?", (seven_days_ago,)) as cursor:
+                alerts = (await cursor.fetchone())[0]
+            return {"approved": approved, "rejected": rejected, "watches": watches, "alerts": alerts}
+
+async def set_oled_config(key: str, value: str):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("INSERT OR REPLACE INTO oled_config (key, value) VALUES (?, ?)", (key, value))
+            await db.commit()
+
+async def populate_initial_data(rss_feeds: list, keywords: list):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("SELECT COUNT(*) FROM rss_feeds") as cursor:
+                if (await cursor.fetchone())[0] == 0:
+                    for url in rss_feeds:
+                        await db.execute("INSERT OR IGNORE INTO rss_feeds (url) VALUES (?)", (url,))
+            async with db.execute("SELECT COUNT(*) FROM gaming_keywords") as cursor:
+                if (await cursor.fetchone())[0] == 0:
+                    for kw in keywords:
+                        await db.execute("INSERT OR IGNORE INTO gaming_keywords (keyword) VALUES (?)", (kw.lower(),))
+            await db.commit()
 
 # --- Tags ---
 async def get_blocked_tags():
@@ -583,22 +612,67 @@ async def cleanup_old_data():
             await db.execute("DELETE FROM posted WHERE posted_at < datetime('now', '-60 days')")
             await db.commit()
             logger.info("Database cleanup completed.")
-        
-            return {
-                "liked": [{"title": r[0], "company": r[1], "reason": r[2]} for r in applied_rows],
-                "disliked": [{"title": r[0], "company": r[1], "reason": r[2]} for r in dismissed_rows]
-            }
 
-async def cleanup_old_data():
-    """Чистит старые записи чтобы не раздувать память и БД."""
+async def mark_alert_sent(watch_id: int):
     async with db_lock:
         async with aiosqlite.connect(DB_PATH, timeout=30) as db:
             await db.execute("PRAGMA journal_mode=WAL")
-            # Логи здоровья старше 7 дней
-            await db.execute("DELETE FROM events_log WHERE created_at < datetime('now', '-7 days')")
-            # Pending новости старше 3 дней (уже не актуальны)
-            await db.execute("DELETE FROM pending WHERE created_at < datetime('now', '-3 days')")
-            # Posted старше 60 дней (для дедупликации достаточно 60 дней)
-            await db.execute("DELETE FROM posted WHERE posted_at < datetime('now', '-60 days')")
+            await db.execute("UPDATE price_alerts SET sent_at=CURRENT_TIMESTAMP WHERE watch_id=? AND sent_at IS NULL", (watch_id,))
             await db.commit()
-            logger.info("Database cleanup completed.")
+
+async def get_pending_price_alerts():
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("""
+                SELECT pa.id, pa.watch_id, pa.price, pa.item_name, pa.item_url, w.name as watch_name, w.user_id 
+                FROM price_alerts pa
+                JOIN watches w ON pa.watch_id = w.id
+                WHERE pa.sent_at IS NULL
+            """) as cursor:
+                return await cursor.fetchall()
+
+async def mark_alerts_sent(alert_ids: list):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            placeholders = ",".join(["?"] * len(alert_ids))
+            await db.execute(f"UPDATE price_alerts SET sent_at=CURRENT_TIMESTAMP WHERE id IN ({placeholders})", alert_ids)
+            await db.commit()
+
+async def get_recent_sentiments(hours=12):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("""
+                SELECT meta FROM events_log
+                WHERE event_type='news_sentiment'
+                AND created_at > datetime('now', ?)
+            """, (f'-{hours} hours',)) as cursor:
+                return await cursor.fetchall()
+
+async def get_weekly_stats():
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            from datetime import datetime, timedelta
+            seven_days_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+            async with db.execute("SELECT COUNT(*) FROM events_log WHERE event_type='post_approved' AND created_at > ?", (seven_days_ago,)) as cursor:
+                approved = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM events_log WHERE event_type='post_rejected' AND created_at > ?", (seven_days_ago,)) as cursor:
+                rejected = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM watches") as cursor:
+                watches = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM events_log WHERE event_type='price_alert' AND created_at > ?", (seven_days_ago,)) as cursor:
+                alerts = (await cursor.fetchone())[0]
+            return {"approved": approved, "rejected": rejected, "watches": watches, "alerts": alerts}
+
+async def get_daily_trades(hours=24):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            from datetime import datetime, timedelta
+            time_ago = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            async with db.execute("""
+                SELECT pair, side, price, qty, pnl, signal, sentiment, created_at
+                FROM trades
+                WHERE created_at > ?
+                ORDER BY created_at ASC
+            """, (time_ago,)) as cursor:
+                return await cursor.fetchall()

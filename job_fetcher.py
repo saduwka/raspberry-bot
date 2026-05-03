@@ -8,7 +8,9 @@ from database import is_vacancy_seen, get_trade_state, get_target_companies
 
 logger = logging.getLogger(__name__)
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+}
 
 async def fetch_with_playwright(url):
     """Открывает страницу через реальный браузер (Playwright) для обхода JS-защиты и рендеринга."""
@@ -96,7 +98,9 @@ async def fetch_hh_jobs(query, schedule="remote"):
         "order_by": "publication_time"
     }
     try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=10) as client:
+        hh_headers = HEADERS.copy()
+        hh_headers["Accept"] = "application/json"
+        async with httpx.AsyncClient(headers=hh_headers, timeout=10) as client:
             r = await client.get(url, params=params)
             r.raise_for_status()
             data = r.json()
@@ -394,9 +398,9 @@ async def fetch_all_jobs():
         fetch_ashby_jobs(),
         
         # Глобальные (Remote-first, только бесплатные для отклика)
-        fetch_rss_jobs("https://jsremotely.com/remote-jobs.rss", "JSRemotely", ["Frontend", "React", "Vue", "TypeScript", "JavaScript"]),
-        fetch_rss_jobs("https://workanywhere.pro/rss/frontend.xml", "WorkAnywhere"),
-        fetch_rss_jobs("https://himalayas.app/jobs.rss", "Himalayas", ["Frontend", "React", "Vue", "TypeScript"]),
+        fetch_rss_jobs("https://remoteok.com/remote-jobs.rss", "RemoteOK", ["Frontend", "React", "Vue", "TypeScript", "JavaScript"]),
+        fetch_rss_jobs("https://weworkremotely.com/categories/remote-front-end-programming-jobs.rss", "WeWorkRemotely"),
+        fetch_rss_jobs("https://jsremotely.com/rss", "JSRemotely", ["Frontend", "React", "Vue", "TypeScript", "JavaScript"]),
     ]
     results = await asyncio.gather(*tasks)
     unique_jobs = []

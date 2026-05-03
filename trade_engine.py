@@ -48,24 +48,24 @@ async def fetch_ohlcv(symbol, timeframe=TRADE_TIMEFRAME, limit=100):
         await exchange.close()
 
 def calc_indicators(df):
-    """Рассчитывает EMA3, EMA8 и RSI14."""
+    """Рассчитывает EMA5, EMA13, EMA50 (тренд) и RSI14."""
     if df is None or df.empty:
         return None
         
     from ta.trend import EMAIndicator
     from ta.momentum import RSIIndicator
     
-    df['ema_fast'] = EMAIndicator(close=df['close'], window=3).ema_indicator()
-    df['ema_slow'] = EMAIndicator(close=df['close'], window=8).ema_indicator()
+    df['ema_fast'] = EMAIndicator(close=df['close'], window=5).ema_indicator()
+    df['ema_slow'] = EMAIndicator(close=df['close'], window=13).ema_indicator()
+    df['ema_trend'] = EMAIndicator(close=df['close'], window=50).ema_indicator()
     df['rsi'] = RSIIndicator(close=df['close'], window=14).rsi()
     return df
 
 def get_signal(df, sentiment=0):
     """
-    Генерирует сигнал.
-    Агрессивный режим:
-    BUY: EMA3 > EMA8 + RSI < 80 (или пересечение)
-    SELL: EMA3 < EMA8 OR RSI > 85
+    Генерирует сигнал с учетом фильтра тренда и сентимента.
+    BUY: (Пересечение вверх ИЛИ (Бычий тренд И RSI < 50)) И Цена > EMA50 И Sentiment >= -0.1
+    SELL: Пересечение вниз ИЛИ (RSI > 80 И Цена < EMA5) ИЛИ Цена < EMA50 * 0.998
     """
     if df is None or len(df) < 2:
         return "HOLD"
@@ -76,16 +76,23 @@ def get_signal(df, sentiment=0):
     # Состояние тренда
     is_bullish = last['ema_fast'] > last['ema_slow']
     is_bearish = last['ema_fast'] < last['ema_slow']
+    above_trend = last['close'] > last['ema_trend']
+    below_trend = last['close'] < (last['ema_trend'] * 0.998) # Небольшой допуск, чтобы не выбивало на шуме
     
     # Момент пересечения
     ema_cross_up = prev['ema_fast'] <= prev['ema_slow'] and is_bullish
     ema_cross_down = prev['ema_fast'] >= prev['ema_slow'] and is_bearish
     
-    # Вход: если только что пересеклись ИЛИ если тренд уже бычий, но RSI позволяет
-    if (ema_cross_up or is_bullish) and last['rsi'] < 80:
+    # Вход: пересечение вверх ИЛИ (бычий настрой И RSI < 45), при этом ослабляем требование выше тренда
+    if (ema_cross_up or (is_bullish and last['rsi'] < 45)) and sentiment >= -0.1:
+        # Если ниже тренда, требуем более сильный RSI (перепроданность)
+        if not above_trend and last['rsi'] > 30:
+             return "HOLD"
         return "BUY"
-    # Выход: пересечение вниз или перекупленность
-    elif ema_cross_down or last['rsi'] > 85:
+
+    
+    # Выход: пересечение вниз ИЛИ сильная перекупленность с разворотом ИЛИ уверенный уход под тренд
+    elif ema_cross_down or (last['rsi'] > 80 and last['close'] < last['ema_fast']) or below_trend:
         return "SELL"
         
     return "HOLD"

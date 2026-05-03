@@ -13,8 +13,8 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 TRADE_PAIRS = [p.strip() for p in os.getenv("TRADE_PAIRS", "BTC/USDT").split(",")]
 PAPER_MODE = os.getenv("PAPER_MODE", "True").lower() == "true"
-TRADE_TIMEFRAME = os.getenv("TRADE_TIMEFRAME", "15m")
-TRADE_INTERVAL_SECONDS = int(os.getenv("TRADE_INTERVAL_SECONDS", "900"))
+TRADE_TIMEFRAME = os.getenv("TRADE_TIMEFRAME", "5m")
+TRADE_INTERVAL_SECONDS = int(os.getenv("TRADE_INTERVAL_SECONDS", "300"))
 TRADE_QTY = float(os.getenv("TRADE_QTY", "0.001"))  # дефолт, если пара не найдена
 TRADE_QTY_MAP = {}
 for pair in TRADE_PAIRS:
@@ -24,7 +24,7 @@ for pair in TRADE_PAIRS:
         TRADE_QTY_MAP[pair] = float(qty)
 TRADE_STOP_LOSS_PCT = float(os.getenv("TRADE_STOP_LOSS_PCT", "0.015"))
 TRADE_TAKE_PROFIT_PCT = float(os.getenv("TRADE_TAKE_PROFIT_PCT", "0.03"))
-GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.25"))
+GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.2"))
 JOB_MIN_SCORE = int(os.getenv("JOB_MIN_SCORE", "7"))
 JOB_REQUIRE_WORLDWIDE = os.getenv("JOB_REQUIRE_WORLDWIDE", "True").lower() == "true"
 

@@ -25,17 +25,20 @@ from config import (
     GEMINI_MIN_CONFIDENCE,
 )
 from database import (
-    get_watches, is_posted, is_pending, mark_posted, save_price_alert, 
-    update_watch_price, save_pending, get_pending, delete_pending, 
+    get_watches, is_posted, is_pending, mark_posted, save_price_alert,
+    update_watch_price, save_pending, get_pending, delete_pending,
     log_event, get_blocked_tags, get_rss_feeds, get_gaming_keywords,
     get_open_position, save_trade, set_trade_state, get_trade_state,
-    get_pending_follow_ups, mark_follow_up_sent
+    get_pending_follow_ups, mark_follow_up_sent,
+    mark_alert_sent, get_pending_price_alerts, mark_alerts_sent,
+    get_recent_sentiments, get_weekly_stats, get_daily_trades
 )
-from ai_utils import process_with_gemini, evaluate_trade_with_gemini
+
+from ai_utils import process_with_gemini, evaluate_trade_with_gemini, generate_daily_analytics
 
 async def restart_bot(update: Update = None, context: ContextTypes.DEFAULT_TYPE = None):
-    """Отправляет сообщение о перезапуске и завершает процесс."""
-    msg_text = "🔄 <b>Перезапуск бота...</b>\n\nЕсли бот запущен через systemd/pm2, он поднимется через несколько секунд."
+    """Отправляет сообщение о перезапуске и инициирует его через systemctl."""
+    msg_text = "🔄 <b>Инициирую перезапуск через systemd...</b>"
     if update and update.message:
         await update.message.reply_text(msg_text, parse_mode="HTML")
     elif context:
@@ -43,6 +46,8 @@ async def restart_bot(update: Update = None, context: ContextTypes.DEFAULT_TYPE 
     
     # Небольшая задержка, чтобы сообщение успело уйти
     await asyncio.sleep(1)
+    import subprocess
+    subprocess.Popen(["sudo", "systemctl", "restart", "gamebot.service"])
     import os
     os._exit(0)
 
@@ -207,26 +212,15 @@ async def price_check_job(context: ContextTypes.DEFAULT_TYPE):
 
                         try:
                             await context.bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
-                            async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-                                await db.execute("PRAGMA journal_mode=WAL")
-                                await db.execute("UPDATE price_alerts SET sent_at=CURRENT_TIMESTAMP WHERE watch_id=? AND sent_at IS NULL", (watch_id,))
-                                await db.commit()
+                            await mark_alert_sent(watch_id)
                         except Exception as e:
                             logger.error(f"Error sending drop notification: {e}")
             await asyncio.sleep(2)
     
     gc.collect() # Очистка после цикла мониторинга
-
+...
 async def send_price_digest(context: ContextTypes.DEFAULT_TYPE):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        async with db.execute("""
-            SELECT pa.id, pa.watch_id, pa.price, pa.item_name, pa.item_url, w.name as watch_name, w.user_id 
-            FROM price_alerts pa
-            JOIN watches w ON pa.watch_id = w.id
-            WHERE pa.sent_at IS NULL
-        """) as cursor:
-            alerts = await cursor.fetchall()
+    alerts = await get_pending_price_alerts()
     
     if not alerts:
         return
@@ -250,11 +244,7 @@ async def send_price_digest(context: ContextTypes.DEFAULT_TYPE):
         
         try:
             await context.bot.send_message(chat_id=data["uid"], text=text, parse_mode="HTML", disable_web_page_preview=True)
-            async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-                await db.execute("PRAGMA journal_mode=WAL")
-                placeholders = ",".join(["?"] * len(data["ids"]))
-                await db.execute(f"UPDATE price_alerts SET sent_at=CURRENT_TIMESTAMP WHERE id IN ({placeholders})", data["ids"])
-                await db.commit()
+            await mark_alerts_sent(data["ids"])
         except Exception as e:
             logger.error(f"Error sending digest: {e}")
 
@@ -438,25 +428,18 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
         
         # 3. Получаем средний сентимент за последние 12 часов
         avg_sentiment = 0
-        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            await db.execute("PRAGMA journal_mode=WAL")
-            async with db.execute("""
-                SELECT meta FROM events_log 
-                WHERE event_type='news_sentiment' 
-                AND created_at > datetime('now', '-12 hours')
-            """) as cursor:
-                rows = await cursor.fetchall()
-                if rows:
-                    sentiments = []
-                    for r in rows:
-                        try:
-                            if r[0]:
-                                data = json.loads(r[0])
-                                sentiments.append(data.get('sentiment', 0))
-                        except:
-                            continue
-                    if sentiments:
-                        avg_sentiment = sum(sentiments) / len(sentiments)
+        rows = await get_recent_sentiments(12)
+        if rows:
+            sentiments = []
+            for r in rows:
+                try:
+                    if r[0]:
+                        data = json.loads(r[0])
+                        sentiments.append(data.get('sentiment', 0))
+                except:
+                    continue
+            if sentiments:
+                avg_sentiment = sum(sentiments) / len(sentiments)
         
         if df is None or df.empty:
             logger.warning(f"No data for indicators for {pair}, skipping")
@@ -477,15 +460,18 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
         technical_signal = trade_engine.get_signal(df, sentiment=avg_sentiment)
         if risk_exit_reason:
             technical_signal = "SELL"
+        
+        logger.info(f"[{pair}] Tech: {technical_signal} | Sentiment: {avg_sentiment:.2f} | RiskExit: {risk_exit_reason}")
+
         market_snapshot = {
             "pair": pair,
             "price": round(float(last_price), 2),
+            "volume": round(float(last_row["volume"]), 2),
             "ema_fast": round(float(last_row["ema_fast"]), 2),
             "ema_slow": round(float(last_row["ema_slow"]), 2),
+            "ema_trend": round(float(last_row["ema_trend"]), 2),
             "rsi": round(float(last_row["rsi"]), 2),
             "ema_gap": round(float(last_row["ema_fast"] - last_row["ema_slow"]), 2),
-            "previous_ema_fast": round(float(df.iloc[-2]["ema_fast"]), 2),
-            "previous_ema_slow": round(float(df.iloc[-2]["ema_slow"]), 2),
             "technical_signal": technical_signal,
             "position_state": current_pos or "none",
             "entry_price": round(float(entry_price), 2) if entry_price is not None else None,
@@ -513,16 +499,21 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
                 avg_sentiment=avg_sentiment,
             )
             
-            # АГРЕССИВНОЕ РЕШЕНИЕ:
-            if (
-                gemini_decision["action"] == technical_signal
-                and gemini_decision["confidence"] >= GEMINI_MIN_CONFIDENCE
-            ) or (
-                technical_signal != "HOLD" 
-                and gemini_decision["action"] == "HOLD" 
-                and gemini_decision["confidence"] < 0.5
-            ):
-                signal = technical_signal
+            logger.info(f"[{pair}] Gemini Decision: {gemini_decision}")
+            
+            # УЛУЧШЕННОЕ КОНСЕРВАТИВНОЕ РЕШЕНИЕ:
+            if technical_signal == "BUY":
+                # Покупаем только если Gemini подтверждает BUY с достаточной уверенностью
+                if gemini_decision["action"] == "BUY" and gemini_decision["confidence"] >= GEMINI_MIN_CONFIDENCE:
+                    signal = "BUY"
+                else:
+                    signal = "HOLD"
+            elif technical_signal == "SELL":
+                # Продаем если техсигнал SELL, НО если Gemini видит потенциал роста (BUY) — удерживаем
+                if gemini_decision["action"] == "BUY" and gemini_decision["confidence"] >= 0.6:
+                    signal = "HOLD"
+                else:
+                    signal = "SELL"
             else:
                 signal = "HOLD"
 
@@ -538,13 +529,6 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
             f"(conf={gemini_decision['confidence']:.2f}) | Final: {signal} | Price: {last_price}"
         )
         
-        # 5. Проверка целевой цены (если установлена)
-        target_buy_price = await get_trade_state("target_buy_price", pair)
-        if signal == "BUY" and target_buy_price is not None:
-            if last_price > float(target_buy_price):
-                logger.info(f"[{pair}] Signal BUY ignored: price {last_price} > target {target_buy_price}")
-                signal = "HOLD"
-
         if signal == "BUY" and current_pos == "in_position":
             continue
         if signal == "SELL" and (current_pos == "none" or current_pos is None):
@@ -577,22 +561,16 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     pnl_text = f"\nРезультат: <b>{pnl:.2f} USDT</b>"
 
-            target_text = f"\nЦель: <code>{target_buy_price}</code>" if signal == "BUY" and target_buy_price else ""
-            
             text = (
                 f"{side_emoji} <b>{side_text}: {pair}</b>\n\n"
                 f"Цена {'входа' if signal == 'BUY' else 'выхода'}: <code>{exec_price}</code>\n"
                 f"Объем: <code>{exec_qty}</code>\n"
-                f"Сумма: <code>{total_amount:.2f} USDT</code>"
-                f"{target_text}\n"
+                f"Сумма: <code>{total_amount:.2f} USDT</code>\n"
                 f"Gemini: <code>{gemini_decision['action']}</code> ({gemini_decision['confidence']:.2f})\n"
                 f"Причина: <code>{html.escape(gemini_decision['reason'])}</code>{pnl_text}\n"
                 f"Режим: {'🧪 PAPER' if trade_engine.PAPER_MODE else '💰 LIVE'}"
             )
             
-            # Сбрасываем целевую цену после покупки
-            if signal == "BUY":
-                await set_trade_state("target_buy_price", None, pair)
             try:
                 await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
             except Exception as e:
@@ -624,28 +602,14 @@ async def post_to_channel(bot, pending_id):
 
 async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Generating weekly digest...")
+    stats = await get_weekly_stats()
+
     async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("PRAGMA journal_mode=WAL")
-        
         seven_days_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
-        
-        async with db.execute("SELECT COUNT(*) FROM events_log WHERE event_type='post_approved' AND created_at > ?", (seven_days_ago,)) as cursor:
-            row = await cursor.fetchone()
-            approved = row[0]
-        async with db.execute("SELECT COUNT(*) FROM events_log WHERE event_type='post_rejected' AND created_at > ?", (seven_days_ago,)) as cursor:
-            row = await cursor.fetchone()
-            rejected = row[0]
-        
-        async with db.execute("SELECT COUNT(*) FROM watches") as cursor:
-            row = await cursor.fetchone()
-            watches_count = row[0]
-        async with db.execute("SELECT COUNT(*) FROM events_log WHERE event_type='price_alert' AND created_at > ?", (seven_days_ago,)) as cursor:
-            row = await cursor.fetchone()
-            alerts_count = row[0]
-        
         async with db.execute("SELECT meta FROM events_log WHERE event_type='health' AND created_at > ?", (seven_days_ago,)) as cursor:
             health_logs = await cursor.fetchall()
-    
+
     max_temp = 0
     uv_count = 0
     for log in health_logs:
@@ -659,23 +623,23 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE):
                     uv_count += 1
         except:
             continue
-            
+
     uptime = get_uptime()
     today = datetime.now()
     week_ago = today - timedelta(days=6)
     date_range = f"{week_ago.strftime('%d.%m')} — {today.strftime('%d.%m')}"
-    
+
     text = (
         f"📊 <b>Итоги недели ({date_range}):</b>\n\n"
-        f"📰 Новостей опубликовано: <code>{approved}</code>\n"
-        f"✅ Одобрено: {approved} | ❌ Отклонено: {rejected}\n\n"
-        f"🛍 Мониторится товаров: <code>{watches_count}</code>\n"
-        f"🔔 Алертов по ценам: <code>{alerts_count}</code>\n\n"
+        f"📰 Новостей опубликовано: <code>{stats['approved']}</code>\n"
+        f"✅ Одобрено: {stats['approved']} | ❌ Отклонено: {stats['rejected']}\n\n"
+        f"🛍 Мониторится товаров: <code>{stats['watches']}</code>\n"
+        f"🔔 Алертов по ценам: <code>{stats['alerts']}</code>\n\n"
         f"🌡 Макс. температура RPi: <code>{max_temp}°C</code>\n"
         f"⚡️ Undervoltage за неделю: <code>{uv_count}</code> раз\n"
         f"⏱ Uptime: <code>{uptime}</code>"
     )
-    
+
     try:
         await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
     except Exception as e:
@@ -683,3 +647,81 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE):
     finally:
         gc.collect()
 
+async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE = None):
+    """Собирает сделки за 24 часа и отправляет аналитику от Gemini."""
+    # Если это вызов из JobQueue, то первый аргумент - это context, и у него нет атрибута 'update_id'
+    if not hasattr(update, 'update_id'):
+        context = update
+        update = None
+    
+    logger.info("Generating daily trade analytics...")
+    
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        
+        # Получаем сделки за последние 24 часа
+        one_day_ago = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        
+        async with db.execute("""
+            SELECT pair, side, price, qty, pnl, signal, sentiment, created_at 
+            FROM trades 
+            WHERE created_at > ?
+            ORDER BY created_at ASC
+        """, (one_day_ago,)) as cursor:
+            rows = await cursor.fetchall()
+            
+    if not rows:
+        logger.info("No trades today, sending empty status report.")
+        header = (
+            f"💰 <b>Статистика за 24ч:</b>\n"
+            f"PnL: <code>0.00 USDT</code>\n"
+            f"Сделок: <code>0</code>\n"
+            f"Статус: <i>Активен, сигналов на вход не было.</i>"
+        )
+        try:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=header, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Error sending empty daily analytics: {e}")
+        return
+
+    trades_summary = []
+    total_pnl = 0.0
+    wins = 0
+    losses = 0
+
+    for r in rows:
+        pnl = float(r[4]) if r[4] is not None else 0.0
+        total_pnl += pnl
+        if pnl > 0: wins += 1
+        elif pnl < 0: losses += 1
+        
+        trades_summary.append({
+            "pair": r[0],
+            "side": r[1],
+            "price": r[2],
+            "qty": r[3],
+            "pnl": round(pnl, 2),
+            "signal": r[5],
+            "sentiment": r[6],
+            "time": r[7]
+        })
+
+    # Добавляем сухую статистику в начало
+    winrate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+    
+    # Запрашиваем "умный" разбор у Gemini
+    ai_report = await generate_daily_analytics(trades_summary)
+    
+    header = (
+        f"💰 <b>Статистика за 24ч:</b>\n"
+        f"PnL: <code>{total_pnl:.2f} USDT</code>\n"
+        f"Сделок: <code>{len(trades_summary)}</code> (W:{wins} / L:{losses})\n"
+        f"Winrate: <code>{winrate:.1f}%</code>\n\n"
+    )
+    
+    full_report = header + ai_report
+    
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=full_report, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Error sending daily analytics: {e}")

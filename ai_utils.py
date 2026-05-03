@@ -206,32 +206,36 @@ async def process_job_scoring(job_title, company, description, history=None):
 async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, avg_sentiment, retries=1):
     """
     Просит Gemini подтвердить или отклонить торговый сигнал по рынку.
-    Агрессивная настройка: Gemini теперь выступает как активный трейдер.
+    Улучшенная логика: поиск сильных трендов и игнорирование боковика.
     """
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
-    prompt = f"""Ты — профессиональный дей-трейдер, ориентированный на захват краткосрочных импульсов.
-Твоя задача — подтверждать вход в сделки при малейшем подтверждении тренда.
+    prompt = f"""Ты — профессиональный риск-менеджер и алгоритмический трейдер.
+Твоя задача — подтвердить или отклонить сигнал технического анализа, исключая ложные срабатывания в "боковике" (flat market).
 
-Технический сигнал стратегии: {technical_signal}
-Средний новостной sentiment за 12 часов: {avg_sentiment:.2f}
+Технический сигнал: {technical_signal}
+Средний новостной sentiment (12ч): {avg_sentiment:.2f}
 
-Снимок рынка:
+Рыночные данные:
 {json.dumps(market_snapshot, ensure_ascii=False)}
 
-Правила:
-- Твоя цель: НЕ упустить прибыльное движение.
-- Если технический сигнал {technical_signal} и рынок не показывает явного разворота в обратную сторону — подтверждай (BUY или SELL).
-- Будь решительным. Выбирай HOLD только если на рынке полный штиль или резкий обвал против сигнала.
-- Учитывай, что EMA 3 и 8 — это быстрые индикаторы для скальпинга.
+Критерии подтверждения:
+1. BUY: Техсигнал BUY + (Sentiment >= 0) + (Цена выше ema_trend). Если цена слишком далеко ушла вверх от ema_trend (>3%), будь осторожен.
+2. SELL: Техсигнал SELL + (Цена ниже ema_trend ИЛИ RSI > 75). Если техсигнал SELL при RSI < 40, это может быть ложный выход на локальном дне.
+3. HOLD: Если рынок не имеет четкого направления, индикаторы противоречат друг другу или sentiment резко негативный при техсигнале BUY.
+
+Твой приоритет:
+- Избегать "распила" капитала в боковом движении.
+- Лучше пропустить сделку, чем войти в сомнительную.
+- Обращай внимание на ema_gap (разрыв между быстрой и медленной средней).
 
 Верни ТОЛЬКО JSON:
 {{
   "action": "BUY/SELL/HOLD",
   "confidence": 0.0-1.0,
-  "reason": "краткое объяснение"
+  "reason": "краткое объяснение (макс 200 символов) почему сигнал подтвержден или отклонен"
 }}"""
 
     for attempt in range(retries + 1):
@@ -350,3 +354,30 @@ async def generate_cover_letter(job_title, company, description):
         logger.error(f"Cover letter generation error: {e}")
         
     return "Failed to generate cover letter. Please try again later."
+
+async def generate_daily_analytics(trades_summary):
+    """Генерирует аналитический отчет по итогам торгового дня через Gemini."""
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-2.5-flash-lite')
+
+    prompt = f"""Ты — главный аналитик торгового фонда. Подведи итоги торгового дня на основе списка сделок.
+Список сделок за сегодня (JSON):
+{json.dumps(trades_summary, ensure_ascii=False)}
+
+Твоя задача:
+1. Кратко оцени общую эффективность (профит/убыток, винрейт).
+2. Выдели 1-2 ключевых момента (удачные входы или ошибки).
+3. Дай совет на завтра.
+
+Стиль: профессиональный, лаконичный, без воды. Используй HTML-теги <b> и <code> для Telegram.
+Никаких приветствий, начни сразу с заголовка <b>📊 Итоги торгового дня</b>."""
+
+    try:
+        response = await model.generate_content_async(prompt)
+        if response and response.text:
+            return response.text.strip()
+    except Exception as e:
+        logger.error(f"Daily analytics generation error: {e}")
+    return "Не удалось сгенерировать аналитику за сегодня."
+

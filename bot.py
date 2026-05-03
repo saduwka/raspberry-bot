@@ -1,3 +1,4 @@
+import os
 import logging
 import asyncio
 import re
@@ -23,14 +24,20 @@ from database import (
     add_rss_feed, remove_rss_feed, get_rss_feeds,
     add_keyword, remove_keyword, get_gaming_keywords,
     save_pending, cleanup_old_data, update_target_price, get_watch_info,
-    get_trade_state, set_trade_state
+    get_trade_state, set_trade_state, set_oled_config, populate_initial_data
 )
 from ai_utils import clean_html
+from handlers.monitoring_handlers import (
+    list_watches, unwatch, start_monitoring_interactive, 
+    service_choice, process_url_step, process_price_step,
+    show_news_menu, add_rss, del_rss, list_rss, add_kw, del_kw, list_kw
+)
+from handlers.system_handlers import oled_menu_handler, oled_callback_handler, show_settings, settings_callback
 from jobs import (
     price_check_job, send_price_digest, check_health_alert,
     fetch_news, process_and_filter_news, send_for_approval,
     fetch_job, post_to_channel, send_weekly_digest, get_stats,
-    trade_job, check_job_follow_ups, restart_bot
+    trade_job, check_job_follow_ups, restart_bot, send_daily_trade_analytics
 )
 import trade_handlers
 import job_handlers
@@ -58,8 +65,16 @@ logger = logging.getLogger(__name__)
 
 ALMATY_TZ = ZoneInfo("Asia/Almaty")
 
-# Состояния диалога
-SELECT_SERVICE, INPUT_URL, INPUT_PRICE, EDIT_PRICE, ADD_RSS, ADD_KW, JOB_QUERY_INPUT, JOB_DISCOVERY_INPUT, TRADE_TARGET_INPUT = range(9)
+from states import (
+    SELECT_SERVICE, INPUT_URL, INPUT_PRICE, EDIT_PRICE, ADD_RSS, 
+    ADD_KW, JOB_QUERY_INPUT, JOB_DISCOVERY_INPUT, INPUT_SCROLL_TEXT
+)
+from handlers.monitoring_handlers import (
+    list_watches, unwatch, start_monitoring_interactive, 
+    service_choice, process_url_step, process_price_step,
+    show_news_menu, add_rss, del_rss, list_rss, add_kw, del_kw, list_kw
+)
+from handlers.system_handlers import oled_menu_handler, oled_callback_handler, show_settings, settings_callback
 
 # --- Decorators ---
 def admin_only(func):
@@ -90,9 +105,18 @@ def monitoring_keyboard():
 def system_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Статус RPi", callback_data="cmd_status")],
+        [InlineKeyboardButton("📺 OLED Дисплей", callback_data="oled_menu")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="set_back"),
          InlineKeyboardButton("🔄 Перезапуск", callback_data="set_restart")],
     ])
+
+# OLED handlers moved to handlers.system_handlers
+
+async def process_scroll_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    await set_oled_config('scrolling_text', text)
+    await update.message.reply_text("✅ Текст бегущей строки обновлен!", reply_markup=reply_keyboard())
+    return ConversationHandler.END
 
 def news_keyboard():
     return InlineKeyboardMarkup([
@@ -104,17 +128,38 @@ def news_keyboard():
 @admin_only
 async def show_monitoring_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "🛍 <b>Управление мониторингом цен</b>\n\nПросматривайте активные товары или добавляйте новые ссылки с Kaspi и OLX."
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=monitoring_keyboard())
+    if update.callback_query:
+        try:
+            await update.callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=monitoring_keyboard())
+        except:
+            await update.callback_query.message.delete()
+            await context.bot.send_message(update.effective_chat.id, text, parse_mode="HTML", reply_markup=monitoring_keyboard())
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=monitoring_keyboard())
 
 @admin_only
 async def show_system_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "⚙️ <b>Системное меню</b>\n\nПроверка состояния оборудования и управление основными настройками бота."
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=system_keyboard())
+    if update.callback_query:
+        try:
+            await update.callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=system_keyboard())
+        except:
+            await update.callback_query.message.delete()
+            await context.bot.send_message(update.effective_chat.id, text, parse_mode="HTML", reply_markup=system_keyboard())
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=system_keyboard())
 
 @admin_only
 async def show_news_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "🔍 <b>Игровые новости</b>\n\nРучной запуск парсера или настройка источников и фильтров."
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=news_keyboard())
+    if update.callback_query:
+        try:
+            await update.callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=news_keyboard())
+        except:
+            await update.callback_query.message.delete()
+            await context.bot.send_message(update.effective_chat.id, text, parse_mode="HTML", reply_markup=news_keyboard())
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=news_keyboard())
 
 def jobs_keyboard():
     return InlineKeyboardMarkup([
@@ -133,7 +178,11 @@ async def show_jobs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Управление поиском вакансий через кнопки."
     )
     if update.callback_query:
-        await update.callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=jobs_keyboard())
+        try:
+            await update.callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=jobs_keyboard())
+        except:
+            await update.callback_query.message.delete()
+            await context.bot.send_message(update.effective_chat.id, text, parse_mode="HTML", reply_markup=jobs_keyboard())
     else:
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=jobs_keyboard())
 
@@ -236,22 +285,6 @@ async def watch_olx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Этот URL уже отслеживается")
 
 @admin_only
-async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    watches = await get_watches()
-    if not watches:
-        await update.message.reply_text("Список пуст", reply_markup=reply_keyboard())
-        return
-    
-    await update.message.reply_text("📋 <b>Ваш список отслеживания:</b>", parse_mode="HTML")
-    for w in watches:
-        wid, _, name, _, target, last, service = w
-        text = (f"📦 <b>{html.escape(name)}</b>\n"
-                f"Служба: {html.escape(service or 'N/A')}\n"
-                f"💰 Текущая: <code>{last}</code> -> 🎯 Цель: <code>{target}</code>")
-        keyboard = [[InlineKeyboardButton("⚙️ Управление", callback_data=f"manage_{wid}")]]
-        await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-
-@admin_only
 async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Использование: /unwatch <id>")
@@ -259,180 +292,11 @@ async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await remove_watch(int(context.args[0]))
     await update.message.reply_text("✅ Удалено из отслеживания.")
 
-# --- Sources Management ---
-@admin_only
-async def add_rss(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Использование: /addrss <url>")
-        return
-    url = context.args[0]
-    if await add_rss_feed(url):
-        await update.message.reply_text(f"✅ RSS-лента добавлена: {url}")
-    else:
-        await update.message.reply_text("❌ Ошибка (возможно, уже есть)")
+# News and Keyword handlers moved to handlers.monitoring_handlers
 
-@admin_only
-async def del_rss(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Использование: /delrss <url>")
-        return
-    url = context.args[0]
-    await remove_rss_feed(url)
-    await update.message.reply_text(f"✅ RSS-лента удалена: {url}")
+# Settings handlers moved to handlers.system_handlers
 
-@admin_only
-async def list_rss(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    feeds = await get_rss_feeds()
-    if not feeds:
-        await update.message.reply_text("Список RSS-лент пуст.")
-    else:
-        await update.message.reply_text("📋 <b>Активные RSS-ленты:</b>\n\n" + "\n".join([html.escape(f) for f in feeds]), parse_mode="HTML")
-
-@admin_only
-async def add_kw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Использование: /addkw <слово>")
-        return
-    kw = " ".join(context.args).lower()
-    if await add_keyword(kw):
-        await update.message.reply_text(f"✅ Ключевое слово добавлено: {kw}")
-    else:
-        await update.message.reply_text("❌ Ошибка")
-
-@admin_only
-async def del_kw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Использование: /delkw <слово>")
-        return
-    kw = " ".join(context.args).lower()
-    await remove_keyword(kw)
-    await update.message.reply_text(f"✅ Ключевое слово удалено: {kw}")
-
-@admin_only
-async def list_kw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kws = await get_gaming_keywords()
-    if not kws:
-        await update.message.reply_text("Список ключевых слов пуст.")
-    else:
-        text = "📋 <b>Ключевые слова:</b>\n\n" + ", ".join([html.escape(k) for k in kws])
-        if len(text) > 4000:
-            for i in range(0, len(text), 4000):
-                await update.message.reply_text(text[i:i+4000], parse_mode="HTML")
-        else:
-            await update.message.reply_text(text, parse_mode="HTML")
-
-# --- Interactive Settings ---
-@admin_only
-async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("📰 Управление RSS", callback_data="set_rss"),
-         InlineKeyboardButton("🔑 Ключевые слова", callback_data="set_kw")],
-        [InlineKeyboardButton("🚫 Стоп-теги", callback_data="set_tags"),
-         InlineKeyboardButton("🧹 Очистка БД", callback_data="set_cleanup")],
-        [InlineKeyboardButton("🔄 ПЕРЕЗАПУСК", callback_data="set_restart"),
-         InlineKeyboardButton("❌ Закрыть", callback_data="set_close")]
-    ]
-    await update.message.reply_text("⚙️ <b>Настройки бота</b>\n\nВыберите раздел для управления:", 
-                                   reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-
-async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id != ADMIN_ID: return
-    data = query.data
-
-    if data == "set_close":
-        await query.message.delete()
-    elif data == "set_rss":
-        feeds = await get_rss_feeds()
-        text = "📰 <b>RSS-ленты:</b>\n\n" + ("\n".join([f"• {html.escape(f)}" for f in feeds]) if feeds else "Пусто")
-        kb = [[InlineKeyboardButton("➕ Добавить ленту", callback_data="add_rss_ui")],
-              [InlineKeyboardButton("🗑 Удалить ленту", callback_data="del_rss_ui")],
-              [InlineKeyboardButton("⬅️ Назад", callback_data="set_back")]]
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML", disable_web_page_preview=True)
-    elif data == "set_kw":
-        kws = await get_gaming_keywords()
-        text = "🔑 <b>Ключевые слова:</b>\n\n" + (", ".join([html.escape(k) for k in kws]) if kws else "Пусто")
-        kb = [[InlineKeyboardButton("➕ Добавить слово", callback_data="add_kw_ui")],
-              [InlineKeyboardButton("🗑 Удалить слово", callback_data="del_kw_ui")],
-              [InlineKeyboardButton("⬅️ Назад", callback_data="set_back")]]
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
-    elif data == "set_tags":
-        tags = await get_blocked_tags()
-        text = "🚫 <b>Заблокированные теги:</b>\n\n" + (", ".join([html.escape(t) for t in tags]) if tags else "Пусто")
-        kb = [[InlineKeyboardButton("⬅️ Назад", callback_data="set_back")]]
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
-    elif data == "set_back":
-        keyboard = [
-            [InlineKeyboardButton("📰 Управление RSS", callback_data="set_rss"),
-             InlineKeyboardButton("🔑 Ключевые слова", callback_data="set_kw")],
-            [InlineKeyboardButton("🚫 Стоп-теги", callback_data="set_tags"),
-             InlineKeyboardButton("🧹 Очистка БД", callback_data="set_cleanup")],
-            [InlineKeyboardButton("🔄 ПЕРЕЗАПУСК", callback_data="set_restart"),
-             InlineKeyboardButton("❌ Закрыть", callback_data="set_close")]
-        ]
-        await query.message.edit_text("⚙️ <b>Настройки бота</b>\n\nВыберите раздел для управления:", 
-                                     reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-    elif data == "set_restart":
-        kb = [[InlineKeyboardButton("✅ ДА, ПЕРЕЗАГРУЗИТЬ", callback_data="confirm_restart")],
-              [InlineKeyboardButton("⬅️ НАЗАД", callback_data="set_back")]]
-        await query.message.edit_text("⚠️ <b>Вы уверены, что хотите перезагрузить бота?</b>", 
-                                     reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
-    elif data == "confirm_restart":
-        await query.message.delete()
-        await restart_bot(context=context)
-    elif data == "set_cleanup":
-        await cleanup_old_data()
-        await query.message.edit_text("✅ База данных очищена (удалены старые логи и новости).", 
-                                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="set_back")]]))
-    elif data == "add_rss_ui":
-        await query.message.reply_text("Отправьте URL новой RSS-ленты (или /cancel):")
-        return ADD_RSS
-    elif data == "add_kw_ui":
-        await query.message.reply_text("Введите новое ключевое слово (или /cancel):")
-        return ADD_KW
-    elif data == "del_rss_ui":
-        feeds = await get_rss_feeds()
-        if not feeds:
-            await query.answer("Список пуст")
-            return
-        kb = [[InlineKeyboardButton(f"🗑 {f[:30]}...", callback_data=f"drss_{i}")] for i, f in enumerate(feeds)]
-        kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="set_rss")])
-        await query.message.edit_text("Выберите ленту для удаления:", reply_markup=InlineKeyboardMarkup(kb))
-    elif data == "del_kw_ui":
-        kws = await get_gaming_keywords()
-        if not kws:
-            await query.answer("Список пуст")
-            return
-        kb = [[InlineKeyboardButton(f"🗑 {k}", callback_data=f"dkw_{i}")] for i, k in enumerate(kws)]
-        kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="set_kw")])
-        await query.message.edit_text("Выберите слово для удаления:", reply_markup=InlineKeyboardMarkup(kb))
-    elif data.startswith("drss_"):
-        idx = int(data.split("_")[1])
-        feeds = await get_rss_feeds()
-        if idx < len(feeds):
-            await remove_rss_feed(feeds[idx])
-            await query.answer(f"Удалено: {feeds[idx][:20]}...")
-            # Показываем обновленный список
-            feeds = await get_rss_feeds()
-            text = "📰 <b>RSS-ленты:</b>\n\n" + ("\n".join([f"• {f}" for f in feeds]) if feeds else "Пусто")
-            kb = [[InlineKeyboardButton("➕ Добавить ленту", callback_data="add_rss_ui")],
-                  [InlineKeyboardButton("🗑 Удалить ленту", callback_data="del_rss_ui")],
-                  [InlineKeyboardButton("⬅️ Назад", callback_data="set_back")]]
-            await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML", disable_web_page_preview=True)
-    elif data.startswith("dkw_"):
-        idx = int(data.split("_")[1])
-        kws = await get_gaming_keywords()
-        if idx < len(kws):
-            await remove_keyword(kws[idx])
-            await query.answer(f"Удалено: {kws[idx]}")
-            # Показываем обновленный список
-            kws = await get_gaming_keywords()
-            text = "🔑 <b>Ключевые слова:</b>\n\n" + (", ".join(kws) if kws else "Пусто")
-            kb = [[InlineKeyboardButton("➕ Добавить слово", callback_data="add_kw_ui")],
-                  [InlineKeyboardButton("🗑 Удалить слово", callback_data="del_kw_ui")],
-                  [InlineKeyboardButton("⬅️ Назад", callback_data="set_back")]]
-            await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+# Handlers have been moved to handlers/monitoring_handlers.py
 
 async def add_rss_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
@@ -455,66 +319,7 @@ async def add_kw_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ошибка.", reply_markup=reply_keyboard())
     return ConversationHandler.END
 
-# --- Interactive Monitoring Setup ---
-@admin_only
-async def start_monitoring_interactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Kaspi 🇰🇿", callback_data="step_kaspi"),
-         InlineKeyboardButton("OLX 🟦", callback_data="step_olx")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="step_cancel")]
-    ]
-    await update.message.reply_text(
-        "🚀 *Настройка мониторинга*\n\nВыберите сервис, который хотите отслеживать:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-    return SELECT_SERVICE
-
-async def service_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id != ADMIN_ID: return
-    
-    if query.data == "step_cancel":
-        await query.message.edit_text("❌ Настройка отменена.")
-        return ConversationHandler.END
-    service = "Kaspi" if query.data == "step_kaspi" else "OLX"
-    context.user_data["tmp_service"] = service
-    await query.message.edit_text(f"✅ Выбран сервис: *{service}*\n\nТеперь *отправьте ссылку*:", parse_mode="Markdown")
-    return INPUT_URL
-
-async def process_url_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text
-    if "http" not in url:
-        await update.message.reply_text("❌ Это не похоже на ссылку. Попробуйте еще раз.")
-        return INPUT_URL
-    context.user_data["tmp_url"] = url
-    await update.message.reply_text("📊 *Целевая цена* (числом):", parse_mode="Markdown")
-    return INPUT_PRICE
-
-async def process_price_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        target_price = int(re.sub(r'[^\d]', '', update.message.text))
-        service = context.user_data.get("tmp_service")
-        url = context.user_data.get("tmp_url")
-        user_id = update.effective_user.id
-        await update.message.reply_text("⏳ Проверяю...")
-        
-        price, _, items = await price_monitor.check_price(url)
-        if price is None:
-            await update.message.reply_text("❌ Ошибка. Проверьте ссылку.")
-            return ConversationHandler.END
-
-        name = url.split("/")[-1].replace("-", " ").replace(".html", "").capitalize()
-        if await add_watch(user_id, name, url, target_price, price, service):
-            if items:
-                for item in items: await mark_posted(item['url'])
-            await update.message.reply_text(f"✅ Мониторинг запущен: <b>{html.escape(name)}</b>", parse_mode="HTML", reply_markup=reply_keyboard())
-        return ConversationHandler.END
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-        return ConversationHandler.END
-
+# Monitoring interactive handlers moved to handlers.monitoring_handlers
 # --- Message and Callback Handlers ---
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -525,6 +330,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Обработка настроек
     if data.startswith(("set_", "add_", "del_", "drss_", "dkw_", "confirm_")):
         return await settings_callback(update, context)
+    elif data == "oled_scroll_set":
+        await query.message.reply_text("Введите текст для бегущей строки (или /cancel):")
+        return INPUT_SCROLL_TEXT
 
     # Обработка вакансий
     if data == "jobs_list":
@@ -549,11 +357,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("trade_select_"):
         pair = data.replace("trade_select_", "")
         await trade_handlers.trade_stats_handler(update, context, pair=pair)
-    elif data.startswith("trade_target_"):
-        pair = data.replace("trade_target_", "")
-        context.user_data["target_pair"] = pair
-        await query.message.reply_text(f"🎯 Введите целевую цену покупки для <b>{pair}</b>:\n(Бот купит только если цена будет ниже или равна этой)", parse_mode="HTML")
-        return TRADE_TARGET_INPUT
     elif data.startswith("trade_stats_"):
         pair = data.replace("trade_stats_", "")
         await trade_handlers.trade_stats_handler(update, context, pair=pair)
@@ -665,39 +468,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_startup(app):
     print("DEBUG: on_startup START")
-    # Первоначальная инициализация базы из конфига, если пустая
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-        async with db.execute("SELECT COUNT(*) FROM rss_feeds") as cursor:
-            row = await cursor.fetchone()
-            if row[0] == 0:
-                logger.info("Populating initial RSS feeds...")
-                for url in RSS_FEEDS:
-                    await db.execute("INSERT OR IGNORE INTO rss_feeds (url) VALUES (?)", (url,))
-        
-        async with db.execute("SELECT COUNT(*) FROM gaming_keywords") as cursor:
-            row = await cursor.fetchone()
-            if row[0] == 0:
-                logger.info("Populating initial keywords...")
-                for kw in GAMING_KEYWORDS:
-                    await db.execute("INSERT OR IGNORE INTO gaming_keywords (keyword) VALUES (?)", (kw.lower(),))
-        
-        async with db.execute("SELECT COUNT(*) FROM target_companies") as cursor:
-            row = await cursor.fetchone()
-            if row[0] == 0:
-                logger.info("Populating initial target companies...")
-                initial_cos = [
-                    ("Т-Банк", "https://www.tbank.ru/career/it/", ["Frontend", "Vue", "React", "TypeScript"]),
-                    ("Островок", "https://ostrovok.team/vacancies", ["Frontend", "Vue", "React", "TypeScript"]),
-                    ("Додо", "https://dodobrands.com/career", ["Frontend", "React", "TypeScript"]),
-                    ("Aviasales", "https://www.aviasales.ru/about/vacancies", ["Frontend", "React", "Vue"]),
-                    ("Kaspi", "https://kaspi.kz/guide/career/", ["Frontend", "Vue", "TypeScript"]),
-                ]
-                for name, url, kws in initial_cos:
-                    import json
-                    await db.execute("INSERT OR IGNORE INTO target_companies (name, url, keywords) VALUES (?, ?, ?)",
-                                     (name, url, json.dumps(kws)))
-        
-        await db.commit()
+    await populate_initial_data(RSS_FEEDS, GAMING_KEYWORDS)
     print("DEBUG: on_startup DATABASE INIT DONE")
 
     try:
@@ -710,19 +481,6 @@ async def cancel_interactive(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("❌ Отменено.", reply_markup=reply_keyboard())
     return ConversationHandler.END
 
-async def process_trade_target_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    try:
-        raw_text = update.message.text.replace(",", ".")
-        new_target = float(re.sub(r'[^\d.]', '', raw_text))
-        pair = context.user_data.get("target_pair")
-        await set_trade_state("target_buy_price", new_target, pair)
-        await update.message.reply_text(f"✅ Целевая цена для {pair} установлена: <b>{new_target}</b>", parse_mode="HTML", reply_markup=reply_keyboard())
-        return ConversationHandler.END
-    except:
-        await update.message.reply_text("❌ Ошибка. Введите число (например: 85.50)")
-        return TRADE_TARGET_INPUT
-
 def main():
     print("--- BOT STARTING VERSION 3.0 ---")
     asyncio.run(init_db())
@@ -733,7 +491,7 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(service_choice, pattern="^step_"),
-            CallbackQueryHandler(callback_handler, pattern="^(editpr_|add_rss_ui|add_kw_ui|jobs_query_edit|jobs_discovery_edit|trade_target_)")
+            CallbackQueryHandler(callback_handler, pattern="^(editpr_|add_rss_ui|add_kw_ui|jobs_query_edit|jobs_discovery_edit|oled_scroll_set)")
         ],
         states={
             SELECT_SERVICE: [CallbackQueryHandler(service_choice, pattern="^step_")],
@@ -744,7 +502,7 @@ def main():
             ADD_KW: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_kw_step)],
             JOB_QUERY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_job_query_step)],
             JOB_DISCOVERY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_job_discovery_step)],
-            TRADE_TARGET_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_trade_target_step)],
+            INPUT_SCROLL_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_scroll_text_step)],
         },
         fallbacks=[CommandHandler("cancel", cancel_interactive), CallbackQueryHandler(service_choice, pattern="^step_cancel$")],
     )
@@ -756,6 +514,11 @@ def main():
     app.add_handler(CommandHandler("watches", list_watches))
     app.add_handler(CommandHandler("unwatch", unwatch))
     app.add_handler(CommandHandler("restart", restart_bot))
+    app.add_handler(CommandHandler("test_analytics", send_daily_trade_analytics))
+    
+    # OLED Handlers
+    app.add_handler(CallbackQueryHandler(oled_menu_handler, pattern="^oled_menu$"))
+    app.add_handler(CallbackQueryHandler(oled_callback_handler, pattern="^oled_(pwr|scr|restart)"))
     
     # Команды управления источниками (остаются как запасной вариант)
     app.add_handler(CommandHandler("addrss", add_rss))
@@ -783,6 +546,7 @@ def main():
     jq.run_daily(check_job_follow_ups, time=dt_time(11, 0, tzinfo=ALMATY_TZ))
     jq.run_daily(lambda ctx: asyncio.create_task(cleanup_old_data()), time=dt_time(4, 0, tzinfo=ALMATY_TZ))
     jq.run_daily(send_weekly_digest, time=dt_time(20, 0, tzinfo=ALMATY_TZ), days=(6,))
+    jq.run_daily(send_daily_trade_analytics, time=dt_time(23, 0, tzinfo=ALMATY_TZ))
     jq.run_repeating(price_check_job, interval=1200, first=60)
     jq.run_repeating(send_price_digest, interval=1800, first=90)
     jq.run_repeating(check_health_alert, interval=300, first=10)
