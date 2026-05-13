@@ -1,6 +1,6 @@
 # 🤖 GameBot v2 (Multi-Assistant)
 
-A multifunctional Telegram bot combining a news aggregator, price monitoring, trading engine, and job search system. Optimized for **Raspberry Pi (DietPi/Debian)**.
+A multifunctional Telegram bot combining a news aggregator, trading engine, and job search system. Optimized for **Raspberry Pi (DietPi/Debian)**.
 
 ---
 
@@ -14,23 +14,18 @@ A multifunctional Telegram bot combining a news aggregator, price monitoring, tr
 *   **Filtering**: Manage keywords (`/addkw`) and tag blacklists (`/blocktag`).
 *   **Moderation**: Approve/Reject system for channel posting.
 
-#### 2. 💰 Price Monitor (Kaspi & OLX)
-*   **Price Tracking**: Monitor products on Kaspi.kz and OLX.kz.
-*   **Notifications**: Instant alerts when the price drops below the target.
-*   **Digests**: Grouped notifications to prevent spam.
-
-#### 3. 📈 Trading Engine (Binance)
+#### 2. 📈 Trading Engine (Binance)
 *   **Automation**: Trading on Binance via the `ccxt` library.
 *   **Strategies**: Market analysis using technical indicators (`ta`, `pandas`).
 *   **AI Analysis**: Additional signal verification via Gemini for decision making.
 *   **Paper Mode**: Support for Paper Trading for safe testing.
 
-#### 4. 💼 Job Hunter (AI Scoring)
+#### 3. 💼 Job Hunter (AI Scoring)
 *   **Job Search**: Automatic collection of vacancies from specialized resources.
 *   **AI Scoring**: Relevancy assessment of vacancies against your CV on a 10-point scale.
 *   **Filters**: Configure minimum scores and requirements (e.g., Worldwide/Remote).
 
-#### 5. 🛠 System Health
+#### 4. 🛠 System Health
 *   **Raspberry Pi Monitoring**: CPU temperature (alert at 65°C+), load, RAM, and power status (Undervoltage).
 
 ### 📋 Main Commands (Admin)
@@ -38,7 +33,6 @@ A multifunctional Telegram bot combining a news aggregator, price monitoring, tr
 | Command | Description |
 | :--- | :--- |
 | `/status` | System, DB, and Raspberry Pi status |
-| `/watches` | List of active price monitors |
 | `/listrss` | Manage news sources |
 | `/jobs_stats` | Statistics on found vacancies |
 | `/trades` | Status of trading positions |
@@ -77,23 +71,18 @@ A multifunctional Telegram bot combining a news aggregator, price monitoring, tr
 *   **Фильтрация**: Управление ключевыми словами (`/addkw`) и черным списком тегов (`/blocktag`).
 *   **Модерация**: Система Approve/Reject для постов в канал.
 
-#### 2. 💰 Мониторинг цен (Kaspi & OLX)
-*   **Трекинг цен**: Отслеживание товаров на Kaspi.kz и OLX.kz.
-*   **Уведомления**: Мгновенные оповещения при падении цены ниже целевой.
-*   **Дайджесты**: Группировка уведомлений для предотвращения спама.
-
-#### 3. 📈 Торговый движок (Binance)
+#### 2. 📈 Торговый движок (Binance)
 *   **Автоматизация**: Торговля на Binance через библиотеку `ccxt`.
 *   **Стратегии**: Анализ рынка с помощью технических индикаторов (`ta`, `pandas`).
 *   **ИИ-Анализ**: Дополнительная проверка сигналов через Gemini для принятия решений.
 *   **Paper Mode**: Поддержка режима симуляции (Paper Trading) для безопасного тестирования.
 
-#### 4. 💼 Поиск работы (AI Scoring)
+#### 3. 💼 Поиск работы (AI Scoring)
 *   **Поиск вакансий**: Автоматический сбор вакансий с профильных ресурсов.
 *   **AI Scoring**: Оценка релевантности вакансий вашему резюме по 10-балльной шкале.
 *   **Фильтры**: Настройка минимального балла и требований (например, Worldwide/Remote).
 
-#### 5. 🛠 Состояние системы
+#### 4. 🛠 Состояние системы
 *   **Мониторинг Raspberry Pi**: температура CPU (алёрт при 65°C+), нагрузка, RAM и статус питания (Undervoltage).
 
 ### 📋 Основные команды (Админ)
@@ -101,7 +90,6 @@ A multifunctional Telegram bot combining a news aggregator, price monitoring, tr
 | Команда | Описание |
 | :--- | :--- |
 | `/status` | Статус системы, БД и Raspberry Pi |
-| `/watches` | Список активных мониторов цен |
 | `/listrss` | Управление источниками новостей |
 | `/jobs_stats` | Статистика по найденным вакансиям |
 | `/trades` | Состояние торговых позиций |

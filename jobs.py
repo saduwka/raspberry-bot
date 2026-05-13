@@ -13,7 +13,6 @@ from datetime import datetime, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-import price_monitor
 import trade_engine
 
 logger = logging.getLogger(__name__)
@@ -25,12 +24,10 @@ from config import (
     GEMINI_MIN_CONFIDENCE,
 )
 from database import (
-    get_watches, is_posted, is_pending, mark_posted, save_price_alert,
-    update_watch_price, save_pending, get_pending, delete_pending,
+    is_posted, is_pending, mark_posted, save_pending, get_pending, delete_pending,
     log_event, get_blocked_tags, get_rss_feeds, get_gaming_keywords,
     get_open_position, save_trade, set_trade_state, get_trade_state,
     get_pending_follow_ups, mark_follow_up_sent,
-    mark_alert_sent, get_pending_price_alerts, mark_alerts_sent,
     get_recent_sentiments, get_weekly_stats, get_daily_trades
 )
 
@@ -168,85 +165,6 @@ async def check_health_alert(context: ContextTypes.DEFAULT_TYPE):
         already_alerted["undervoltage"] = True
     elif not flags.get("undervoltage"):
         already_alerted["undervoltage"] = False
-
-async def price_check_job(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Checking prices...")
-    watches = await get_watches()
-    if not watches:
-        return
-
-    async with httpx.AsyncClient(headers=price_monitor.HEADERS, timeout=15) as client:
-        for watch in watches:
-            watch_id, user_id, name, url, target_price, last_price, service = watch
-            current_price, srv_type, items = await price_monitor.check_price(url, client=client)
-            
-            if items: # Категория
-                new_items_count = 0
-                for item in items:
-                    if item['price'] <= target_price:
-                        if not await is_posted(item['url']):
-                            await save_price_alert(watch_id, item['price'], item['name'], item['url'])
-                            await mark_posted(item['url'])
-                            new_items_count += 1
-                
-                if new_items_count > 0:
-                    logger.info(f"Saved {new_items_count} alerts for {name}")
-                
-                if current_price is not None:
-                    await update_watch_price(watch_id, current_price)
-            
-            elif current_price is not None: # Одиночный товар
-                if last_price is None or current_price != last_price:
-                    await update_watch_price(watch_id, current_price)
-                    
-                    if current_price <= target_price:
-                        await save_price_alert(watch_id, current_price, name, url)
-                        safe_name = html.escape(name)
-                        safe_service = html.escape(srv_type or service)
-                        safe_url = html.escape(url)
-                        text = (f"🎯 <b>Цена упала!</b> ({safe_service})\n\n"
-                                f"📦 {safe_name}\n"
-                                f"💰 Текущая цена: <code>{html.escape(str(current_price))}</code>\n"
-                                f"📉 Цель: <code>{html.escape(str(target_price))}</code>\n\n"
-                                f"🔗 {safe_url}")
-
-                        try:
-                            await context.bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
-                            await mark_alert_sent(watch_id)
-                        except Exception as e:
-                            logger.error(f"Error sending drop notification: {e}")
-            await asyncio.sleep(2)
-    
-    gc.collect() # Очистка после цикла мониторинга
-...
-async def send_price_digest(context: ContextTypes.DEFAULT_TYPE):
-    alerts = await get_pending_price_alerts()
-    
-    if not alerts:
-        return
-
-    by_watch = {}
-    for alert in alerts:
-        aid, wid, price, name, url, wname, uid = alert
-        if wid not in by_watch:
-            by_watch[wid] = {"name": wname, "uid": uid, "items": [], "ids": []}
-        by_watch[wid]["items"].append({"name": name, "price": price, "url": url})
-        by_watch[wid]["ids"].append(aid)
-
-    for wid, data in by_watch.items():
-        items_text = []
-        for item in data["items"]:
-            safe_name = html.escape(item["name"])
-            safe_url = html.escape(item["url"])
-            items_text.append(f"📦 {safe_name}\n💰 Цена: <code>{html.escape(str(item['price']))}</code>\n🔗 {safe_url}")
-        
-        text = f"🎁 <b>Новые находки по запросу: {html.escape(data['name'])}</b> ({len(data['items'])} шт.)\n\n" + "\n\n".join(items_text)
-        
-        try:
-            await context.bot.send_message(chat_id=data["uid"], text=text, parse_mode="HTML", disable_web_page_preview=True)
-            await mark_alerts_sent(data["ids"])
-        except Exception as e:
-            logger.error(f"Error sending digest: {e}")
 
 # --- News Jobs ---
 async def is_gaming(text):
@@ -604,26 +522,6 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Generating weekly digest...")
     stats = await get_weekly_stats()
 
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        seven_days_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
-        async with db.execute("SELECT meta FROM events_log WHERE event_type='health' AND created_at > ?", (seven_days_ago,)) as cursor:
-            health_logs = await cursor.fetchall()
-
-    max_temp = 0
-    uv_count = 0
-    for log in health_logs:
-        try:
-            if log[0]:
-                data = json.loads(log[0])
-                temp = data.get("temp")
-                if temp and temp > max_temp:
-                    max_temp = temp
-                if data.get("uv"):
-                    uv_count += 1
-        except:
-            continue
-
     uptime = get_uptime()
     today = datetime.now()
     week_ago = today - timedelta(days=6)
@@ -633,10 +531,6 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE):
         f"📊 <b>Итоги недели ({date_range}):</b>\n\n"
         f"📰 Новостей опубликовано: <code>{stats['approved']}</code>\n"
         f"✅ Одобрено: {stats['approved']} | ❌ Отклонено: {stats['rejected']}\n\n"
-        f"🛍 Мониторится товаров: <code>{stats['watches']}</code>\n"
-        f"🔔 Алертов по ценам: <code>{stats['alerts']}</code>\n\n"
-        f"🌡 Макс. температура RPi: <code>{max_temp}°C</code>\n"
-        f"⚡️ Undervoltage за неделю: <code>{uv_count}</code> раз\n"
         f"⏱ Uptime: <code>{uptime}</code>"
     )
 
@@ -656,19 +550,7 @@ async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE,
     
     logger.info("Generating daily trade analytics...")
     
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        
-        # Получаем сделки за последние 24 часа
-        one_day_ago = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
-        
-        async with db.execute("""
-            SELECT pair, side, price, qty, pnl, signal, sentiment, created_at 
-            FROM trades 
-            WHERE created_at > ?
-            ORDER BY created_at ASC
-        """, (one_day_ago,)) as cursor:
-            rows = await cursor.fetchall()
+    rows = await get_daily_trades(24)
             
     if not rows:
         logger.info("No trades today, sending empty status report.")

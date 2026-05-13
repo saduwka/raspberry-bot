@@ -2,7 +2,7 @@ import aiosqlite
 import json
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from config import DB_PATH
 
 logger = logging.getLogger(__name__)
@@ -31,38 +31,6 @@ async def init_db():
                     summary TEXT,
                     image_url TEXT,
                     created_at TEXT
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS watches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    name TEXT,
-                    url TEXT UNIQUE,
-                    target_price INTEGER,
-                    last_price INTEGER,
-                    service TEXT
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS price_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    watch_id INTEGER,
-                    price INTEGER,
-                    found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (watch_id) REFERENCES watches(id)
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS price_alerts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    watch_id INTEGER,
-                    price INTEGER,
-                    item_name TEXT,
-                    item_url TEXT,
-                    found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    sent_at TIMESTAMP,
-                    FOREIGN KEY (watch_id) REFERENCES watches(id)
                 )
             """)
             await db.execute("""
@@ -168,55 +136,6 @@ async def log_event(event_type, meta=None):
             await db.execute("INSERT INTO events_log (event_type, meta) VALUES (?, ?)", (event_type, meta_json))
             await db.commit()
 
-# --- Watches Management ---
-async def add_watch(user_id, name, url, target_price, last_price, service):
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            await db.execute("PRAGMA journal_mode=WAL")
-            try:
-                await db.execute("INSERT INTO watches (user_id, name, url, target_price, last_price, service) VALUES (?, ?, ?, ?, ?, ?)",
-                                 (user_id, name, url, target_price, last_price, service))
-                await db.commit()
-                
-                async with db.execute("SELECT last_insert_rowid()") as cursor:
-                    row = await cursor.fetchone()
-                    watch_id = row[0]
-                    
-                if last_price is not None:
-                    await db.execute("INSERT INTO price_history (watch_id, price) VALUES (?, ?)", (watch_id, last_price))
-                    await db.commit()
-                return True
-            except Exception as e:
-                logger.error(f"Error adding watch: {e}")
-                return False
-
-async def get_watches():
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            async with db.execute("SELECT * FROM watches") as cursor:
-                return await cursor.fetchall()
-
-async def update_watch_price(watch_id, price):
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            await db.execute("PRAGMA journal_mode=WAL")
-            async with db.execute("SELECT last_price FROM watches WHERE id=?", (watch_id,)) as cursor:
-                row = await cursor.fetchone()
-                if not row: return
-                last_price = row[0]
-            
-            if last_price != price:
-                await db.execute("UPDATE watches SET last_price=? WHERE id=?", (price, watch_id))
-                await db.execute("INSERT INTO price_history (watch_id, price) VALUES (?, ?)", (watch_id, price))
-                await db.commit()
-
-async def remove_watch(watch_id):
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            await db.execute("PRAGMA journal_mode=WAL")
-            await db.execute("DELETE FROM watches WHERE id=?", (watch_id,))
-            await db.commit()
-
 # --- News Status ---
 async def is_posted(url):
     async with db_lock:
@@ -237,11 +156,7 @@ async def mark_posted(url):
                 approved = (await cursor.fetchone())[0]
             async with db.execute("SELECT COUNT(*) FROM events_log WHERE event_type='post_rejected' AND created_at > ?", (seven_days_ago,)) as cursor:
                 rejected = (await cursor.fetchone())[0]
-            async with db.execute("SELECT COUNT(*) FROM watches") as cursor:
-                watches = (await cursor.fetchone())[0]
-            async with db.execute("SELECT COUNT(*) FROM events_log WHERE event_type='price_alert' AND created_at > ?", (seven_days_ago,)) as cursor:
-                alerts = (await cursor.fetchone())[0]
-            return {"approved": approved, "rejected": rejected, "watches": watches, "alerts": alerts}
+            return {"approved": approved, "rejected": rejected}
 
 async def set_oled_config(key: str, value: str):
     async with db_lock:
@@ -374,28 +289,6 @@ async def delete_pending(pending_id):
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("DELETE FROM pending WHERE id=?", (pending_id,))
             await db.commit()
-
-async def save_price_alert(watch_id, price, item_name, item_url):
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            await db.execute("PRAGMA journal_mode=WAL")
-            await db.execute("INSERT INTO price_alerts (watch_id, price, item_name, item_url) VALUES (?, ?, ?, ?)",
-                             (watch_id, price, item_name, item_url))
-            await db.commit()
-    await log_event("price_alert", {"watch_id": watch_id, "price": price})
-
-async def update_target_price(watch_id, new_price):
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            await db.execute("PRAGMA journal_mode=WAL")
-            await db.execute("UPDATE watches SET target_price=? WHERE id=?", (new_price, watch_id))
-            await db.commit()
-
-async def get_watch_info(watch_id):
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            async with db.execute("SELECT name, target_price FROM watches WHERE id=?", (watch_id,)) as cursor:
-                return await cursor.fetchone()
 
 # --- Trading Functions ---
 async def save_trade(pair, side, price, qty, pnl, signal, sentiment):
@@ -613,32 +506,6 @@ async def cleanup_old_data():
             await db.commit()
             logger.info("Database cleanup completed.")
 
-async def mark_alert_sent(watch_id: int):
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            await db.execute("PRAGMA journal_mode=WAL")
-            await db.execute("UPDATE price_alerts SET sent_at=CURRENT_TIMESTAMP WHERE watch_id=? AND sent_at IS NULL", (watch_id,))
-            await db.commit()
-
-async def get_pending_price_alerts():
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            async with db.execute("""
-                SELECT pa.id, pa.watch_id, pa.price, pa.item_name, pa.item_url, w.name as watch_name, w.user_id 
-                FROM price_alerts pa
-                JOIN watches w ON pa.watch_id = w.id
-                WHERE pa.sent_at IS NULL
-            """) as cursor:
-                return await cursor.fetchall()
-
-async def mark_alerts_sent(alert_ids: list):
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            await db.execute("PRAGMA journal_mode=WAL")
-            placeholders = ",".join(["?"] * len(alert_ids))
-            await db.execute(f"UPDATE price_alerts SET sent_at=CURRENT_TIMESTAMP WHERE id IN ({placeholders})", alert_ids)
-            await db.commit()
-
 async def get_recent_sentiments(hours=12):
     async with db_lock:
         async with aiosqlite.connect(DB_PATH, timeout=30) as db:
@@ -658,11 +525,7 @@ async def get_weekly_stats():
                 approved = (await cursor.fetchone())[0]
             async with db.execute("SELECT COUNT(*) FROM events_log WHERE event_type='post_rejected' AND created_at > ?", (seven_days_ago,)) as cursor:
                 rejected = (await cursor.fetchone())[0]
-            async with db.execute("SELECT COUNT(*) FROM watches") as cursor:
-                watches = (await cursor.fetchone())[0]
-            async with db.execute("SELECT COUNT(*) FROM events_log WHERE event_type='price_alert' AND created_at > ?", (seven_days_ago,)) as cursor:
-                alerts = (await cursor.fetchone())[0]
-            return {"approved": approved, "rejected": rejected, "watches": watches, "alerts": alerts}
+            return {"approved": approved, "rejected": rejected}
 
 async def get_daily_trades(hours=24):
     async with db_lock:
