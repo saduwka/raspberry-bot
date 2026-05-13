@@ -473,7 +473,7 @@ async def get_vacancy_details(vacancy_id):
     """Возвращает полную информацию о вакансии для генерации письма."""
     async with db_lock:
         async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            async with db.execute("SELECT title, company, description FROM job_vacancies WHERE id = ?", (vacancy_id,)) as cursor:
+            async with db.execute("SELECT title, company, description, url FROM job_vacancies WHERE id = ?", (vacancy_id,)) as cursor:
                 return await cursor.fetchone()
 
 async def is_vacancy_seen(url):

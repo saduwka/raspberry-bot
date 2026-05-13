@@ -25,8 +25,9 @@ for pair in TRADE_PAIRS:
 TRADE_STOP_LOSS_PCT = float(os.getenv("TRADE_STOP_LOSS_PCT", "0.015"))
 TRADE_TAKE_PROFIT_PCT = float(os.getenv("TRADE_TAKE_PROFIT_PCT", "0.03"))
 GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.2"))
-JOB_MIN_SCORE = int(os.getenv("JOB_MIN_SCORE", "7"))
-JOB_REQUIRE_WORLDWIDE = os.getenv("JOB_REQUIRE_WORLDWIDE", "True").lower() == "true"
+JOB_MIN_SCORE = int(os.getenv("JOB_MIN_SCORE", "6"))
+JOB_REQUIRE_WORLDWIDE = os.getenv("JOB_REQUIRE_WORLDWIDE", "False").lower() == "true"
+RESUME_URL = os.getenv("RESUME_URL", "https://your-resume-link.com")
 
 DB_PATH = "bot.db"
 

@@ -503,14 +503,14 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
             
             # УЛУЧШЕННОЕ КОНСЕРВАТИВНОЕ РЕШЕНИЕ:
             if technical_signal == "BUY":
-                # Покупаем только если Gemini подтверждает BUY с достаточной уверенностью
-                if gemini_decision["action"] == "BUY" and gemini_decision["confidence"] >= GEMINI_MIN_CONFIDENCE:
+                # Покупаем ТОЛЬКО если Gemini подтверждает BUY
+                if gemini_decision["action"] == "BUY" and gemini_decision["confidence"] >= 0.4:
                     signal = "BUY"
                 else:
                     signal = "HOLD"
             elif technical_signal == "SELL":
-                # Продаем если техсигнал SELL, НО если Gemini видит потенциал роста (BUY) — удерживаем
-                if gemini_decision["action"] == "BUY" and gemini_decision["confidence"] >= 0.6:
+                # Продаем если техсигнал SELL, НО если Gemini видит ОЧЕНЬ сильный потенциал роста — удерживаем
+                if gemini_decision["action"] == "BUY" and gemini_decision["confidence"] >= 0.8:
                     signal = "HOLD"
                 else:
                     signal = "SELL"

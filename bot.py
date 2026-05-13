@@ -1,4 +1,5 @@
 import os
+import subprocess
 import logging
 import asyncio
 import re
@@ -349,6 +350,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "jobs_discovery_edit":
         await query.message.reply_text("Опишите, какие компании искать (например: Финтех компании СНГ похожие на Каспи):")
         return JOB_DISCOVERY_INPUT
+
+    elif data == "ipod_sync_push":
+        await query.answer("🚀 Запускаю перенос...")
+        # Run the sync script in the background
+        cmd = ["python3", "/root/music_sync/sync.py", "--push-only"]
+        try:
+            # We use a non-blocking subprocess call
+            subprocess.Popen(cmd)
+        except Exception as e:
+            await query.message.reply_text(f"❌ Ошибка запуска: {e}")
 
     if data == "cmd_status":
         await query.message.reply_text(get_stats(), parse_mode="HTML")

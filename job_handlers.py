@@ -31,10 +31,24 @@ def _job_passes_filters(result):
         return False
     return True
 
-async def job_fetch_job(context: ContextTypes.DEFAULT_TYPE):
-    """Периодическая задача по поиску вакансий."""
+async def job_fetch_job(context: ContextTypes.DEFAULT_TYPE, message=None):
+    """Периодическая задача по поиску вакансий с поддержкой прогресс-бара."""
     logger.info("Starting job hunting...")
-    vacancies = await fetch_all_jobs()
+    
+    status_text = "🔎 <b>Поиск вакансий...</b>\n\n"
+    
+    async def update_progress(current, total, source_name):
+        nonlocal status_text
+        percent = int((current / total) * 100)
+        bar = "🟢" * (current // 2) + "⚪️" * ((total - current) // 2)
+        new_text = f"{status_text}Прогресс: {bar} {percent}%\nСейчас: <code>{source_name}</code>"
+        if message:
+            try:
+                await message.edit_text(new_text, parse_mode="HTML")
+            except:
+                pass
+
+    vacancies = await fetch_all_jobs(progress_callback=update_progress if message else None)
     
     # Загружаем историю для персонализации (3 лайка, 3 дизлайка)
     history = await get_recent_job_history(3, 3)
@@ -55,32 +69,25 @@ async def job_fetch_job(context: ContextTypes.DEFAULT_TYPE):
                 description=v.get("description", "")
             )
             count += 1
-            await asyncio.sleep(1) # Небольшая пауза для API Gemini
+            await asyncio.sleep(0.5) # Небольшая пауза для API Gemini
             
-    if count > 0:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID, 
-            text=(
-                f"💼 <b>Международный поиск: +{count} новых вакансий!</b>\n"
-                f"Фильтр: score >= {JOB_MIN_SCORE}, core stack match, "
-                f"{'worldwide only' if JOB_REQUIRE_WORLDWIDE else 'remote allowed'}.\n"
-                f"Используйте команду /jobs."
-            ),
-            parse_mode="HTML"
-        )
+    final_msg = (
+        f"💼 <b>Поиск завершен!</b>\n\n"
+        f"✅ Найдено новых подходящих: <b>{count}</b>\n"
+        f"Фильтр: score >= {JOB_MIN_SCORE}, core stack match.\n\n"
+        f"Используйте команду /jobs или кнопку Список."
+    )
+    
+    if message:
+        await message.edit_text(final_msg, parse_mode="HTML")
     else:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text="💤 Поиск завершен, но новых подходящих вакансий не найдено.",
-            parse_mode="HTML",
-        )
+        await context.bot.send_message(chat_id=ADMIN_ID, text=final_msg, parse_mode="HTML")
 
 async def jobs_refresh_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручной запуск поиска вакансий."""
+    """Ручной запуск поиска вакансий с прогресс-баром."""
     target_msg = update.effective_message
-    await target_msg.reply_text("🔎 Запускаю поиск вакансий...")
-    await job_fetch_job(context)
-    await target_msg.reply_text("✅ Поиск завершен. Используйте /jobs.")
+    status_msg = await target_msg.reply_text("🔎 Подготовка к поиску...")
+    await job_fetch_job(context, message=status_msg)
 
 async def list_jobs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выводит топ подходящих вакансий."""
@@ -124,28 +131,36 @@ async def list_jobs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error sending job message: {e}")
 
 async def cover_letter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Генерирует и отправляет сопроводительное письмо."""
+    """Генерирует и отправляет полный пакет для отклика."""
     query = update.callback_query
-    await query.answer("✍️ Генерирую письмо...")
+    await query.answer("✍️ Формирую пакет для отклика...")
     
     vid = int(query.data.split("_")[-1])
     from database import get_vacancy_details
     from ai_utils import generate_cover_letter
+    from config import RESUME_URL
     
     details = await get_vacancy_details(vid)
     if not details:
         await query.message.reply_text("❌ Данные вакансии не найдены в базе.")
         return
         
-    title, company, description = details
+    title, company, description, url = details[0], details[1], details[2], details[3]
     if not description:
         await query.message.reply_text("❌ Описание вакансии пустое, не могу составить письмо.")
         return
         
     letter = await generate_cover_letter(title, company, description)
     
-    header = f"✉️ <b>Сопроводительное письмо для {html.escape(company)}:</b>\n\n"
-    await query.message.reply_text(f"{header}<code>{html.escape(letter)}</code>", parse_mode="HTML")
+    packet = (
+        f"📋 <b>Пакет для отклика: {html.escape(company)}</b>\n\n"
+        f"🔗 <b>Вакансия:</b> {html.escape(url)}\n"
+        f"📄 <b>Резюме:</b> {html.escape(RESUME_URL)}\n\n"
+        f"✉️ <b>Сопроводительное письмо (нажми, чтобы скопировать):</b>\n"
+        f"<code>{html.escape(letter)}</code>"
+    )
+    
+    await query.message.reply_text(packet, parse_mode="HTML")
 
 async def list_applied_jobs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список вакансий, на которые вы уже откликнулись."""

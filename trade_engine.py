@@ -64,10 +64,10 @@ def calc_indicators(df):
 def get_signal(df, sentiment=0):
     """
     Генерирует сигнал с учетом фильтра тренда и сентимента.
-    BUY: (Пересечение вверх ИЛИ (Бычий тренд И RSI < 50)) И Цена > EMA50 И Sentiment >= -0.1
-    SELL: Пересечение вниз ИЛИ (RSI > 80 И Цена < EMA5) ИЛИ Цена < EMA50 * 0.998
+    BUY: (EMA crossover up AND RSI < 55) AND Price > EMA50 AND Sentiment >= -0.1
+    SELL: EMA crossover down OR (RSI > 80 AND Price < EMA5) OR Price < EMA50 * 0.995
     """
-    if df is None or len(df) < 2:
+    if df is None or len(df) < 5:
         return "HOLD"
         
     last = df.iloc[-1]
@@ -77,22 +77,26 @@ def get_signal(df, sentiment=0):
     is_bullish = last['ema_fast'] > last['ema_slow']
     is_bearish = last['ema_fast'] < last['ema_slow']
     above_trend = last['close'] > last['ema_trend']
-    below_trend = last['close'] < (last['ema_trend'] * 0.998) # Небольшой допуск, чтобы не выбивало на шуме
+    below_trend = last['close'] < (last['ema_trend'] * 0.995) 
     
     # Момент пересечения
     ema_cross_up = prev['ema_fast'] <= prev['ema_slow'] and is_bullish
     ema_cross_down = prev['ema_fast'] >= prev['ema_slow'] and is_bearish
     
-    # Вход: пересечение вверх ИЛИ (бычий настрой И RSI < 45), при этом ослабляем требование выше тренда
-    if (ema_cross_up or (is_bullish and last['rsi'] < 45)) and sentiment >= -0.1:
-        # Если ниже тренда, требуем более сильный RSI (перепроданность)
-        if not above_trend and last['rsi'] > 30:
-             return "HOLD"
-        return "BUY"
-
+    # Фильтр волатильности (EMA Gap)
+    ema_gap_pct = abs(last['ema_fast'] - last['ema_slow']) / last['ema_slow']
+    is_flat = ema_gap_pct < 0.0002 # Смягчаем еще сильнее: было 0.0005, теперь 0.02%
     
-    # Выход: пересечение вниз ИЛИ сильная перекупленность с разворотом ИЛИ уверенный уход под тренд
-    elif ema_cross_down or (last['rsi'] > 80 and last['close'] < last['ema_fast']) or below_trend:
+    # Вход: только при пересечении вверх или уверенном бычьем тренде с откатом (RSI)
+    # Обязательно выше тренда EMA50 для BUY
+    if above_trend and not is_flat and sentiment >= -0.1:
+        if ema_cross_up and last['rsi'] < 65: # Смягчаем: было 60
+            return "BUY"
+        if is_bullish and prev['rsi'] < 45 and last['rsi'] >= 45: # Смягчаем: было 40
+            return "BUY"
+
+    # Выход: пересечение вниз ИЛИ сильная перекупленность ИЛИ уход под тренд
+    if ema_cross_down or (last['rsi'] > 80 and last['close'] < last['ema_fast']) or below_trend:
         return "SELL"
         
     return "HOLD"

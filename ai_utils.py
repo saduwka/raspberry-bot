@@ -37,15 +37,31 @@ def clean_html(raw_html):
         return html.escape(re.sub(r'<.*?>', '', raw_html))
 
 def extract_json(text):
-    """Пытается извлечь JSON из ответа Gemini, если он обернут в ```json...```"""
+    """Пытается извлечь JSON из ответа Gemini, исправляя типичные ошибки нейросетей."""
     try:
+        # Убираем Markdown обертки
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0].strip()
         elif "```" in text:
             text = text.split("```")[1].split("```")[0].strip()
-        return json.loads(text)
+            
+        # Очистка текста от лишних символов по краям
+        text = text.strip()
+        
+        # Попытка 1: Прямой парсинг
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Попытка 2: Исправление типичных проблем с кавычками внутри строк
+            # (очень грубая очистка, но часто помогает)
+            # Заменяем переносы строк внутри кавычек, чтобы json.loads не падал
+            cleaned = re.sub(r'(?<=: ")(.*?)(?=",?\n|(?:"\s*}))', 
+                             lambda m: m.group(1).replace('"', '\\"').replace('\n', '\\n'), 
+                             text, flags=re.DOTALL)
+            return json.loads(cleaned)
+            
     except Exception as e:
-        logger.warning(f"Failed to extract JSON from: {text[:100]}... Error: {e}")
+        logger.warning(f"Failed to extract JSON. Error: {e}. Raw text: {text[:200]}...")
         return None
 
 def get_personal_experience():
@@ -136,7 +152,7 @@ async def process_job_scoring(job_title, company, description, history=None):
         if liked: history_context += f"\nПользователю РАНЕЕ ПОНРАВИЛИСЬ эти вакансии:\n{liked}"
         if disliked: history_context += f"\nПользователь РАНЕЕ ОТКЛОНИЛ эти вакансии:\n{disliked}"
 
-    prompt = f"""Ты — HR-эксперт по международному найму. Оцени вакансию для FRONTEND РАЗРАБОТЧИКА:
+    prompt = f"""Ты — HR-эксперт по международному найму. Твоя задача — максимально ЖЕСТКО оценить вакансию для FRONTEND РАЗРАБОТЧИКА.
 {job_title} в компании {company}.
 
 Описание/Стек:
@@ -146,19 +162,21 @@ async def process_job_scoring(job_title, company, description, history=None):
 {cv_summary}
 {history_context}
 
-Твоя задача:
-1. ПРОВЕРЬ РОЛЬ: 
-   - Если это Backend, DevOps, QA, Mobile (Flutter/Swift) или чисто системное программирование — ставь score 0.
-   - Если это Fullstack, где Backend занимает >50% (например, PHP/Laravel, Python/Django, Java/Spring) — ставь score 0-2.
-   - Пользователь ищет ТОЛЬКО Frontend (Vue/React/Next.js).
-2. Оцени стек и опыт (0-10):
-   - Идеально: Vue 3, TypeScript, Microfrontends.
-   - Хорошо: React, Next.js.
+КРИТЕРИИ ОЦЕНКИ (БУДЬ ПРЕДВЗЯТЫМ):
+1. ПРОВЕРЬ РОЛЬ (САМОЕ ВАЖНОЕ): 
+   - Если в названии или описании основная роль это iOS, Android, Mobile, Backend, DevOps, QA, Data Science — ставь score 0 БЕЗ ВАРИАНТОВ.
+   - Если это Fullstack, но Frontend там меньше 70% — ставь score 0-3.
+   - Мы ищем ТОЛЬКО Frontend (Vue, React, Next.js, TypeScript).
+2. ОЦЕНИ СТЕК (0-10):
+   - Vue 3 + TypeScript + Composition API: +10 баллов.
+   - React + TypeScript + Next.js: +8 баллов.
+   - Только JavaScript (без TS): -5 баллов.
+   - Устаревший стек (Vue 2, jQuery, Angular 1): score 0-2.
 3. ПРОВЕРЬ ЛОКАЦИЮ:
-   - Если есть жесткое ограничение по стране (кроме Казахстана) — ставь score 0-2.
-   - Worldwide Remote — это приоритет.
-4. УЧТИ ПРЕДПОЧТЕНИЯ:
-   - Если вакансия похожа на те, что пользователю понравились (+1 к score).
+   - Если вакансия требует релокации или работы в офисе (кроме Казахстана) — ставь score 0.
+   - Если это "Remote in USA only" или "Remote in Europe only", а мы ищем Worldwide — ставь score 0-2.
+4. ПРОВЕРЬ ПЛАТНОСТЬ:
+   - Если в тексте есть намеки, что для отклика нужна платная подписка (например, "upgrade to apply") — ставь score 0.
 
 Верни ТОЛЬКО JSON:
 {{
@@ -213,7 +231,7 @@ async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, av
     model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
     prompt = f"""Ты — профессиональный риск-менеджер и алгоритмический трейдер.
-Твоя задача — подтвердить или отклонить сигнал технического анализа, исключая ложные срабатывания в "боковике" (flat market).
+Твоя задача — подтвердить или отклонить торговый сигнал, минимизируя убытки от "распила" в боковом движении (choppy/flat market).
 
 Технический сигнал: {technical_signal}
 Средний новостной sentiment (12ч): {avg_sentiment:.2f}
@@ -221,15 +239,15 @@ async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, av
 Рыночные данные:
 {json.dumps(market_snapshot, ensure_ascii=False)}
 
-Критерии подтверждения:
-1. BUY: Техсигнал BUY + (Sentiment >= 0) + (Цена выше ema_trend). Если цена слишком далеко ушла вверх от ema_trend (>3%), будь осторожен.
-2. SELL: Техсигнал SELL + (Цена ниже ema_trend ИЛИ RSI > 75). Если техсигнал SELL при RSI < 40, это может быть ложный выход на локальном дне.
-3. HOLD: Если рынок не имеет четкого направления, индикаторы противоречат друг другу или sentiment резко негативный при техсигнале BUY.
+Критерии подтверждения (БУДЬ СТРОГИМ):
+1. BUY: Подтверждай ТОЛЬКО если есть явный восходящий тренд (ema_fast > ema_slow > ema_trend) ИЛИ уверенный отскок от ema_trend. Если ema_gap < 0.05% от цены — это боковик, отвечай HOLD.
+2. SELL: Подтверждай, если цена пробила уровни поддержки или RSI > 75. Если цена все еще выше ema_trend и падение кажется незначительным шумом — можно HOLD.
+3. Фильтр "Шума": Если цена мечется вверх-вниз без направления — всегда HOLD.
 
 Твой приоритет:
-- Избегать "распила" капитала в боковом движении.
-- Лучше пропустить сделку, чем войти в сомнительную.
-- Обращай внимание на ema_gap (разрыв между быстрой и медленной средней).
+- Сохранение капитала важнее прибыли.
+- Игнорируй слабые сигналы в узком диапазоне.
+- Обращай внимание на ema_gap: чем он больше, тем сильнее тренд.
 
 Верни ТОЛЬКО JSON:
 {{
@@ -371,12 +389,13 @@ async def generate_daily_analytics(trades_summary):
 3. Дай совет на завтра.
 
 Стиль: профессиональный, лаконичный, без воды. Используй HTML-теги <b> и <code> для Telegram.
+ВАЖНО: Telegram НЕ поддерживает теги <ul>, <li>, <ol>. Для списков используй обычный символ "-" или "•".
 Никаких приветствий, начни сразу с заголовка <b>📊 Итоги торгового дня</b>."""
 
     try:
         response = await model.generate_content_async(prompt)
         if response and response.text:
-            return response.text.strip()
+            return clean_html(response.text.strip())
     except Exception as e:
         logger.error(f"Daily analytics generation error: {e}")
     return "Не удалось сгенерировать аналитику за сегодня."
