@@ -26,10 +26,8 @@ from database import (
     save_pending, cleanup_old_data,
     get_trade_state, set_trade_state, set_oled_config, populate_initial_data
 )
-from ai_utils import clean_html
-from handlers.monitoring_handlers import (
-    show_news_menu, add_rss, del_rss, list_rss, add_kw, del_kw, list_kw
-)
+from ai.base import clean_html
+from ai.trading import generate_daily_analytics
 from handlers.system_handlers import oled_menu_handler, oled_callback_handler, show_settings, settings_callback
 from jobs import (
     check_health_alert,
@@ -43,6 +41,10 @@ from job_handlers import (
     job_fetch_job, list_jobs_handler, dismiss_job_callback,
     job_query_handler, jobs_refresh_handler, list_applied_jobs_handler,
     cover_letter_callback, job_discovery_handler
+)
+from states import (
+    ADD_RSS, 
+    ADD_KW, JOB_QUERY_INPUT, JOB_DISCOVERY_INPUT, INPUT_SCROLL_TEXT
 )
 
 # --- Logging ---
@@ -61,12 +63,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from states import (
-    ADD_RSS, 
-    ADD_KW, JOB_QUERY_INPUT, JOB_DISCOVERY_INPUT, INPUT_SCROLL_TEXT
-)
+ALMATY_TZ = ZoneInfo("Asia/Almaty")
 
-# --- Decorators ---
 def admin_only(func):
     @wraps(func)
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
@@ -77,6 +75,61 @@ def admin_only(func):
         return await func(update, context, *args, **kwargs)
     return wrapped
 
+# --- Monitoring Handlers (Legacy Command Wrappers) ---
+@admin_only
+async def add_rss(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: /addrss <url>")
+        return
+    url = context.args[0]
+    if await add_rss_feed(url):
+        await update.message.reply_text(f"✅ RSS добавлена: {url}")
+    else:
+        await update.message.reply_text("❌ Не удалось добавить.")
+
+@admin_only
+async def del_rss(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: /delrss <url>")
+        return
+    if await remove_rss_feed(context.args[0]):
+        await update.message.reply_text("✅ Удалено.")
+    else:
+        await update.message.reply_text("❌ Ошибка.")
+
+@admin_only
+async def list_rss(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    feeds = await get_rss_feeds()
+    text = "📰 <b>RSS-ленты:</b>\n\n" + ("\n".join([f"• {f}" for f in feeds]) if feeds else "Пусто")
+    await update.message.reply_text(text, parse_mode="HTML")
+
+@admin_only
+async def add_kw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: /addkw <word>")
+        return
+    if await add_keyword(context.args[0]):
+        await update.message.reply_text(f"✅ Добавлено: {context.args[0]}")
+    else:
+        await update.message.reply_text("❌ Ошибка.")
+
+@admin_only
+async def del_kw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: /delkw <word>")
+        return
+    if await remove_keyword(context.args[0]):
+        await update.message.reply_text("✅ Удалено.")
+    else:
+        await update.message.reply_text("❌ Ошибка.")
+
+@admin_only
+async def list_kw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kws = await get_gaming_keywords()
+    text = "🔑 <b>Ключевые слова:</b>\n\n" + (", ".join(kws) if kws else "Пусто")
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
 # --- UI Helpers ---
 def reply_keyboard():
     return ReplyKeyboardMarkup([
@@ -86,13 +139,27 @@ def reply_keyboard():
 
 def system_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Статус RPi", callback_data="cmd_status")],
+        [InlineKeyboardButton("📊 Статус RPi", callback_data="cmd_status"),
+         InlineKeyboardButton("🎵 Музыка", callback_data="music_menu")],
         [InlineKeyboardButton("📺 OLED Дисплей", callback_data="oled_menu")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="set_back"),
          InlineKeyboardButton("🔄 Перезапуск", callback_data="set_restart")],
     ])
 
 # OLED handlers moved to handlers.system_handlers
+
+async def show_music_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    text = "🎵 <b>Управление музыкой</b>\n\nСинхронизация библиотеки с YouTube Music и перенос на iPod."
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Синхронизация (Полная)", callback_data="music_sync_full")],
+        [InlineKeyboardButton("📤 Только перенос", callback_data="ipod_sync_push")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_system")]
+    ])
+    if query:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 async def process_scroll_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -202,7 +269,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return INPUT_SCROLL_TEXT
 
     # Обработка вакансий
-    if data == "jobs_list":
+    elif data == "jobs_list" or data.startswith("jobs_list_"):
         await list_jobs_handler(update, context)
     elif data == "jobs_refresh":
         await jobs_refresh_handler(update, context)
@@ -211,12 +278,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "jobs_query_show":
         await job_query_handler(update, context)
     elif data == "jobs_query_edit":
-        await query.message.reply_text("Введите новый поисковый запрос (например: React Senior):")
+        await query.message.reply_text("Введите новый поисковый запрос (например: React Middle/Senior):")
         return JOB_QUERY_INPUT
     elif data == "jobs_discovery_edit":
         await query.message.reply_text("Опишите, какие компании искать (например: Финтех компании СНГ похожие на Каспи):")
         return JOB_DISCOVERY_INPUT
 
+    # Обработка музыки
+    elif data == "music_menu":
+        await show_music_menu(update, context)
+    elif data == "music_sync_full":
+        await query.answer("🎵 Запускаю синхронизацию...")
+        cmd = ["python3", "/root/music_sync/sync.py"]
+        try:
+            subprocess.Popen(cmd)
+        except Exception as e:
+            await query.message.reply_text(f"❌ Ошибка запуска: {e}")
     elif data == "ipod_sync_push":
         await query.answer("🚀 Запускаю перенос...")
         # Run the sync script in the background
@@ -226,11 +303,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             subprocess.Popen(cmd)
         except Exception as e:
             await query.message.reply_text(f"❌ Ошибка запуска: {e}")
+    elif data == "back_to_system":
+        await show_system_menu(update, context)
 
-    if data == "cmd_status":
-        await query.message.reply_text(get_stats(), parse_mode="HTML")
+    elif data == "cmd_status":
+        await query.message.edit_text(get_stats(), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_system")]]))
     elif data == "trade_menu":
-        await show_trade_menu(update, context)
+        await trade_handlers.show_trade_menu(update, context)
     elif data.startswith("trade_select_"):
         pair = data.replace("trade_select_", "")
         await trade_handlers.trade_stats_handler(update, context, pair=pair)
@@ -305,7 +384,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "⚙️ Система":
         await show_system_menu(update, context)
     elif text == "📈 Трейдинг":
-        await show_trade_menu(update, context)
+        await trade_handlers.show_trade_menu(update, context)
     elif text == "💼 Вакансии":
         await show_jobs_menu(update, context)
     elif text == "/start":
@@ -350,6 +429,7 @@ def main():
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("restart", restart_bot))
+    app.add_handler(CommandHandler("status", lambda u, c: asyncio.create_task(u.message.reply_text(get_stats(), parse_mode="HTML"))))
     app.add_handler(CommandHandler("test_analytics", send_daily_trade_analytics))
     
     # OLED Handlers
@@ -378,6 +458,9 @@ def main():
     jq.run_daily(job_fetch_job, time=dt_time(18, 0, tzinfo=ALMATY_TZ))
     jq.run_daily(check_job_follow_ups, time=dt_time(11, 0, tzinfo=ALMATY_TZ))
     jq.run_daily(lambda ctx: asyncio.create_task(cleanup_old_data()), time=dt_time(4, 0, tzinfo=ALMATY_TZ))
+    # Бэкап БД
+    from jobs import backup_db_job
+    jq.run_daily(backup_db_job, time=dt_time(3, 0, tzinfo=ALMATY_TZ))
     jq.run_daily(send_weekly_digest, time=dt_time(20, 0, tzinfo=ALMATY_TZ), days=(6,))
     jq.run_daily(send_daily_trade_analytics, time=dt_time(23, 0, tzinfo=ALMATY_TZ))
     jq.run_repeating(check_health_alert, interval=300, first=10)

@@ -22,6 +22,7 @@ from config import (
     CHANNEL_ID,
     TRADE_PAIRS,
     GEMINI_MIN_CONFIDENCE,
+    MAX_DAILY_TRADES,
 )
 from database import (
     is_posted, is_pending, mark_posted, save_pending, get_pending, delete_pending,
@@ -31,7 +32,8 @@ from database import (
     get_recent_sentiments, get_weekly_stats, get_daily_trades
 )
 
-from ai_utils import process_with_gemini, evaluate_trade_with_gemini, generate_daily_analytics
+from ai.news import process_with_gemini
+from ai.trading import evaluate_trade_with_gemini, generate_daily_analytics
 
 async def restart_bot(update: Update = None, context: ContextTypes.DEFAULT_TYPE = None):
     """Отправляет сообщение о перезапуске и инициирует его через systemctl."""
@@ -365,48 +367,72 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
             
         last_row = df.iloc[-1]
         last_price = last_row['close']
+        last_atr = last_row['atr']
+        last_adx = last_row['adx']
+        
         current_pos = await get_open_position(pair)
         entry_price = await get_trade_state("entry_price", pair)
+        highest_price = await get_trade_state("highest_price", pair)
+        
+        # Обновляем максимальную цену для трейлинг-стопа
+        if current_pos == "in_position" and last_price is not None:
+            if highest_price is None or float(last_price) > float(highest_price):
+                highest_price = float(last_price)
+                await set_trade_state("highest_price", highest_price, pair)
+
         risk_exit_reason = None
         if current_pos == "in_position" and entry_price is not None:
             try:
-                risk_exit_reason = trade_engine.get_risk_exit_signal(float(last_price), float(entry_price))
-            except (TypeError, ValueError):
-                logger.warning(f"Invalid entry_price in trade_state for {pair}: {entry_price}")
+                risk_exit_reason = trade_engine.get_risk_exit_signal(
+                    float(last_price), 
+                    float(entry_price), 
+                    float(last_atr),
+                    highest_price=float(highest_price) if highest_price else None
+                )
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Error calculating risk exit for {pair}: {e}")
         
-        # 4. Генерируем техсигнал и отдельно спрашиваем Gemini
+        # 4. Генерируем техсигнал
         technical_signal = trade_engine.get_signal(df, sentiment=avg_sentiment)
         if risk_exit_reason:
             technical_signal = "SELL"
         
-        logger.info(f"[{pair}] Tech: {technical_signal} | Sentiment: {avg_sentiment:.2f} | RiskExit: {risk_exit_reason}")
+        logger.info(f"[{pair}] Tech: {technical_signal} | ADX: {last_adx:.1f} | ATR: {last_atr:.4f} | RiskExit: {risk_exit_reason}")
 
+        # 5. Оптимизация Gemini: вызываем только если есть техсигнал или нужно подтверждение выхода
         market_snapshot = {
             "pair": pair,
-            "price": round(float(last_price), 2),
+            "price": round(float(last_price), 4),
             "volume": round(float(last_row["volume"]), 2),
-            "ema_fast": round(float(last_row["ema_fast"]), 2),
-            "ema_slow": round(float(last_row["ema_slow"]), 2),
-            "ema_trend": round(float(last_row["ema_trend"]), 2),
+            "ema_fast": round(float(last_row["ema_fast"]), 4),
+            "ema_slow": round(float(last_row["ema_slow"]), 4),
+            "ema_trend": round(float(last_row["ema_trend"]), 4),
             "rsi": round(float(last_row["rsi"]), 2),
-            "ema_gap": round(float(last_row["ema_fast"] - last_row["ema_slow"]), 2),
+            "adx": round(float(last_adx), 2),
+            "atr": round(float(last_atr), 4),
+            "ema_gap": round(float(last_row["ema_fast"] - last_row["ema_slow"]), 4),
             "technical_signal": technical_signal,
             "position_state": current_pos or "none",
-            "entry_price": round(float(entry_price), 2) if entry_price is not None else None,
+            "entry_price": round(float(entry_price), 4) if entry_price is not None else None,
+            "highest_price": round(float(highest_price), 4) if highest_price is not None else None,
             "risk_exit": risk_exit_reason,
+            "recent_candles": df[['close', 'volume', 'rsi']].tail(3).to_dict('records')
         }
-        if technical_signal == "HOLD" and not risk_exit_reason:
+
+        should_call_gemini = (technical_signal != "HOLD") or (risk_exit_reason is not None)
+        
+        if not should_call_gemini:
             gemini_decision = {
                 "action": "HOLD",
                 "confidence": 0.0,
-                "reason": "Технический сигнал нейтральный, Gemini не вызывался",
+                "reason": "Технических сигналов нет, ADX низкий — экономим API",
             }
             signal = "HOLD"
         elif risk_exit_reason:
             gemini_decision = {
                 "action": "SELL",
                 "confidence": 1.0,
-                "reason": f"Сработал риск-выход: {risk_exit_reason}",
+                "reason": f"Сработал динамический выход: {risk_exit_reason}",
             }
             signal = "SELL"
         else:
@@ -417,17 +443,14 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
                 avg_sentiment=avg_sentiment,
             )
             
-            logger.info(f"[{pair}] Gemini Decision: {gemini_decision}")
-            
-            # УЛУЧШЕННОЕ КОНСЕРВАТИВНОЕ РЕШЕНИЕ:
+            # Консервативная логика принятия решения
             if technical_signal == "BUY":
-                # Покупаем ТОЛЬКО если Gemini подтверждает BUY
-                if gemini_decision["action"] == "BUY" and gemini_decision["confidence"] >= 0.4:
+                if gemini_decision["action"] == "BUY" and gemini_decision["confidence"] >= 0.6:
                     signal = "BUY"
                 else:
                     signal = "HOLD"
             elif technical_signal == "SELL":
-                # Продаем если техсигнал SELL, НО если Gemini видит ОЧЕНЬ сильный потенциал роста — удерживаем
+                # Если Gemini против продажи и уверенность > 0.8 — можем придержать
                 if gemini_decision["action"] == "BUY" and gemini_decision["confidence"] >= 0.8:
                     signal = "HOLD"
                 else:
@@ -443,21 +466,39 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
         await set_trade_state("last_risk_exit_reason", risk_exit_reason, pair)
         
         logger.info(
-            f"[{pair}] Tech: {technical_signal} | Gemini: {gemini_decision['action']} "
-            f"(conf={gemini_decision['confidence']:.2f}) | Final: {signal} | Price: {last_price}"
+            f"[{pair}] Final Decision: {signal} | Price: {last_price} | Gemini: {gemini_decision['action']} ({gemini_decision['confidence']})"
         )
         
-        if signal == "BUY" and current_pos == "in_position":
-            continue
+        if signal == "BUY":
+            if current_pos == "in_position":
+                continue
+                
+            # Проверка лимитов перед входом
+            daily_trades = await get_daily_trades(24)
+            buy_trades_count = len([t for t in daily_trades if t[1] == 'BUY'])
+            total_daily_pnl = sum([float(t[4]) for t in daily_trades if t[4] is not None])
+            
+            if buy_trades_count >= MAX_DAILY_TRADES:
+                logger.warning(f"Daily trade limit reached ({MAX_DAILY_TRADES}). Skipping BUY for {pair}.")
+                continue
+                
+            if total_daily_pnl < -100: # Условный стоп по дневному убытку в USDT (можно в конфиг)
+                logger.warning(f"Daily drawdown limit reached. Skipping BUY for {pair}.")
+                continue
+
         if signal == "SELL" and (current_pos == "none" or current_pos is None):
             continue
+            
         if signal == "HOLD":
             continue
+            
+        trade_result = await trade_engine.execute_trade(signal, last_price, pair, avg_sentiment, atr=last_atr)
 
-        # 6. Исполняем
-        trade_result = await trade_engine.execute_trade(signal, last_price, pair, avg_sentiment)
         
         if trade_result and trade_result.get("success"):
+            # Сбрасываем highest_price при закрытии сделки
+            if signal == "SELL":
+                await set_trade_state("highest_price", None, pair)
             side_emoji = "🚀" if signal == "BUY" else "🔻"
             side_text = "ПОКУПКА" if signal == "BUY" else "ПРОДАЖА"
             pnl_text = ""
@@ -607,3 +648,29 @@ async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE,
         await context.bot.send_message(chat_id=ADMIN_ID, text=full_report, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Error sending daily analytics: {e}")
+
+async def backup_db_job(context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет резервную копию базы данных админу."""
+    logger.info("Creating database backup...")
+    try:
+        # Используем sqlite3 для корректного создания копии (VACUUM INTO или просто копирование файла)
+        # Для простоты и безопасности на RPi просто копируем файл
+        backup_path = f"{DB_PATH}.backup"
+        import shutil
+        shutil.copy2(DB_PATH, backup_path)
+        
+        with open(backup_path, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=ADMIN_ID,
+                document=f,
+                filename=f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
+                caption=f"📦 Резервная копия базы данных\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+            )
+        
+        # Удаляем временный файл
+        import os
+        os.remove(backup_path)
+        logger.info("Backup sent successfully.")
+    except Exception as e:
+        logger.error(f"Backup failed: {e}")
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"❌ Ошибка при создании бэкапа: {e}")

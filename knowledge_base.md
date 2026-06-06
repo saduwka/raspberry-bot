@@ -14,7 +14,7 @@
 - Настройка CI/CD для фронтенда.
 
 ## Предпочтения по вакансиям:
-- **Роль:** Senior/Middle+ Frontend Developer.
+- **Роль:** Middle/Senior Frontend Developer.
 - **Формат:** Полная удаленка (Remote).
 - **Локация:** Worldwide (предпочтительно), СНГ, Европа.
 - **Стек:** Vue 3 + TS — приоритет №1. React/Next.js — приоритет №2.

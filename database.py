@@ -376,15 +376,15 @@ async def is_vacancy_seen(url):
                 row = await cursor.fetchone()
                 return row is not None
 
-async def get_top_vacancies(limit=10):
+async def get_top_vacancies(limit=10, offset=0):
     async with db_lock:
         async with aiosqlite.connect(DB_PATH, timeout=30) as db:
             async with db.execute("""
                 SELECT * FROM job_vacancies 
                 WHERE dismissed = 0 
                 ORDER BY score DESC, created_at DESC 
-                LIMIT ?
-            """, (limit,)) as cursor:
+                LIMIT ? OFFSET ?
+            """, (limit, offset)) as cursor:
                 return await cursor.fetchall()
 
 async def dismiss_vacancy(vacancy_id):

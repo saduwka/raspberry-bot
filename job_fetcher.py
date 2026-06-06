@@ -5,49 +5,87 @@ import asyncio
 import urllib.parse
 from bs4 import BeautifulSoup
 from database import is_vacancy_seen, get_trade_state, get_target_companies
+from ai.jobs import expand_search_query
 
 logger = logging.getLogger(__name__)
 
+# Singleton-like manager for Playwright
+class PlaywrightManager:
+    _instance = None
+    _browser = None
+    _playwright = None
+
+    @classmethod
+    async def get_browser(cls):
+        if cls._browser is None:
+            from playwright.async_api import async_playwright
+            cls._playwright = await async_playwright().start()
+            cls._browser = await cls._playwright.chromium.launch(headless=True)
+        return cls._browser
+
+    @classmethod
+    async def close(cls):
+        if cls._browser:
+            await cls._browser.close()
+            cls._browser = None
+        if cls._playwright:
+            await cls._playwright.stop()
+            cls._playwright = None
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
 
 async def fetch_with_playwright(url):
     """Открывает страницу через реальный браузер (Playwright) для обхода JS-защиты и рендеринга."""
-    from playwright.async_api import async_playwright
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(user_agent=HEADERS["User-Agent"])
-            page = await context.new_page()
-            
+        browser = await PlaywrightManager.get_browser()
+        context = await browser.new_context(user_agent=HEADERS["User-Agent"])
+        page = await context.new_page()
+        
+        try:
             # Устанавливаем таймаут и ждем загрузки сети
-            await page.goto(url, wait_until="networkidle", timeout=30000)
+            await page.goto(url, wait_until="networkidle", timeout=25000)
             
             # Прокрутка вниз для динамического контента
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1.5)
             
             content = await page.content()
-            await browser.close()
             return content
+        finally:
+            await context.close()
     except Exception as e:
-        logger.error(f"Playwright error for {url}: {e}")
+        logger.debug(f"Playwright error for {url}: {e}")
         return None
 
 LEVER_COMPANIES = [
     {"name": "Plaid", "board": "plaid"},
+    {"name": "Postscript", "board": "postscript"},
+    {"name": "Hotjar", "board": "hotjar"},
+    {"name": "Miro", "board": "miro"},
+    {"name": "Figma", "board": "figma"},
 ]
 
 GREENHOUSE_COMPANIES = [
     {"name": "Vercel", "board": "vercel"},
+    {"name": "GitLab", "board": "gitlab"},
+    {"name": "Stripe", "board": "stripe"},
+    {"name": "Airbnb", "board": "airbnb"},
+    {"name": "DoorDash", "board": "doordash"},
+    {"name": "Affirm", "board": "affirm"},
 ]
 
 ASHBY_COMPANIES = [
     {"name": "Linear", "board": "linear"},
     {"name": "Render", "board": "render"},
+    {"name": "Oyster", "board": "oyster"},
+    {"name": "Replicate", "board": "replicate"},
+    {"name": "Stability AI", "board": "stabilityai"},
 ]
 
 def normalize_job_url(url):
@@ -91,19 +129,24 @@ async def fetch_full_job_description(client, url):
         return ""
 
 async def fetch_hh_jobs(query, schedule="remote"):
-    """Парсинг hh.kz через открытый API."""
+    """Парсинг hh.ru через открытый API."""
     url = "https://api.hh.ru/vacancies"
     params = {
         "text": query,
         "schedule": schedule,
-        "per_page": 15,
+        "per_page": 20,
         "order_by": "publication_time"
     }
     try:
         hh_headers = HEADERS.copy()
+        # HH API требует уникальный User-Agent.
+        hh_headers["User-Agent"] = f"JobHunterBot/1.0 (contact@nurzhan.me)"
         hh_headers["Accept"] = "application/json"
-        async with httpx.AsyncClient(headers=hh_headers, timeout=12) as client:
+        async with httpx.AsyncClient(headers=hh_headers, timeout=15) as client:
             r = await client.get(url, params=params)
+            if r.status_code == 403:
+                logger.warning("HH API returned 403. Access might be restricted by IP.")
+                return []
             r.raise_for_status()
             data = r.json()
             
@@ -380,72 +423,193 @@ async def fetch_career_page_jobs():
                 logger.error(f"Error scanning {company['name']}: {e}")
     return jobs
 
+async def fetch_remote_co_jobs(query):
+    """Скрапер Remote.co (не требует ключей)."""
+    url = f"https://remote.co/remote-jobs/developer"
+    try:
+        html = await fetch_with_playwright(url)
+        if not html: return []
+        
+        soup = BeautifulSoup(html, 'html.parser')
+        job_list = soup.find_all('a', class_='card')
+        
+        jobs = []
+        for card in job_list[:25]:
+            title_tag = card.find('span', class_='font-weight-bold')
+            if not title_tag: continue
+            
+            title = title_tag.get_text().strip()
+            v_url = normalize_job_url(urllib.parse.urljoin("https://remote.co", card['href']))
+            if await is_vacancy_seen(v_url): continue
+            
+            jobs.append({
+                "title": title,
+                "company": "Remote.co",
+                "url": v_url,
+                "salary_raw": "See website",
+                "is_remote": True,
+                "source": "Remote.co",
+                "description": title
+            })
+        return jobs
+    except Exception as e:
+        logger.error(f"Remote.co Error: {e}")
+        return []
+
+async def fetch_hn_jobs():
+    """Hacker News 'Who is hiring': Парсинг через Algolia API."""
+    try:
+        # 1. Ищем последний тред "Who is hiring"
+        search_url = "https://hn.algolia.com/api/v1/search_by_date"
+        params = {
+            "query": "Who is hiring",
+            "tags": "story,author_whoishiring",
+            "hitsPerPage": 1
+        }
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(search_url, params=params)
+            r.raise_for_status()
+            hits = r.json().get("hits", [])
+            if not hits: return []
+            
+            story_id = hits[0]["objectID"]
+            story_title = hits[0]["title"]
+            
+            # 2. Получаем комментарии (вакансии)
+            item_url = f"https://hn.algolia.com/api/v1/items/{story_id}"
+            r = await client.get(item_url)
+            r.raise_for_status()
+            comments = r.json().get("children", [])
+            
+            jobs = []
+            for comment in comments[:100]: # Берем первые 100 для анализа
+                text = comment.get("text", "")
+                if not text: continue
+                
+                # HN вакансии обычно начинаются с Названия Компании | Роли | Локации
+                # Упрощенно проверяем на Remote и ключевые слова
+                text_plain = BeautifulSoup(text, 'html.parser').get_text(separator=" ")
+                if not looks_remote(text_plain): continue
+                
+                # Фильтр по стеку (Vue/React/Frontend)
+                keywords = ["vue", "react", "frontend", "front-end", "typescript"]
+                if not any(kw in text_plain.lower() for kw in keywords): continue
+                
+                v_url = f"https://news.ycombinator.com/item?id={comment['id']}"
+                if await is_vacancy_seen(v_url): continue
+                
+                # Пытаемся вычленить заголовок (первая строка до пайпа или переноса)
+                first_line = text_plain.split("\n")[0].split("|")[0].strip()
+                
+                jobs.append({
+                    "title": first_line[:100],
+                    "company": "HN Startup",
+                    "url": v_url,
+                    "salary_raw": "See HN thread",
+                    "is_remote": True,
+                    "source": f"Hacker News ({story_title})",
+                    "description": text_plain
+                })
+            return jobs
+    except Exception as e:
+        logger.error(f"HN Error: {e}")
+        return []
+
 async def fetch_all_jobs(progress_callback=None):
-    """Агрегатор всех источников: локальных, прямых и международных."""
+    """Агрегатор всех источников с использованием ИИ-расширения запросов (Параллельно)."""
     db_query = await get_trade_state("job_search_query")
     raw_query = db_query if db_query else "Vue TypeScript Frontend"
     
-    # Очистка запроса для разных API (убираем запятые, заменяем на пробелы для поиска)
-    clean_query = raw_query.replace(",", " ").strip()
-    hh_query = clean_query.split(" ")[0] # Для HH берем первое слово или весь если мало
-    remotive_query = clean_query
+    # 1. Расширяем запрос через ИИ
+    if progress_callback:
+        await progress_callback(0, 100, "Expanding search queries via Gemini...")
+    
+    query_variations = await expand_search_query(raw_query)
     
     # Функции-фабрики для создания задач
-    def get_sources(raw_query, hh_query, remotive_query):
-        return [
-            (lambda: fetch_hh_jobs(hh_query), 'HeadHunter'),
-            (lambda: fetch_rss_jobs(f'https://career.habr.com/vacancies/rss?q={urllib.parse.quote(raw_query.replace(",", " "))}&remote=true', 'Habr Career'), 'Habr Career'),
-            (lambda: fetch_rss_jobs(f'https://djinni.co/jobs/rss?primary_keyword=Frontend', 'Djinni', ['Vue', 'React', 'TypeScript', 'Frontend']), 'Djinni'),
-            (lambda: fetch_remotive_jobs(remotive_query), 'Remotive'),
+    def get_sources(queries):
+        sources = [
             (lambda: fetch_career_page_jobs(), 'Career Pages'),
             (lambda: fetch_lever_jobs(), 'Lever'),
             (lambda: fetch_greenhouse_jobs(), 'Greenhouse'),
             (lambda: fetch_ashby_jobs(), 'Ashby'),
+            (lambda: fetch_hn_jobs(), 'Hacker News'),
+            (lambda: fetch_remote_co_jobs(queries[0]), 'Remote.co'),
+            (lambda: fetch_rss_jobs(f'https://djinni.co/jobs/rss?primary_keyword=Frontend', 'Djinni', ['Vue', 'React', 'TypeScript', 'Frontend']), 'Djinni'),
+            (lambda: fetch_rss_jobs('https://himalayas.app/jobs.rss', 'Himalayas', ['Frontend', 'Vue', 'React', 'TypeScript']), 'Himalayas'),
+            (lambda: fetch_rss_jobs('https://jsremotely.com/jobs/rss', 'JS Remotely'), 'JS Remotely'),
             (lambda: fetch_rss_jobs('https://remoteok.com/remote-jobs.rss', 'RemoteOK', ['Frontend', 'React', 'Vue', 'TypeScript', 'JavaScript']), 'RemoteOK'),
             (lambda: fetch_rss_jobs('https://weworkremotely.com/categories/remote-front-end-programming-jobs.rss', 'WeWorkRemotely'), 'WeWorkRemotely'),
             (lambda: fetch_rss_jobs('https://app.vuejobs.com/feed/posts', 'VueJobs'), 'VueJobs'),
             (lambda: fetch_rss_jobs('https://authenticjobs.com/feed/', 'AuthenticJobs', ['Frontend', 'React', 'Vue', 'TypeScript']), 'AuthenticJobs'),
-            (lambda: fetch_rss_jobs('https://rss.atpchel.com/telegram/channel/frontendjobs', 'TG: Frontend Jobs', ['Vue', 'React', 'TypeScript']), 'TG: Frontend'),
-            (lambda: fetch_rss_jobs('https://rss.atpchel.com/telegram/channel/javascriptjobs', 'TG: JS Jobs', ['Vue', 'React', 'TypeScript']), 'TG: JS'),
-            (lambda: fetch_rss_jobs('https://rss.atpchel.com/telegram/channel/react_jobs', 'TG: React Jobs'), 'TG: React'),
-            (lambda: fetch_rss_jobs('https://rss.atpchel.com/telegram/channel/remote_it_jobs', 'TG: За борт'), 'TG: Remote'),
         ]
+        
+        # Добавляем мульти-запросы для ключевых платформ
+        for q in queries[:4]: # Берем топ-4 вариации
+            q_clean = q.replace(",", " ").strip()
+            hh_q = q_clean.split(" ")[0]
+            sources.append((lambda q=hh_q: fetch_hh_jobs(q), f'HH:{q}'))
+            sources.append((lambda q=q_clean: fetch_remotive_jobs(q), f'Remotive:{q}'))
+            sources.append((lambda q=q_clean: fetch_rss_jobs(f'https://career.habr.com/vacancies/rss?q={urllib.parse.quote(q_clean)}&remote=true', f'Habr:{q}'), f'Habr:{q}'))
 
-    sources = get_sources(raw_query, hh_query, remotive_query)
+        return sources
+
+    sources = get_sources(query_variations)
     total = len(sources)
     all_results = []
     
-    for i, (task_factory, name) in enumerate(sources):
-        if progress_callback:
-            await progress_callback(i, total, name)
-        
-        try:
-            # Вызываем фабрику для получения корутины
-            coro = task_factory()
-            res = await asyncio.wait_for(coro, timeout=25) 
-            all_results.append(res)
-        except asyncio.TimeoutError:
-            logger.error(f'Timeout fetching from {name}')
-            all_results.append([])
-        except Exception as e:
-            logger.error(f'Error fetching from {name}: {e}')
-            all_results.append([])
+    sem = asyncio.Semaphore(6)
+
+    async def wrapped_task(task_factory, name, index):
+        async with sem:
+            if progress_callback:
+                await progress_callback(index, total, name)
+            try:
+                coro = task_factory()
+                return await asyncio.wait_for(coro, timeout=35)
+            except asyncio.TimeoutError:
+                logger.error(f'Timeout fetching from {name}')
+                return []
+            except Exception as e:
+                logger.error(f'Error fetching from {name}: {e}')
+                return []
+
+    try:
+        tasks = [wrapped_task(tf, name, i) for i, (tf, name) in enumerate(sources)]
+        all_results = await asyncio.gather(*tasks)
+    finally:
+        await PlaywrightManager.close()
 
     if progress_callback:
-        await progress_callback(total, total, "Scoring with AI...")
+        await progress_callback(total, total, "Filtering & Deduplicating...")
 
     unique_jobs = []
     seen_urls = set()
+    seen_identifiers = set() # For company + title deduplication
+    
     for sublist in all_results:
         for job in sublist:
             normalized_url = normalize_job_url(job.get("url"))
-            if not normalized_url or normalized_url in seen_urls:
+            title = job.get("title", "").strip()
+            company = job.get("company", "").strip()
+            
+            if not normalized_url or not title or not company:
                 continue
-            if not job.get("title") or not job.get("company"):
+                
+            # 1. URL Deduplication
+            if normalized_url in seen_urls:
                 continue
             
-            # Базовая фильтрация по названию, чтобы отсечь явный бэкенд до AI-скоринга
-            title_lower = job["title"].lower()
+            # 2. Company + Title Deduplication
+            clean_title = "".join(filter(str.isalnum, title.lower()))
+            clean_company = "".join(filter(str.isalnum, company.lower()))
+            identifier = f"{clean_company}_{clean_title}"
+            
+            if identifier in seen_identifiers:
+                continue
+
+            # 3. Basic Title Filtering
+            title_lower = title.lower()
             exclude_keywords = [
                 "backend", "devops", "qa engineer", "tester", "android", "ios", "swift", "kotlin",
                 "java", "python", "php", "c++", "c#", ".net", "ruby", "rust", "go", "golang",
@@ -453,26 +617,31 @@ async def fetch_all_jobs(progress_callback=None):
                 "product manager", "project manager", "designer", "scrum master"
             ]
             
-            # Если в названии есть исключающее слово И нет "frontend"/"front-end", пропускаем
             if any(kw in title_lower for kw in exclude_keywords):
                 if "frontend" not in title_lower and "front-end" not in title_lower:
                     continue
 
+            # Passed all filters
             job["url"] = normalized_url
             unique_jobs.append(job)
             seen_urls.add(normalized_url)
+            seen_identifiers.add(identifier)
 
-    # ДОПОЛНИТЕЛЬНЫЙ ЭТАП: Догружаем описания, если они слишком короткие
+    if progress_callback:
+        await progress_callback(total, total, "Enriching descriptions...")
+
     async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as client:
+        enrich_sem = asyncio.Semaphore(5)
 
-        # Берем только лучшие вакансии для экономии ресурсов (например, первые 20)
-        for job in unique_jobs:
-            desc = job.get("description", "")
-            if len(desc) < 300: # Если описание подозрительно короткое
-                logger.info(f"Fetching full description for {job['title']} @ {job['company']}...")
-                full_desc = await fetch_full_job_description(client, job["url"])
-                if full_desc:
-                    job["description"] = full_desc
-                await asyncio.sleep(0.5)
+        async def enrich_job(job):
+            async with enrich_sem:
+                desc = job.get("description", "")
+                if len(desc) < 400:
+                    full_desc = await fetch_full_job_description(client, job["url"])
+                    if full_desc:
+                        job["description"] = full_desc
+                    await asyncio.sleep(0.2)
+
+        await asyncio.gather(*[enrich_job(j) for j in unique_jobs[:35]])
 
     return unique_jobs
