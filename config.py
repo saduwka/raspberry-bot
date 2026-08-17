@@ -5,6 +5,8 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_JOB_API_KEY = os.getenv("GEMINI_JOB_API_KEY") or GEMINI_API_KEY
+GEMINI_TRADE_API_KEY = os.getenv("GEMINI_TRADE_API_KEY") or GEMINI_API_KEY
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 
@@ -33,7 +35,20 @@ TRADE_RISK_PER_TRADE_USDT = float(os.getenv("TRADE_RISK_PER_TRADE_USDT", "10.0")
 GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.2"))
 JOB_MIN_SCORE = int(os.getenv("JOB_MIN_SCORE", "6"))
 JOB_REQUIRE_WORLDWIDE = os.getenv("JOB_REQUIRE_WORLDWIDE", "False").lower() == "true"
+JOB_AI_SCORE_LIMIT = int(os.getenv("JOB_AI_SCORE_LIMIT", "50"))
+JOB_AI_BATCH_SIZE = int(os.getenv("JOB_AI_BATCH_SIZE", "8"))
+JOB_RAW_QUEUE_LIMIT = int(os.getenv("JOB_RAW_QUEUE_LIMIT", "200"))
+JOB_SCORING_PROVIDER = os.getenv("JOB_SCORING_PROVIDER", "local").lower()
+GEMINI_JOB_MODEL = os.getenv("GEMINI_JOB_MODEL", "gemini-2.0-flash-lite")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 RESUME_URL = os.getenv("RESUME_URL", "https://your-resume-link.com")
+
+LOCAL_LLM_BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "http://sadu.tail73af56.ts.net:8091/v1")
+LOCAL_LLM_API_KEY = os.getenv("LOCAL_LLM_API_KEY", "")
+LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "qwen3.5-coder")
+LOCAL_LLM_TIMEOUT = float(os.getenv("LOCAL_LLM_TIMEOUT", "60"))
+AI_PROVIDER = os.getenv("AI_PROVIDER", "local").lower()
 
 DB_PATH = "bot.db"
 

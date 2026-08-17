@@ -5,7 +5,8 @@ import asyncio
 import urllib.parse
 from bs4 import BeautifulSoup
 from database import is_vacancy_seen, get_trade_state, get_target_companies
-from ai.jobs import expand_search_query
+from ai.jobs import expand_search_query_safe
+from ai.job_role_filters import passes_title_filter
 
 logger = logging.getLogger(__name__)
 
@@ -83,16 +84,6 @@ async def fetch_with_playwright(url):
 
 LEVER_COMPANIES = [
     {"name": "Plaid", "board": "plaid"},
-    {"name": "Postscript", "board": "postscript"},
-    {"name": "Hotjar", "board": "hotjar"},
-    {"name": "Miro", "board": "miro"},
-    {"name": "Figma", "board": "figma"},
-    {"name": "Supabase", "board": "supabase"},
-    {"name": "Docker", "board": "docker"},
-    {"name": "Sourcegraph", "board": "sourcegraph"},
-    {"name": "Vanta", "board": "vanta"},
-    {"name": "OpenAI", "board": "openai"},
-    {"name": "Loom", "board": "loom"},
 ]
 
 GREENHOUSE_COMPANIES = [
@@ -100,13 +91,8 @@ GREENHOUSE_COMPANIES = [
     {"name": "GitLab", "board": "gitlab"},
     {"name": "Stripe", "board": "stripe"},
     {"name": "Airbnb", "board": "airbnb"},
-    {"name": "DoorDash", "board": "doordash"},
     {"name": "Affirm", "board": "affirm"},
-    {"name": "Sentry", "board": "sentry"},
     {"name": "Okta", "board": "okta"},
-    {"name": "Retool", "board": "retool"},
-    {"name": "Grafana", "board": "grafana"},
-    {"name": "HashiCorp", "board": "hashicorp"},
 ]
 
 ASHBY_COMPANIES = [
@@ -125,16 +111,12 @@ ASHBY_COMPANIES = [
 STATIC_RSS_SOURCES = [
     # (url, source_name, filter_keywords)
     ("https://djinni.co/jobs/rss?primary_keyword=Frontend",  "Djinni",         ["Vue", "React", "TypeScript", "Frontend"]),
-    ("https://himalayas.app/jobs.rss",                       "Himalayas",       ["Frontend", "Vue", "React", "TypeScript"]),
-    ("https://jsremotely.com/jobs/rss",                      "JS Remotely",     None),
     ("https://remoteok.com/remote-jobs.rss",                 "RemoteOK",        ["Frontend", "React", "Vue", "TypeScript", "JavaScript"]),
     ("https://weworkremotely.com/categories/remote-front-end-programming-jobs.rss", "WeWorkRemotely", None),
     ("https://app.vuejobs.com/feed/posts",                   "VueJobs",         None),
     ("https://authenticjobs.com/feed/",                      "AuthenticJobs",   ["Frontend", "React", "Vue", "TypeScript"]),
-    ("https://web3.career/remote-jobs.rss",                  "Web3.career",     ["Frontend", "React", "Vue", "TypeScript", "JavaScript"]),
     ("https://nodesk.co/remote-jobs/index.xml",              "NoDesk",          ["Frontend", "React", "Vue", "TypeScript", "JavaScript"]),
     ("https://jobspresso.co/feed/?post_type=job_listing",    "Jobspresso",      ["Frontend", "React", "Vue", "TypeScript", "JavaScript"]),
-    ("https://jobs.jsconf.org/jobs.xml",                     "JSConf Jobs",     ["Frontend", "React", "Vue", "TypeScript", "JavaScript"]),
 ]
 
 
@@ -342,6 +324,10 @@ async def fetch_lever_jobs():
                     if not looks_remote(text_blob):
                         continue
 
+                    title = item.get("text", "")
+                    if not passes_title_filter(title):
+                        continue
+
                     url = normalize_job_url(item.get("hostedUrl"))
                     if not url or await is_vacancy_seen(url):
                         continue
@@ -375,6 +361,10 @@ async def fetch_greenhouse_jobs():
                     content = item.get("content", "") or ""
                     text_blob = " ".join(filter(None, [item.get("title"), location, content]))
                     if not looks_remote(text_blob):
+                        continue
+
+                    title = item.get("title", "")
+                    if not passes_title_filter(title):
                         continue
 
                     absolute_url = normalize_job_url(item.get("absolute_url"))
@@ -411,11 +401,14 @@ async def fetch_ashby_jobs():
                         continue
                     if not text or not looks_remote(text):
                         continue
+                    job_title = text.split("@")[0].strip()
+                    if not passes_title_filter(job_title):
+                        continue
                     if await is_vacancy_seen(href):
                         continue
 
                     jobs.append(_build_vacancy(
-                        title=text.split("@")[0].strip(),
+                        title=job_title,
                         company=company["name"],
                         url=href,
                         source=f"Ashby:{company['name']}",
@@ -485,7 +478,9 @@ async def fetch_career_page_jobs():
 
 async def fetch_remote_co_jobs(query):
     """Скрапер Remote.co с быстрым HTTP-запросом и переходом на Playwright в случае ошибки/блокировки."""
-    url = "https://remote.co/remote-jobs/developer"
+    slug = urllib.parse.quote(query.lower().replace(" ", "-")[:40]) if query else "developer"
+    url = f"https://remote.co/remote-jobs/{slug}" if slug != "developer" else "https://remote.co/remote-jobs/developer"
+    query_terms = [t.lower() for t in query.replace(",", " ").split() if len(t) > 2] if query else []
     html = None
     try:
         # Сначала пробуем быстрый HTTP-запрос
@@ -514,9 +509,14 @@ async def fetch_remote_co_jobs(query):
             if not title_tag: continue
             
             title = title_tag.get_text().strip()
+            title_lower = title.lower()
+            if query_terms and not any(t in title_lower for t in query_terms):
+                dev_terms = ("frontend", "front-end", "developer", "engineer", "vue", "react", "typescript")
+                if not any(t in title_lower for t in dev_terms):
+                    continue
             v_url = normalize_job_url(urllib.parse.urljoin("https://remote.co", card['href']))
             if await is_vacancy_seen(v_url): continue
-            
+
             jobs.append(_build_vacancy(
                 title=title,
                 company="Remote.co",
@@ -591,47 +591,61 @@ async def fetch_hn_jobs():
 async def fetch_all_jobs(progress_callback=None):
     """Агрегатор всех источников с использованием ИИ-расширения запросов (Параллельно)."""
     db_query = await get_trade_state("job_search_query")
-    raw_query = db_query if db_query else "Vue TypeScript Frontend"
+    raw_query = (db_query.strip().strip('"').strip("'") if db_query else "Vue 3 Nuxt TypeScript Frontend Remote")
     
     # 1. Расширяем запрос через ИИ
     if progress_callback:
-        await progress_callback(0, 100, "Expanding search queries via Gemini...")
+        await progress_callback(0, 100, "Expanding search queries...")
     
-    query_variations = await expand_search_query(raw_query)
+    query_variations = await expand_search_query_safe(raw_query)
     
     # Функции-фабрики для создания задач
     def get_sources(queries):
-        # Статические источники: Playwright/API-борды и RSS из константы STATIC_RSS_SOURCES
-        sources = [
-            (lambda: fetch_career_page_jobs(), 'Career Pages'),
-            (lambda: fetch_lever_jobs(),        'Lever'),
-            (lambda: fetch_greenhouse_jobs(),   'Greenhouse'),
-            (lambda: fetch_ashby_jobs(),        'Ashby'),
-            (lambda: fetch_hn_jobs(),           'Hacker News'),
-            (lambda: fetch_remote_co_jobs(queries[0]), 'Remote.co'),
-        ] + [
-            (lambda u=url, n=name, k=kw: fetch_rss_jobs(u, n, k), name)
-            for url, name, kw in STATIC_RSS_SOURCES
-        ]
+        sources = []
+        primary = queries[0].replace(",", " ").strip() if queries else raw_query
 
-        # Динамические мульти-запросы для ключевых платформ
-        for q in queries[:5]:  # Топ-5 вариаций
+        # Приоритет: RU/CIS и проверенные remote-источники
+        for url, name, kw in STATIC_RSS_SOURCES:
+            if name == "Djinni":
+                sources.append((lambda u=url, n=name, k=kw: fetch_rss_jobs(u, n, k), name))
+                break
+        sources.append((lambda q=primary: fetch_remotive_jobs(q), f'Remotive:{primary}'))
+        sources.append((lambda q=primary: fetch_rss_jobs(
+            f'https://career.habr.com/vacancies/rss?q={urllib.parse.quote(primary)}&remote=true',
+            f'Habr:{primary}'
+        ), f'Habr:{primary}'))
+        sources.append((lambda q=primary: fetch_hh_jobs(q), f'HH:{primary}'))
+
+        for q in queries[1:5]:
             q_clean = q.replace(",", " ").strip()
-            hh_q = q_clean.split(" ")[0]
-            sources.append((lambda q=hh_q: fetch_hh_jobs(q),       f'HH:{q}'))
             sources.append((lambda q=q_clean: fetch_remotive_jobs(q), f'Remotive:{q}'))
             sources.append((lambda q=q_clean: fetch_rss_jobs(
                 f'https://career.habr.com/vacancies/rss?q={urllib.parse.quote(q_clean)}&remote=true',
                 f'Habr:{q}'
             ), f'Habr:{q}'))
+            sources.append((lambda q=q_clean: fetch_hh_jobs(q), f'HH:{q}'))
 
+        sources += [
+            (lambda u=url, n=name, k=kw: fetch_rss_jobs(u, n, k), name)
+            for url, name, kw in STATIC_RSS_SOURCES if name != "Djinni"
+        ]
+        sources += [
+            (lambda: fetch_lever_jobs(), 'Lever'),
+            (lambda: fetch_greenhouse_jobs(), 'Greenhouse'),
+            (lambda: fetch_ashby_jobs(), 'Ashby'),
+            (lambda: fetch_hn_jobs(), 'Hacker News'),
+            (lambda q=primary: fetch_remote_co_jobs(q), 'Remote.co'),
+            (lambda: fetch_career_page_jobs(), 'Career Pages'),
+        ]
         return sources
 
     sources = get_sources(query_variations)
     total = len(sources)
     all_results = []
-    
-    sem = asyncio.Semaphore(6)
+
+    source_timeouts = {"Career Pages": 75}
+
+    sem = asyncio.Semaphore(3)
 
     async def wrapped_task(task_factory, name, index):
         async with sem:
@@ -639,7 +653,8 @@ async def fetch_all_jobs(progress_callback=None):
                 await progress_callback(index, total, name)
             try:
                 coro = task_factory()
-                return await asyncio.wait_for(coro, timeout=35)
+                timeout = source_timeouts.get(name, 40)
+                return await asyncio.wait_for(coro, timeout=timeout)
             except asyncio.TimeoutError:
                 logger.error(f'Timeout fetching from {name}')
                 return []
@@ -681,18 +696,9 @@ async def fetch_all_jobs(progress_callback=None):
             if identifier in seen_identifiers:
                 continue
 
-            # 3. Basic Title Filtering
-            title_lower = title.lower()
-            exclude_keywords = [
-                "backend", "devops", "qa engineer", "tester", "android", "ios", "swift", "kotlin",
-                "java", "python", "php", "c++", "c#", ".net", "ruby", "rust", "go", "golang",
-                "embedded", "firmware", "hardware", "data scientist", "data engineer", "ml engineer",
-                "product manager", "project manager", "designer", "scrum master"
-            ]
-            
-            if any(kw in title_lower for kw in exclude_keywords):
-                if "frontend" not in title_lower and "front-end" not in title_lower:
-                    continue
+            # 3. Title role filtering
+            if not passes_title_filter(title):
+                continue
 
             # Passed all filters
             job["url"] = normalized_url
@@ -715,6 +721,6 @@ async def fetch_all_jobs(progress_callback=None):
                         job["description"] = full_desc
                     await asyncio.sleep(0.2)
 
-        await asyncio.gather(*[enrich_job(j) for j in unique_jobs[:35]])
+        await asyncio.gather(*[enrich_job(j) for j in unique_jobs[:50]])
 
     return unique_jobs

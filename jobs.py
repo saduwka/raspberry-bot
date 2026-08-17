@@ -466,7 +466,7 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
         await set_trade_state("last_risk_exit_reason", risk_exit_reason, pair)
         
         logger.info(
-            f"[{pair}] Final Decision: {signal} | Price: {last_price} | Gemini: {gemini_decision['action']} ({gemini_decision['confidence']})"
+            f"[{pair}] Final Decision: {signal} | Price: {last_price} | local/qwen3.5-coder: {gemini_decision['action']} ({gemini_decision['confidence']})"
         )
         
         if signal == "BUY":
@@ -525,7 +525,7 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
                 f"Цена {'входа' if signal == 'BUY' else 'выхода'}: <code>{exec_price}</code>\n"
                 f"Объем: <code>{exec_qty}</code>\n"
                 f"Сумма: <code>{total_amount:.2f} USDT</code>\n"
-                f"Gemini: <code>{gemini_decision['action']}</code> ({gemini_decision['confidence']:.2f})\n"
+                f"local/qwen3.5-coder: <code>{gemini_decision['action']}</code> ({gemini_decision['confidence']:.2f})\n"
                 f"Причина: <code>{html.escape(gemini_decision['reason'])}</code>{pnl_text}\n"
                 f"Режим: {'🧪 PAPER' if trade_engine.PAPER_MODE else '💰 LIVE'}"
             )
@@ -583,7 +583,7 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE):
         gc.collect()
 
 async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE = None):
-    """Собирает сделки за 24 часа и отправляет аналитику от Gemini."""
+    """Собирает сделки за 24 часа и отправляет аналитику от локальной модели."""
     # Если это вызов из JobQueue, то первый аргумент - это context, и у него нет атрибута 'update_id'
     if not hasattr(update, 'update_id'):
         context = update

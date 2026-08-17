@@ -1,18 +1,63 @@
 import asyncio
 import html
 import logging
+from functools import wraps
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from database import (
-    save_vacancy, get_top_vacancies, dismiss_vacancy, is_vacancy_seen,
+    save_vacancy, get_top_vacancies, get_dismissed_vacancies, get_job_stats,
+    dismiss_vacancy, is_vacancy_seen,
     get_trade_state, set_trade_state, get_recent_job_history,
-    load_seen_vacancies_cache, clear_seen_vacancies_cache, save_vacancies_batch
+    load_seen_vacancies_cache, clear_seen_vacancies_cache, save_vacancies_batch,
+    save_job_raw_batch, get_pending_raw_jobs, mark_raw_jobs_scored,
 )
 from job_fetcher import fetch_all_jobs
-from ai.jobs import process_job_scoring, suggest_new_companies
-from config import ADMIN_ID, JOB_MIN_SCORE, JOB_REQUIRE_WORLDWIDE
+from ai.jobs import process_jobs_scoring_batch, suggest_new_companies
+from config import (
+    ADMIN_ID, JOB_MIN_SCORE, JOB_REQUIRE_WORLDWIDE,
+    JOB_AI_SCORE_LIMIT, JOB_AI_BATCH_SIZE, JOB_RAW_QUEUE_LIMIT,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def admin_only(func):
+    @wraps(func)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id != ADMIN_ID:
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapped
+
+
+async def _clear_job_list_messages(context, chat_id):
+    for mid in context.user_data.pop("job_message_ids", []):
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+
+
+def _format_vacancy_card(v, show_actions=True):
+    vid, title, company, url, salary, score, verdict = v[0], v[1], v[2], v[3], v[4], v[6], v[7]
+    match_emoji = "🟢" if score >= 8 else "🟡" if score >= 6 else "🔴"
+    text = (
+        f"{match_emoji} <b>{html.escape(title)}</b>\n"
+        f"🏢 {html.escape(company)}\n"
+        f"💰 {html.escape(salary)}\n"
+        f"📊 Оценка: <b>{score}/10</b>\n\n"
+        f"📝 <i>{html.escape(verdict[:500])}</i>\n\n"
+        f"🔗 {html.escape(url)}"
+    )
+    keyboard = None
+    if show_actions:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔥 ГЕНЕРИРОВАТЬ ПИСЬМО", callback_data=f"cover_job_{vid}")],
+            [InlineKeyboardButton("✅ Я откликнулся", callback_data=f"apply_job_{vid}"),
+             InlineKeyboardButton("❌ Пропустить", callback_data=f"dismiss_job_{vid}")],
+        ])
+    return text, keyboard
 
 def _format_job_verdict(result, source):
     loc_prefix = "🌍 Worldwide" if result["is_worldwide"] else "📍 Restricted"
@@ -31,6 +76,82 @@ def _job_passes_filters(result):
     if not result.get("core_stack_match", False):
         return False
     return True
+
+
+def get_vacancy_priority(v):
+    title = v.get("title", "").lower()
+    desc = v.get("description", "").lower()
+    if "vue" in title or "nuxt" in title or "composition api" in title:
+        return 0
+    if "vue 3" in desc or "nuxt" in desc or "composition api" in desc:
+        return 1
+    if "react" in title or "next" in title or "typescript" in title:
+        return 2
+    if "vue" in desc:
+        return 3
+    if "react" in desc or "typescript" in desc:
+        return 4
+    if "frontend" in title or "front-end" in title or "javascript" in title:
+        return 5
+    return 6
+
+
+def _normalize_search_query(query: str) -> str:
+    return query.strip().strip('"').strip("'") if query else query
+
+
+async def _score_pending_queue(history, status_text="", raw_added=0, fetch_count=0):
+    pending_raw = await get_pending_raw_jobs(limit=JOB_AI_SCORE_LIMIT)
+    pending_raw = sorted(pending_raw, key=get_vacancy_priority)
+    target_vacancies = pending_raw[:JOB_AI_SCORE_LIMIT]
+
+    passed_vacancies = []
+    scoring_modes = {}
+    scored_urls = []
+
+    for i in range(0, len(target_vacancies), JOB_AI_BATCH_SIZE):
+        batch = target_vacancies[i:i + JOB_AI_BATCH_SIZE]
+        try:
+            results = await process_jobs_scoring_batch(batch, history=history)
+            for v, result in zip(batch, results):
+                scored_urls.append(v["url"])
+                mode = result.get("scoring_mode", "unknown")
+                scoring_modes[mode] = scoring_modes.get(mode, 0) + 1
+                if not _job_passes_filters(result):
+                    continue
+                mode_tag = {
+                    "groq": "Groq", "gemini": "Gemini",
+                    "local": "local/qwen3.5-coder",
+                    "rules": "эвристика", "cache": "кеш",
+                }.get(mode, mode)
+                full_verdict = _format_job_verdict(result, f"{v.get('source', 'Unknown')} | {mode_tag}")
+                passed_vacancies.append((
+                    v["title"], v["company"], v["url"], v["salary_raw"],
+                    1 if v.get("is_remote", True) else 0,
+                    result["score"], full_verdict,
+                    1 if result["has_salary"] else 0,
+                    v.get("description", ""),
+                ))
+        except Exception as e:
+            logger.error(f"Error scoring batch at offset {i}: {e}")
+
+    await mark_raw_jobs_scored(scored_urls)
+
+    new_count = 0
+    if passed_vacancies and await save_vacancies_batch(passed_vacancies):
+        new_count = len(passed_vacancies)
+
+    stats = await get_job_stats()
+    mode_summary = ", ".join(f"{k}: {v}" for k, v in sorted(scoring_modes.items())) or "нет"
+    return new_count, (
+        f"💼 <b>Поиск завершен!</b>\n\n"
+        f"✅ Отобрано новых подходящих: <b>{new_count}</b>\n"
+        f"Проверено: {len(target_vacancies)} | В очереди: <b>{stats['raw_pending']}</b>\n"
+        f"Найдено в fetch: {fetch_count} | +в очередь: {raw_added}\n"
+        f"Скоринг: <code>{mode_summary}</code>\n\n"
+        f"Используйте /jobs или кнопку Список."
+    )
+
 
 async def job_fetch_job(context: ContextTypes.DEFAULT_TYPE, message=None):
     """Периодическая задача по поиску вакансий с поддержкой параллельного скоринга."""
@@ -53,105 +174,37 @@ async def job_fetch_job(context: ContextTypes.DEFAULT_TYPE, message=None):
                 except:
                     pass
 
-        vacancies = await fetch_all_jobs(progress_callback=update_progress if message else None)
-        
-        if not vacancies:
-            final_msg = "💼 <b>Поиск завершен!</b>\n\nНовых вакансий не найдено."
-            if message: await message.edit_text(final_msg, parse_mode="HTML")
-            else: await context.bot.send_message(chat_id=ADMIN_ID, text=final_msg, parse_mode="HTML")
+        try:
+            vacancies = await fetch_all_jobs(progress_callback=update_progress if message else None)
+        except Exception as e:
+            logger.exception("Job fetch failed")
+            err_msg = f"❌ <b>Ошибка поиска:</b> <code>{html.escape(str(e)[:200])}</code>"
+            if message:
+                await message.edit_text(err_msg, parse_mode="HTML")
+            else:
+                await context.bot.send_message(chat_id=ADMIN_ID, text=err_msg, parse_mode="HTML")
             return
 
-        # 1. Отсеиваем уже просмотренные вакансии через быстрый кеш в ОЗУ
         unseen_vacancies = []
-        for v in vacancies:
-            if not await is_vacancy_seen(v["url"]):
-                unseen_vacancies.append(v)
+        if vacancies:
+            for v in vacancies:
+                if not await is_vacancy_seen(v["url"]):
+                    unseen_vacancies.append(v)
 
-        if not unseen_vacancies:
-            final_msg = "💼 <b>Поиск завершен!</b>\n\nНовых уникальных вакансий не найдено."
-            if message: await message.edit_text(final_msg, parse_mode="HTML")
-            else: await context.bot.send_message(chat_id=ADMIN_ID, text=final_msg, parse_mode="HTML")
-            return
-
-        # 2. Приоритизируем вакансии по стеку
-        def get_vacancy_priority(v):
-            title = v.get("title", "").lower()
-            desc = v.get("description", "").lower()
-            
-            # Приоритет 1: Vue 3 / Composition API
-            if "vue" in title or "composition api" in title:
-                return 0
-            # Приоритет 2: React / Next / TS
-            if "react" in title or "next" in title or "typescript" in title or "ts" in title:
-                return 1
-            # Приоритет 3: Vue в описании
-            if "vue" in desc:
-                return 2
-            # Приоритет 4: React / TS в описании
-            if "react" in desc or "typescript" in desc or "ts" in desc:
-                return 3
-            # Приоритет 5: Обычный Frontend
-            if "frontend" in title or "front-end" in title or "javascript" in title or "js" in title:
-                return 4
-            return 5
-
-        # Сортируем и берем максимум 30 самых подходящих
-        sorted_vacancies = sorted(unseen_vacancies, key=get_vacancy_priority)
-        target_vacancies = sorted_vacancies[:30]
-
-        # Загружаем историю для персонализации
+        raw_added = await save_job_raw_batch(unseen_vacancies[:JOB_RAW_QUEUE_LIMIT])
         history = await get_recent_job_history(3, 3)
-        
+
         if message:
             await message.edit_text(
-                f"{status_text}🧠 <b>Оцениваю через ИИ {len(target_vacancies)} наиболее подходящих вакансий...</b>\n"
-                f"(Всего отфильтровано новых: {len(unseen_vacancies)})",
-                parse_mode="HTML"
+                f"{status_text}🧠 <b>Оцениваю очередь вакансий...</b>\n"
+                f"Новых в fetch: {len(unseen_vacancies)} | +в очередь: {raw_added}",
+                parse_mode="HTML",
             )
 
-        # 3. Параллельный скоринг через ИИ
-        sem = asyncio.Semaphore(4) # Ограничиваем количество одновременных запросов к Gemini
-        passed_vacancies = []
-        passed_lock = asyncio.Lock()
-
-        async def score_vacancy(v):
-            async with sem:
-                try:
-                    result = await process_job_scoring(v["title"], v["company"], v.get("description", ""), history=history)
-                    
-                    if _job_passes_filters(result):
-                        full_verdict = _format_job_verdict(result, v.get("source", "Unknown"))
-                        # Подготавливаем кортеж для пакетной записи
-                        item = (
-                            v["title"],
-                            v["company"],
-                            v["url"],
-                            v["salary_raw"],
-                            1 if v.get("is_remote", True) else 0,
-                            result["score"],
-                            full_verdict,
-                            1 if result["has_salary"] else 0,
-                            v.get("description", "")
-                        )
-                        async with passed_lock:
-                            passed_vacancies.append(item)
-                except Exception as e:
-                    logger.error(f"Error scoring vacancy {v['url']}: {e}")
-
-        # Запускаем скоринг для всех отобранных вакансий
-        await asyncio.gather(*[score_vacancy(v) for v in target_vacancies])
-        
-        # 4. Пакетно сохраняем успешно прошедшие скоринг вакансии в БД
-        new_vacancies_count = 0
-        if passed_vacancies:
-            if await save_vacancies_batch(passed_vacancies):
-                new_vacancies_count = len(passed_vacancies)
-                
-        final_msg = (
-            f"💼 <b>Поиск завершен!</b>\n\n"
-            f"✅ Отобрано новых подходящих: <b>{new_vacancies_count}</b>\n"
-            f"Проверено ИИ: {len(target_vacancies)} (всего найдено: {len(vacancies)})\n\n"
-            f"Используйте команду /jobs или кнопку Список."
+        _, final_msg = await _score_pending_queue(
+            history,
+            raw_added=raw_added,
+            fetch_count=len(unseen_vacancies),
         )
         
         if message:
@@ -165,82 +218,151 @@ async def job_fetch_job(context: ContextTypes.DEFAULT_TYPE, message=None):
         import gc
         gc.collect()
 
+@admin_only
 async def jobs_refresh_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ручной запуск поиска вакансий с прогресс-баром."""
     target_msg = update.effective_message
     status_msg = await target_msg.reply_text("🔎 Подготовка к поиску...")
     await job_fetch_job(context, message=status_msg)
 
+@admin_only
 async def list_jobs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выводит топ подходящих вакансий с пагинацией."""
-    target_message = update.effective_message
     query = update.callback_query
-    
-    # Определяем текущий оффсет
+    chat_id = update.effective_chat.id
     offset = 0
-    if query and query.data.startswith("jobs_list_"):
-        offset = int(query.data.split("_")[-1])
-        await query.answer()
+    if query and (query.data == "jobs_list" or query.data.startswith("jobs_list_")):
+        if query.data.startswith("jobs_list_"):
+            offset = int(query.data.split("_")[-1])
+        await _clear_job_list_messages(context, chat_id)
 
     limit = 5
-    vacancies = await get_top_vacancies(limit=limit + 1, offset=offset) # Берем на 1 больше для проверки "далее"
-    
+    vacancies = await get_top_vacancies(limit=limit + 1, offset=offset)
+
     if not vacancies and offset == 0:
-        await target_message.reply_text("💤 Пока новых подходящих вакансий не найдено.")
+        text = "💤 Пока новых подходящих вакансий не найдено."
+        if query:
+            try:
+                await query.message.edit_text(text)
+            except Exception:
+                await context.bot.send_message(chat_id, text)
+        else:
+            await update.effective_message.reply_text(text)
         return
-    elif not vacancies:
-        await query.answer("Это все доступные вакансии.")
+    if not vacancies:
+        if query:
+            await query.answer("Это все доступные вакансии.", show_alert=True)
         return
 
     has_more = len(vacancies) > limit
     display_vacancies = vacancies[:limit]
+    message_ids = []
 
     for v in display_vacancies:
-        vid = v[0]
-        title = v[1]
-        company = v[2]
-        url = v[3]
-        salary = v[4]
-        score = v[6]
-        verdict = v[7]
-        
-        match_emoji = "🟢" if score >= 8 else "🟡" if score >= 6 else "🔴"
-        
-        text = (
-            f"{match_emoji} <b>{html.escape(title)}</b>\n"
-            f"🏢 {html.escape(company)}\n"
-            f"💰 {html.escape(salary)}\n"
-            f"📊 Оценка: <b>{score}/10</b>\n\n"
-            f"📝 <i>{html.escape(verdict)}</i>\n\n"
-            f"🔗 {html.escape(url)}"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("🔥 ГЕНЕРИРОВАТЬ ПИСЬМО", callback_data=f"cover_job_{vid}")],
-            [InlineKeyboardButton("✅ Я откликнулся", callback_data=f"apply_job_{vid}"),
-             InlineKeyboardButton("❌ Пропустить", callback_data=f"dismiss_job_{vid}")]
-        ]
-        
+        text, keyboard = _format_vacancy_card(v)
         try:
-            if query and v == display_vacancies[0] and offset > 0:
-                # Если это не первая страница, просто шлем новые сообщения
-                await context.bot.send_message(update.effective_chat.id, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-            else:
-                await target_message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+            msg = await context.bot.send_message(
+                chat_id, text, parse_mode="HTML", reply_markup=keyboard
+            )
+            message_ids.append(msg.message_id)
         except Exception as e:
             logger.error(f"Error sending job message: {e}")
 
-    # Кнопки пагинации
     nav_buttons = []
     if offset > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"jobs_list_{max(0, offset-limit)}"))
+        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"jobs_list_{max(0, offset - limit)}"))
     if has_more:
-        nav_buttons.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"jobs_list_{offset+limit}"))
-    
-    if nav_buttons:
-        await target_message.reply_text(f"Навигация (показано {offset+1}-{offset+len(display_vacancies)}):", 
-                                     reply_markup=InlineKeyboardMarkup([nav_buttons]))
+        nav_buttons.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"jobs_list_{offset + limit}"))
 
+    if nav_buttons:
+        nav = await context.bot.send_message(
+            chat_id,
+            f"Навигация (показано {offset + 1}-{offset + len(display_vacancies)}):",
+            reply_markup=InlineKeyboardMarkup([nav_buttons]),
+        )
+        message_ids.append(nav.message_id)
+
+    context.user_data["job_message_ids"] = message_ids
+
+
+@admin_only
+async def list_archive_jobs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    offset = 0
+    if query and query.data.startswith("jobs_archive"):
+        if query.data.startswith("jobs_archive_"):
+            offset = int(query.data.split("_")[-1])
+        await _clear_job_list_messages(context, chat_id)
+
+    limit = 5
+    vacancies = await get_dismissed_vacancies(limit=limit + 1, offset=offset)
+
+    if not vacancies and offset == 0:
+        text = "📁 Архив пуст."
+        if query:
+            try:
+                await query.message.edit_text(text)
+            except Exception:
+                await context.bot.send_message(chat_id, text)
+        else:
+            await update.effective_message.reply_text(text)
+        return
+    if not vacancies:
+        if query:
+            await query.answer("Это весь архив.", show_alert=True)
+        return
+
+    has_more = len(vacancies) > limit
+    display_vacancies = vacancies[:limit]
+    message_ids = []
+
+    for v in display_vacancies:
+        text, _ = _format_vacancy_card(v, show_actions=False)
+        msg = await context.bot.send_message(chat_id, text, parse_mode="HTML")
+        message_ids.append(msg.message_id)
+
+    nav_buttons = []
+    if offset > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"jobs_archive_{max(0, offset - limit)}"))
+    if has_more:
+        nav_buttons.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"jobs_archive_{offset + limit}"))
+
+    if nav_buttons:
+        nav = await context.bot.send_message(
+            chat_id,
+            f"📁 Архив ({offset + 1}-{offset + len(display_vacancies)}):",
+            reply_markup=InlineKeyboardMarkup([nav_buttons]),
+        )
+        message_ids.append(nav.message_id)
+
+    context.user_data["job_message_ids"] = message_ids
+
+
+@admin_only
+async def jobs_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats = await get_job_stats()
+    query = await get_trade_state("job_search_query")
+    ai_status = ["local/qwen3.5-coder"]
+
+    last = stats["last_added"] or "никогда"
+    text = (
+        "📊 <b>Статистика вакансий</b>\n\n"
+        f"Всего в базе: <b>{stats['total']}</b>\n"
+        f"Активных: <b>{stats['active']}</b>\n"
+        f"В архиве: <b>{stats['dismissed']}</b>\n"
+        f"Откликов: <b>{stats['applied']}</b>\n"
+        f"В очереди (raw): <b>{stats.get('raw_pending', 0)}</b>\n"
+        f"Кеш скоринга: <b>{stats.get('score_cache_size', 0)}</b>\n"
+        f"Последнее добавление: <code>{html.escape(str(last))}</code>\n"
+        f"Запрос: <code>{html.escape(query or stats['search_query'] or 'Vue TypeScript Frontend')}</code>\n"
+        f"ИИ: <code>{', '.join(ai_status)}</code>\n"
+        f"Мин. оценка: <b>{JOB_MIN_SCORE}</b>"
+    )
+    await update.effective_message.reply_text(text, parse_mode="HTML")
+
+
+@admin_only
 async def cover_letter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Генерирует и отправляет полный пакет для отклика."""
     query = update.callback_query
@@ -273,6 +395,7 @@ async def cover_letter_callback(update: Update, context: ContextTypes.DEFAULT_TY
     
     await query.message.reply_text(packet, parse_mode="HTML")
 
+@admin_only
 async def list_applied_jobs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список вакансий, на которые вы уже откликнулись."""
     target_message = update.effective_message
@@ -295,6 +418,7 @@ async def list_applied_jobs_handler(update: Update, context: ContextTypes.DEFAUL
     
     await target_message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
+@admin_only
 async def dismiss_job_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -310,6 +434,7 @@ async def dismiss_job_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await dismiss_vacancy(vid)
         await query.message.edit_text("📁 Вакансия перенесена в архив.")
 
+@admin_only
 async def job_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Позволяет просматривать и менять поисковый запрос для вакансий."""
     target_msg = update.effective_message
@@ -323,15 +448,16 @@ async def job_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    new_query = " ".join(context.args)
+    new_query = _normalize_search_query(" ".join(context.args))
     await set_trade_state("job_search_query", new_query)
     await target_msg.reply_text(
         f"✅ <b>Запрос изменен!</b>\nТеперь бот ищет: <code>{html.escape(new_query)}</code>",
         parse_mode="HTML"
     )
 
+@admin_only
 async def job_discovery_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Поиск и добавление новых компаний через Gemini."""
+    """Поиск и добавление новых компаний через локальную модель."""
     target_msg = update.effective_message
     if not context.args:
         await target_msg.reply_text(
@@ -344,7 +470,7 @@ async def job_discovery_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     prompt = " ".join(context.args)
-    status_msg = await target_msg.reply_text("🤖 Gemini исследует рынок и ищет прямые ссылки на вакансии...")
+    status_msg = await target_msg.reply_text("🤖 local/qwen3.5-coder ищет компании и прямые ссылки на вакансии...")
     
     added_count, companies = await suggest_new_companies(prompt)
     

@@ -1,4 +1,5 @@
 import os
+import sys
 import subprocess
 import logging
 import asyncio
@@ -28,7 +29,7 @@ from database import (
 )
 from ai.base import clean_html
 from ai.trading import generate_daily_analytics
-from handlers.system_handlers import oled_menu_handler, oled_callback_handler, show_settings, settings_callback
+from handlers.system_handlers import oled_menu_handler, oled_callback_handler, jira_stats_handler, show_settings, settings_callback
 from jobs import (
     check_health_alert,
     fetch_news, process_and_filter_news, send_for_approval,
@@ -40,7 +41,8 @@ import job_handlers
 from job_handlers import (
     job_fetch_job, list_jobs_handler, dismiss_job_callback,
     job_query_handler, jobs_refresh_handler, list_applied_jobs_handler,
-    cover_letter_callback, job_discovery_handler
+    cover_letter_callback, job_discovery_handler, jobs_stats_handler,
+    list_archive_jobs_handler,
 )
 from states import (
     ADD_RSS, 
@@ -130,6 +132,12 @@ async def list_kw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 
+@admin_only
+async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from handlers.system_handlers import ai_status_handler
+    await ai_status_handler(update, context)
+
+
 # --- UI Helpers ---
 def reply_keyboard():
     return ReplyKeyboardMarkup([
@@ -140,10 +148,12 @@ def reply_keyboard():
 def system_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Статус RPi", callback_data="cmd_status"),
-         InlineKeyboardButton("🎵 Музыка", callback_data="music_menu")],
-        [InlineKeyboardButton("📺 OLED Дисплей", callback_data="oled_menu")],
-        [InlineKeyboardButton("⚙️ Настройки", callback_data="set_back"),
-         InlineKeyboardButton("🔄 Перезапуск", callback_data="set_restart")],
+         InlineKeyboardButton("🤖 Local AI", callback_data="cmd_ai")],
+        [InlineKeyboardButton("🎵 Музыка", callback_data="music_menu"),
+         InlineKeyboardButton("📺 OLED Дисплей", callback_data="oled_menu")],
+        [InlineKeyboardButton("📋 Jira", callback_data="jira_stats"),
+         InlineKeyboardButton("⚙️ Настройки", callback_data="set_back")],
+        [InlineKeyboardButton("🔄 Перезапуск", callback_data="set_restart")],
     ])
 
 # OLED handlers moved to handlers.system_handlers
@@ -203,6 +213,8 @@ def jobs_keyboard():
         [InlineKeyboardButton("📋 Список", callback_data="jobs_list"),
          InlineKeyboardButton("🔄 Обновить", callback_data="jobs_refresh")],
         [InlineKeyboardButton("📝 Мои отклики", callback_data="jobs_applied"),
+         InlineKeyboardButton("📁 Архив", callback_data="jobs_archive_0")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="jobs_stats"),
          InlineKeyboardButton("🔎 Текущий запрос", callback_data="jobs_query_show")],
         [InlineKeyboardButton("✏️ Изменить запрос", callback_data="jobs_query_edit"),
          InlineKeyboardButton("🕵️ Найти компании", callback_data="jobs_discovery_edit")],
@@ -275,6 +287,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await jobs_refresh_handler(update, context)
     elif data == "jobs_applied":
         await list_applied_jobs_handler(update, context)
+    elif data == "jobs_stats":
+        await jobs_stats_handler(update, context)
+    elif data == "jobs_archive_0" or data.startswith("jobs_archive_"):
+        await list_archive_jobs_handler(update, context)
     elif data == "jobs_query_show":
         await job_query_handler(update, context)
     elif data == "jobs_query_edit":
@@ -308,6 +324,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "cmd_status":
         await query.message.edit_text(get_stats(), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_system")]]))
+    elif data == "cmd_ai":
+        from handlers.system_handlers import ai_status_handler
+        await ai_status_handler(update, context)
     elif data == "trade_menu":
         await trade_handlers.show_trade_menu(update, context)
     elif data.startswith("trade_select_"):
@@ -358,6 +377,7 @@ async def process_job_query_step(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Изменение отменено.", reply_markup=reply_keyboard())
         return ConversationHandler.END
 
+    new_query = new_query.strip().strip('"').strip("'")
     await set_trade_state("job_search_query", new_query)
     await update.message.reply_text(
         f"✅ <b>Запрос изменен!</b>\nТеперь бот ищет: <code>{html.escape(new_query)}</code>",
@@ -407,6 +427,17 @@ async def cancel_interactive(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 def main():
     print("--- BOT STARTING VERSION 3.0 ---")
+    
+    # PID Lock
+    import fcntl
+    pid_file = "/tmp/gamebot.pid"
+    fp = open(pid_file, 'w')
+    try:
+        fcntl.flock(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        print("Bot is already running. Exiting.")
+        sys.exit(1)
+
     asyncio.run(init_db())
     
     app = Application.builder().token(BOT_TOKEN).build()
@@ -430,11 +461,13 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("restart", restart_bot))
     app.add_handler(CommandHandler("status", lambda u, c: asyncio.create_task(u.message.reply_text(get_stats(), parse_mode="HTML"))))
+    app.add_handler(CommandHandler("ai", ai_command))
     app.add_handler(CommandHandler("test_analytics", send_daily_trade_analytics))
     
     # OLED Handlers
     app.add_handler(CallbackQueryHandler(oled_menu_handler, pattern="^oled_menu$"))
-    app.add_handler(CallbackQueryHandler(oled_callback_handler, pattern="^oled_(pwr|scr|restart)"))
+    app.add_handler(CallbackQueryHandler(oled_callback_handler, pattern="^oled_(pwr|scr|restart|mode_)"))
+    app.add_handler(CallbackQueryHandler(jira_stats_handler, pattern="^jira_stats$"))
     
     # Команды управления источниками (остаются как запасной вариант)
     app.add_handler(CommandHandler("addrss", add_rss))
@@ -445,6 +478,7 @@ def main():
     app.add_handler(CommandHandler("listkw", list_kw))
     app.add_handler(CommandHandler("jobs", list_jobs_handler))
     app.add_handler(CommandHandler("jobs_refresh", jobs_refresh_handler))
+    app.add_handler(CommandHandler("jobs_stats", jobs_stats_handler))
     app.add_handler(CommandHandler("job_query", job_query_handler))
     app.add_handler(CommandHandler("discovery", job_discovery_handler))
 

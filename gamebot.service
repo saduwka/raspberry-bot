@@ -1,0 +1,18 @@
+[Unit]
+Description=GameBot v2 - Multi-Assistant Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/bot
+ExecStart=/usr/bin/python3 /root/bot/bot.py
+Restart=always
+RestartSec=10
+
+# Clean restart configuration
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

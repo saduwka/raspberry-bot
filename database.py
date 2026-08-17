@@ -13,6 +13,12 @@ db_lock = asyncio.Lock()
 # Кеш в памяти для просмотренных вакансий
 _seen_vacancies_cache = None
 
+
+def normalize_job_url(url):
+    if not url:
+        return None
+    return url.split("#")[0].rstrip("/")
+
 async def load_seen_vacancies_cache():
     global _seen_vacancies_cache
     async with db_lock:
@@ -119,6 +125,36 @@ async def init_db():
                     follow_up_sent INTEGER DEFAULT 0,
                     description TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS job_raw (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT,
+                    company TEXT,
+                    url TEXT UNIQUE,
+                    salary_raw TEXT,
+                    is_remote INTEGER DEFAULT 1,
+                    source TEXT,
+                    description TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS job_score_cache (
+                    url TEXT PRIMARY KEY,
+                    score INTEGER,
+                    is_worldwide INTEGER,
+                    core_stack_match INTEGER,
+                    matching_skills TEXT,
+                    missing_skills TEXT,
+                    location_reason TEXT,
+                    verdict TEXT,
+                    has_salary INTEGER,
+                    scoring_mode TEXT,
+                    cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
@@ -366,6 +402,7 @@ async def get_trade_state(key, pair="GLOBAL"):
 
 # --- Job Hunter Functions ---
 async def save_vacancy(title, company, url, salary_raw, is_remote, score, verdict, has_salary, description=""):
+    url = normalize_job_url(url)
     async with db_lock:
         async with aiosqlite.connect(DB_PATH, timeout=30) as db:
             await db.execute("PRAGMA journal_mode=WAL")
@@ -386,6 +423,11 @@ async def save_vacancies_batch(vacancies):
     """Пакетное сохранение вакансий в рамках одной транзакции."""
     if not vacancies:
         return True
+    normalized = []
+    for v in vacancies:
+        row = list(v)
+        row[2] = normalize_job_url(row[2])
+        normalized.append(tuple(row))
     async with db_lock:
         async with aiosqlite.connect(DB_PATH, timeout=30) as db:
             await db.execute("PRAGMA journal_mode=WAL")
@@ -393,11 +435,10 @@ async def save_vacancies_batch(vacancies):
                 await db.executemany("""
                     INSERT OR IGNORE INTO job_vacancies (title, company, url, salary_raw, is_remote, score, match_verdict, has_salary, description)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, vacancies)
+                """, normalized)
                 await db.commit()
                 if _seen_vacancies_cache is not None:
-                    for v in vacancies:
-                        # URL находится на индексе 2 в кортеже вакансии
+                    for v in normalized:
                         _seen_vacancies_cache.add(v[2])
                 return True
             except Exception as e:
@@ -414,11 +455,14 @@ async def get_vacancy_details(vacancy_id):
 
 async def is_vacancy_seen(url):
     global _seen_vacancies_cache
+    normalized = normalize_job_url(url)
+    if not normalized:
+        return False
     if _seen_vacancies_cache is not None:
-        return url in _seen_vacancies_cache
+        return normalized in _seen_vacancies_cache
     async with db_lock:
         async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            async with db.execute("SELECT id FROM job_vacancies WHERE url=?", (url,)) as cursor:
+            async with db.execute("SELECT id FROM job_vacancies WHERE url=?", (normalized,)) as cursor:
                 row = await cursor.fetchone()
                 return row is not None
 
@@ -433,6 +477,182 @@ async def get_top_vacancies(limit=10, offset=0):
                 LIMIT ? OFFSET ?
             """, (limit, offset)) as cursor:
                 return await cursor.fetchall()
+
+
+async def get_dismissed_vacancies(limit=10, offset=0):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("""
+                SELECT * FROM job_vacancies
+                WHERE dismissed = 1 AND applied_at IS NULL
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+            """, (limit, offset)) as cursor:
+                return await cursor.fetchall()
+
+
+async def get_job_stats():
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("""
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN dismissed = 0 THEN 1 ELSE 0 END) AS active,
+                    SUM(CASE WHEN dismissed = 1 AND applied_at IS NULL THEN 1 ELSE 0 END) AS dismissed,
+                    SUM(CASE WHEN applied_at IS NOT NULL THEN 1 ELSE 0 END) AS applied,
+                    MAX(created_at) AS last_added
+                FROM job_vacancies
+            """) as cursor:
+                row = await cursor.fetchone()
+            async with db.execute(
+                "SELECT COUNT(*) FROM job_raw WHERE status='pending'"
+            ) as cursor:
+                raw_pending = (await cursor.fetchone())[0] or 0
+            async with db.execute("SELECT COUNT(*) FROM job_score_cache") as cursor:
+                cache_size = (await cursor.fetchone())[0] or 0
+            async with db.execute("SELECT value FROM trade_state WHERE key='job_search_query'") as cursor:
+                query_row = await cursor.fetchone()
+            return {
+                "total": row[0] or 0,
+                "active": row[1] or 0,
+                "dismissed": row[2] or 0,
+                "applied": row[3] or 0,
+                "last_added": row[4],
+                "raw_pending": raw_pending,
+                "score_cache_size": cache_size,
+                "search_query": query_row[0] if query_row else None,
+            }
+
+
+async def save_job_raw_batch(jobs):
+    if not jobs:
+        return 0
+    rows = []
+    for j in jobs:
+        url = normalize_job_url(j.get("url"))
+        if not url:
+            continue
+        rows.append((
+            j.get("title", ""),
+            j.get("company", ""),
+            url,
+            j.get("salary_raw", "See website"),
+            1 if j.get("is_remote", True) else 0,
+            j.get("source", ""),
+            j.get("description", ""),
+        ))
+    if not rows:
+        return 0
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT COUNT(*) FROM job_raw WHERE status='pending'"
+            ) as cursor:
+                before = (await cursor.fetchone())[0]
+            await db.executemany("""
+                INSERT OR IGNORE INTO job_raw
+                (title, company, url, salary_raw, is_remote, source, description, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+            """, rows)
+            await db.commit()
+            async with db.execute(
+                "SELECT COUNT(*) FROM job_raw WHERE status='pending'"
+            ) as cursor:
+                after = (await cursor.fetchone())[0]
+            return after - before
+
+
+async def get_pending_raw_jobs(limit=50):
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("""
+                SELECT title, company, url, salary_raw, is_remote, source, description
+                FROM job_raw
+                WHERE status = 'pending'
+                ORDER BY created_at ASC
+                LIMIT ?
+            """, (limit,)) as cursor:
+                rows = await cursor.fetchall()
+    return [
+        {
+            "title": r[0], "company": r[1], "url": r[2],
+            "salary_raw": r[3], "is_remote": bool(r[4]),
+            "source": r[5], "description": r[6] or "",
+        }
+        for r in rows
+    ]
+
+
+async def mark_raw_jobs_scored(urls):
+    if not urls:
+        return
+    normalized = [normalize_job_url(u) for u in urls if normalize_job_url(u)]
+    if not normalized:
+        return
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            placeholders = ",".join("?" * len(normalized))
+            await db.execute(
+                f"UPDATE job_raw SET status='scored' WHERE url IN ({placeholders})",
+                normalized,
+            )
+            await db.commit()
+
+
+async def get_cached_job_score(url):
+    normalized = normalize_job_url(url)
+    if not normalized:
+        return None
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with db.execute("""
+                SELECT score, is_worldwide, core_stack_match, matching_skills,
+                       missing_skills, location_reason, verdict, has_salary, scoring_mode
+                FROM job_score_cache WHERE url = ?
+            """, (normalized,)) as cursor:
+                row = await cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "score": row[0],
+        "is_worldwide": bool(row[1]),
+        "core_stack_match": bool(row[2]),
+        "matching_skills": json.loads(row[3] or "[]"),
+        "missing_skills": json.loads(row[4] or "[]"),
+        "location_reason": row[5] or "",
+        "verdict": row[6] or "",
+        "has_salary": bool(row[7]),
+        "scoring_mode": row[8] or "cache",
+    }
+
+
+async def save_job_score_cache(url, result):
+    normalized = normalize_job_url(url)
+    if not normalized:
+        return
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("""
+                INSERT OR REPLACE INTO job_score_cache
+                (url, score, is_worldwide, core_stack_match, matching_skills,
+                 missing_skills, location_reason, verdict, has_salary, scoring_mode, cached_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (
+                normalized,
+                int(result.get("score", 0)),
+                int(bool(result.get("is_worldwide", False))),
+                int(bool(result.get("core_stack_match", False))),
+                json.dumps(result.get("matching_skills", [])),
+                json.dumps(result.get("missing_skills", [])),
+                str(result.get("location_reason", "")),
+                str(result.get("verdict", "")),
+                int(bool(result.get("has_salary", False))),
+                result.get("scoring_mode", "unknown"),
+            ))
+            await db.commit()
 
 async def dismiss_vacancy(vacancy_id):
     async with db_lock:
@@ -555,6 +775,9 @@ async def cleanup_old_data():
             await db.execute("DELETE FROM job_vacancies WHERE dismissed = 1 AND created_at < datetime('now', '-30 days')")
             # Удаляем любые вакансии старше 90 дней
             await db.execute("DELETE FROM job_vacancies WHERE created_at < datetime('now', '-90 days')")
+            await db.execute("DELETE FROM job_raw WHERE status='scored' AND created_at < datetime('now', '-14 days')")
+            await db.execute("DELETE FROM job_raw WHERE created_at < datetime('now', '-30 days')")
+            await db.execute("DELETE FROM job_score_cache WHERE cached_at < datetime('now', '-60 days')")
             
             await db.commit()
             logger.info("Database cleanup completed and old job vacancies pruned.")

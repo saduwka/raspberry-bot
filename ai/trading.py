@@ -1,21 +1,16 @@
 import json
 import logging
 import asyncio
-from config import GEMINI_API_KEY
 from ai.base import extract_json, clean_html
+from ai import local as local_llm
 
 logger = logging.getLogger(__name__)
 
 async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, avg_sentiment, retries=1):
     """
-    Просит Gemini подтвердить или отклонить торговый сигнал.
-    Использует промпт Quantum Trader.
+    Просит локальную модель подтвердить или отклонить торговый сигнал.
+    Gemini отключен.
     """
-    import google.generativeai as genai
-    genai.configure(api_key=GEMINI_API_KEY)
-    # Здесь можно настроить модель специфично для трейдинга
-    model = genai.GenerativeModel('gemini-2.5-flash')
-
     prompt = f"""Ты — профессиональный квантовый трейдер с 10+ годами опыта на крипто-рынках.
 Твоя задача — принять ОКОНЧАТЕЛЬНОЕ решение по сделке, игнорируя шум и ложные пробои.
 
@@ -88,12 +83,18 @@ async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, av
 
     for attempt in range(retries + 1):
         try:
-            response = await model.generate_content_async(prompt)
-            if not response or not response.text:
+            text = await local_llm.chat(prompt)
+            if not text:
+                logger.error(
+                    "Trade local attempt %s: %s",
+                    attempt + 1,
+                    local_llm.last_error,
+                )
+                await asyncio.sleep(1)
                 continue
 
-            logger.info(f"Trade Gemini raw: {response.text.strip()[:300]}")
-            data = extract_json(response.text.strip())
+            logger.info("Trade %s raw: %s", local_llm.model_label(), text[:300])
+            data = extract_json(text)
             if data:
                 action = str(data.get("action", "HOLD")).upper()
                 if action not in {"BUY", "SELL", "HOLD"}:
@@ -105,7 +106,7 @@ async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, av
                     confidence = 0.0
                 confidence = max(0.0, min(confidence, 1.0))
 
-                reason = str(data.get("reason", "Gemini не дал объяснение")).strip()[:300]
+                reason = str(data.get("reason", "local LLM не дал объяснение")).strip()[:300]
                 
                 if action in {"BUY", "SELL"} and confidence < 0.3:
                     logger.warning(f"Low confidence {confidence} for {action}, forcing HOLD")
@@ -115,27 +116,25 @@ async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, av
                 return {
                     "action": action,
                     "confidence": confidence,
-                    "reason": reason or "Gemini не дал объяснение",
+                    "reason": reason or "local LLM не дал объяснение",
+                    "provider": local_llm.model_label(),
                 }
 
-            logger.info(f"Trade Gemini attempt {attempt+1}: invalid JSON, retrying...")
+            logger.info(f"Trade local attempt {attempt+1}: invalid JSON, retrying...")
             await asyncio.sleep(1)
         except Exception as e:
-            logger.error(f"Trade Gemini attempt {attempt+1}: {e}")
+            logger.error(f"Trade local attempt {attempt+1}: {e}")
             await asyncio.sleep(1)
             
     return {
         "action": "HOLD",
         "confidence": 0.0,
-        "reason": "Gemini не ответил или дал некорректные данные"
+        "reason": f"локальная модель недоступна ({local_llm.last_error or 'нет ответа'})",
+        "provider": local_llm.model_label(),
     }
 
 async def generate_daily_analytics(trades_summary):
-    """Генерирует аналитический отчет по итогам торгового дня через Gemini."""
-    import google.generativeai as genai
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-2.5-flash')
-
+    """Генерирует аналитический отчет по итогам торгового дня через локальную модель."""
     prompt = f"""Ты — главный аналитик торгового фонда. Подведи итоги торгового дня на основе списка сделок.
 Список сделок за сегодня (JSON):
 {json.dumps(trades_summary, ensure_ascii=False)}
@@ -149,9 +148,10 @@ async def generate_daily_analytics(trades_summary):
 Никаких приветствий, начни сразу с заголовка <b>📊 Итоги торгового дня</b>."""
 
     try:
-        response = await model.generate_content_async(prompt)
-        if response and response.text:
-            return clean_html(response.text.strip())
+        text = await local_llm.chat(prompt)
+        if text:
+            return clean_html(text)
+        logger.error("Daily analytics local failed: %s", local_llm.last_error)
     except Exception as e:
         logger.error(f"Daily analytics generation error: {e}")
-    return "Не удалось сгенерировать аналитику за сегодня."
+    return f"Не удалось сгенерировать аналитику: локальная модель недоступна ({local_llm.last_error or 'нет ответа'})."

@@ -55,7 +55,7 @@ async def show_trade_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=trade_keyboard(pair))
 
 async def trade_signal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, pair=None):
-    """Показывает текущий технический сигнал и решение Gemini для конкретной пары."""
+    """Показывает текущий технический сигнал и решение локальной модели для конкретной пары."""
     try:
         active_pair = pair or TRADE_PAIRS[0]
         df = await trade_engine.fetch_ohlcv(active_pair)
@@ -171,9 +171,9 @@ async def trade_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             reason_text = html.escape(str(last_gemini_reason or "нет объяснения"))
             risk_exit_text = html.escape(str(last_risk_exit_reason or "нет"))
             gemini_text = (
-                f"\n🤖 <b>Gemini в решении:</b>\n"
+                f"\n🤖 <b>local/qwen3.5-coder в решении:</b>\n"
                 f"Техсигнал: <code>{html.escape(str(last_trade_signal or 'N/A'))}</code>\n"
-                f"Gemini: <code>{html.escape(str(last_gemini_action or 'N/A'))}</code> "
+                f"local/qwen3.5-coder: <code>{html.escape(str(last_gemini_action or 'N/A'))}</code> "
                 f"(conf <code>{confidence_text}</code>)\n"
                 f"Итог: <code>{html.escape(str(last_trade_decision or 'HOLD'))}</code>\n"
                 f"Риск-выход: <code>{risk_exit_text}</code>\n"

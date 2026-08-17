@@ -59,6 +59,16 @@ A multifunctional Telegram bot combining a news aggregator, trading engine, and 
    python3 bot.py
    ```
 
+4. **Setup Systemd Service (Optional but Recommended)**:
+   To ensure the bot runs in the background and restarts automatically:
+   ```bash
+   sudo cp gamebot.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable gamebot.service
+   sudo systemctl start gamebot.service
+   ```
+   *Note: The service file includes `KillMode=control-group` and `TimeoutStopSec=10` to ensure all child processes are correctly terminated during restarts.*
+
 ---
 
 ## 🇷🇺 Русская версия
@@ -115,6 +125,16 @@ A multifunctional Telegram bot combining a news aggregator, trading engine, and 
    ```bash
    python3 bot.py
    ```
+
+4. **Настройка Systemd Service (Рекомендуется)**:
+   Для автоматического запуска и перезагрузки бота:
+   ```bash
+   sudo cp gamebot.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable gamebot.service
+   sudo systemctl start gamebot.service
+   ```
+   *Примечание: В файле сервиса настроены `KillMode=control-group` и `TimeoutStopSec=10` для корректного завершения всех дочерних процессов при перезагрузке.*
 
 ---
 *Developed for personal efficiency and automation.*

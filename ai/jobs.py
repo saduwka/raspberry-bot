@@ -1,22 +1,37 @@
 import json
 import logging
 import asyncio
-import google.generativeai as genai
-from config import GEMINI_API_KEY
-from ai.base import extract_json, clean_html
-from database import add_target_company
+from config import (
+    GEMINI_JOB_API_KEY, GROQ_API_KEY, GROQ_MODEL, GEMINI_JOB_MODEL,
+    JOB_SCORING_PROVIDER, JOB_AI_BATCH_SIZE,
+)
+from ai.base import extract_json
+from ai.local import chat as _local_chat
+from ai.job_scoring_rules import (
+    score_job_rules, expand_query_rules, cover_letter_template,
+)
+from database import add_target_company, get_cached_job_score, save_job_score_cache
 
 logger = logging.getLogger(__name__)
 
-# Инициализируем Gemini один раз на уровне модуля
-genai.configure(api_key=GEMINI_API_KEY)
+# Groq/Gemini clients kept for rollback, but are not called.
+_groq_client = None
 
-def _get_model(model_name: str) -> genai.GenerativeModel:
-    """Возвращает экземпляр Gemini-модели. Конфигурация уже выполнена на уровне модуля."""
+
+def _get_groq_client():
+    global _groq_client
+    if _groq_client is None and GROQ_API_KEY:
+        from groq import AsyncGroq
+        _groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+    return _groq_client
+
+
+def _get_gemini_model(model_name: str):
+    import google.generativeai as genai
     return genai.GenerativeModel(model_name)
 
+
 def get_personal_experience():
-    """Читает базу знаний кандидата из файла."""
     try:
         with open("knowledge_base.md", "r", encoding="utf-8") as f:
             return f.read()
@@ -24,49 +39,33 @@ def get_personal_experience():
         logger.error(f"Error reading knowledge_base.md: {e}")
         return "Sadu Nurzhan. Frontend Developer (Vue/React/TS)."
 
-async def expand_search_query(base_query):
-    """Использует Gemini для расширения поискового запроса до 5-7 вариаций."""
-    model = _get_model('gemini-2.0-flash')  # Быстрая модель для расширения запроса
-    
-    prompt = f"""Ты — эксперт по подбору персонала. Пользователь ищет вакансии по запросу: "{base_query}".
-Твоя задача — сгенерировать 5-7 максимально эффективных поисковых фраз (на английском), которые помогут найти больше релевантных вакансий на международных площадках (LinkedIn, Indeed, Adzuna и т.д.).
 
-Вариации должны включать:
-- Названия ролей (Senior Frontend, Vue Engineer, etc.)
-- Технологии (Vue 3, TypeScript, Next.js)
-- Комбинации с "Remote" и "Worldwide".
+def _normalize_scoring_result(data: dict, mode: str) -> dict:
+    return {
+        "score": int(data.get("score", 0)),
+        "is_worldwide": bool(data.get("is_worldwide", False)),
+        "core_stack_match": bool(data.get("core_stack_match", False)),
+        "matching_skills": list(data.get("matching_skills", [])),
+        "missing_skills": list(data.get("missing_skills", [])),
+        "location_reason": str(data.get("location_reason", "N/A")),
+        "verdict": str(data.get("verdict", "Не удалось проанализировать")),
+        "has_salary": bool(data.get("has_salary", False)),
+        "scoring_mode": mode,
+    }
 
-Верни ТОЛЬКО JSON список строк:
-["фраза 1", "фраза 2", ...]"""
 
-    try:
-        response = await model.generate_content_async(prompt)
-        if response and response.text:
-            variations = extract_json(response.text.strip())
-            if variations and isinstance(variations, list):
-                # Добавляем оригинальный запрос в начало
-                if base_query not in variations:
-                    variations.insert(0, base_query)
-                return variations[:8]
-    except Exception as e:
-        logger.error(f"Query expansion error: {e}")
-        
-    return [base_query]
-
-async def process_job_scoring(job_title, company, description, history=None):
-    """Оценивает вакансию с учетом резюме и предыдущих предпочтений пользователя."""
-    model = _get_model('gemini-2.5-flash')  # Pro-модель для качественного скоринга
-    
+def _scoring_prompt(job_title, company, description, history=None):
     cv_summary = get_personal_experience()
-    
     history_context = ""
     if history:
         liked = "\n".join([f"- {h['title']} в {h['company']}" for h in history.get('liked', [])])
         disliked = "\n".join([f"- {h['title']} в {h['company']}" for h in history.get('disliked', [])])
-        if liked: history_context += f"\nПользователю РАНЕЕ ПОНРАВИЛИСЬ эти вакансии:\n{liked}"
-        if disliked: history_context += f"\nПользователь РАНЕЕ ОТКЛОНИЛ эти вакансии:\n{disliked}"
+        if liked:
+            history_context += f"\nПользователю РАНЕЕ ПОНРАВИЛИСЬ эти вакансии:\n{liked}"
+        if disliked:
+            history_context += f"\nПользователь РАНЕЕ ОТКЛОНИЛ эти вакансии:\n{disliked}"
 
-    prompt = f"""Ты — HR-эксперт по международному найму. Твоя задача — объективно оценить вакансию для FRONTEND РАЗРАБОТЧИКА.
+    return f"""Ты — HR-эксперт по международному найму. Оцени вакансию для FRONTEND РАЗРАБОТЧИКА.
 {job_title} в компании {company}.
 
 Описание/Стек:
@@ -76,28 +75,17 @@ async def process_job_scoring(job_title, company, description, history=None):
 {cv_summary}
 {history_context}
 
-КРИТЕРИИ ОЦЕНКИ:
-1. ПРОВЕРЬ РОЛЬ: 
-   - Мы ищем Frontend (Vue, React, Next.js, TypeScript).
-   - Если это чисто Backend, DevOps, QA, Data Science — ставь score 0.
-   - Fullstack допустим, если Frontend > 50%.
-2. ОЦЕНИ СТЕК (0-10):
-   - Vue 3 + TypeScript: приоритет №1 (8-10 баллов).
-   - React + TypeScript + Next.js: приоритет №2 (7-9 баллов).
-   - Если стек современный и совпадает с опытом, ставь высокий балл.
-   - Устаревший стек (Vue 2, jQuery, Angular 1): score 0-3.
-3. ПРОВЕРЬ УРОВЕНЬ:
-   - Мы рассматриваем Middle, Middle+ и Senior. Это ок.
-4. ПРОВЕРЬ ЛОКАЦИЮ:
-   - Если вакансия требует работы в офисе (кроме Казахстана) — ставь score 0.
-   - Remote (Worldwide/CIS/Europe) — это отлично.
-5. БОНУС ЗА СВЕЖЕСТЬ:
-   - Если вакансия свежая, накидывай +1 балл (до макс 10).
+КРИТЕРИИ:
+1. Title ДОЛЖЕН быть developer/engineer/frontend ролью. Sales/Director/Support/Marketing/Community/PM — score 0, core_stack_match=false (даже если React упомянут в описании компании).
+2. Vue 3 / Nuxt 3 + TypeScript remote: 9-10. React + TS remote: 7-8. Generic frontend JS: 5-6.
+3. Backend/DevOps/QA/Mobile/Data — score 0.
+4. Middle/Senior — ок, 4+ года опыта.
+5. Remote Worldwide/CIS/Europe — отлично. On-site only вне Казахстана — score 0.
 
 Верни ТОЛЬКО JSON:
 {{
   "score": 0,
-  "is_worldwide": true/false,
+  "is_worldwide": true,
   "core_stack_match": true,
   "matching_skills": [],
   "missing_skills": [],
@@ -106,99 +94,296 @@ async def process_job_scoring(job_title, company, description, history=None):
   "has_salary": false
 }}"""
 
+
+async def _groq_chat(prompt: str, timeout: float = 45) -> str | None:
+    client = _get_groq_client()
+    if not client:
+        return None
     try:
-        response = await model.generate_content_async(prompt)
-        if not response or not response.text:
-            return {"score": 0, "is_worldwide": False, "location_reason": "Error", "verdict": "Ошибка ИИ", "has_salary": False}
-            
-        data = extract_json(response.text.strip())
-        if data:
-            return {
-                "score": int(data.get("score", 0)),
-                "is_worldwide": bool(data.get("is_worldwide", False)),
-                "core_stack_match": bool(data.get("core_stack_match", False)),
-                "matching_skills": list(data.get("matching_skills", [])),
-                "missing_skills": list(data.get("missing_skills", [])),
-                "location_reason": str(data.get("location_reason", "N/A")),
-                "verdict": str(data.get("verdict", "Не удалось проанализировать")),
-                "has_salary": bool(data.get("has_salary", False))
-            }
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            ),
+            timeout=timeout,
+        )
+        return response.choices[0].message.content
+    except asyncio.TimeoutError:
+        logger.error("Groq error: request timed out")
+        return None
     except Exception as e:
-        logger.error(f"Job scoring error: {e}")
-        
-    return {
-        "score": 0,
-        "is_worldwide": False,
-        "core_stack_match": False,
-        "matching_skills": [],
-        "missing_skills": [],
-        "location_reason": "Error",
-        "verdict": "Ошибка обработки",
-        "has_salary": False,
-    }
+        logger.error(f"Groq error: {e}")
+        return None
 
-async def suggest_new_companies(prompt_context):
-    """Использует Gemini для поиска и добавления новых компаний в мониторинг."""
-    model = _get_model('gemini-2.5-flash')
-    
-    prompt = f"""Ты — эксперт по рынку труда в IT. Твоя задача: найти 5-10 компаний, которые соответствуют запросу пользователя.
-Для каждой компании найди ПРЯМУЮ ссылку на страницу с вакансиями (career page) или на их профиль в Greenhouse/Lever/Ashby.
 
-Запрос пользователя: {prompt_context}
-
-Верни ТОЛЬКО JSON список объектов:
-[
-  {{
-    "name": "Название компании",
-    "url": "https://company.com/careers",
-    "keywords": ["Frontend", "Vue", "React"]
-  }}
-]"""
-
+async def _gemini_chat(prompt: str, model_name: str = "gemini-2.0-flash") -> str | None:
+    if not GEMINI_JOB_API_KEY:
+        return None
     try:
-        response = await model.generate_content_async(prompt)
-        if response and response.text:
-            companies = extract_json(response.text.strip())
-            if companies and isinstance(companies, list):
-                added_count = 0
-                for c in companies:
-                    if await add_target_company(c['name'], c['url'], c.get('keywords', [])):
-                        added_count += 1
-                return added_count, companies
-    except Exception as e:
-        logger.error(f"Discovery error: {e}")
-    return 0, []
-
-async def generate_cover_letter(job_title, company, description):
-    """Генерирует лаконичное сопроводительное письмо на языке вакансии."""
-    model = _get_model('gemini-2.5-flash')
-    
-    cv_summary = get_personal_experience()
-
-    prompt = f"""Ты — HR-эксперт. Напиши ОЧЕНЬ короткое сопроводительное письмо (Cover Letter).
-Пиши письмо на том же языке, на котором написана вакансия.
-
-Кандидат: Sadu Nurzhan
-Опыт и кейсы:
-{cv_summary}
-
-Вакансия: {job_title} in {company}
-Описание вакансии:
-{description[:3000]}
-
-Твоя задача:
-1. Выбери из "Опыта и кейсов" ОДИН наиболее подходящий проект.
-2. Текст должен состоять СТРОГО ИЗ ОДНОГО АБЗАЦА (3-5 предложений).
-3. Суть: Почему мой конкретный опыт принесет пользу {company}.
-4. Никаких формальных "шапок", только само письмо.
-
-Верни ТОЛЬКО текст письма."""
-
-    try:
+        model = _get_gemini_model(model_name)
         response = await model.generate_content_async(prompt)
         if response and response.text:
             return response.text.strip()
     except Exception as e:
-        logger.error(f"Cover letter generation error: {e}")
-        
-    return "Failed to generate cover letter."
+        logger.error(f"Gemini error ({model_name}): {e}")
+    return None
+
+
+async def _score_with_groq(job_title, company, description, history=None):
+    text = await _groq_chat(_scoring_prompt(job_title, company, description, history))
+    if not text:
+        return None
+    data = extract_json(text)
+    if data:
+        return _normalize_scoring_result(data, "groq")
+    return None
+
+
+async def _score_with_gemini(job_title, company, description, history=None):
+    text = await _gemini_chat(_scoring_prompt(job_title, company, description, history), GEMINI_JOB_MODEL)
+    if not text:
+        return None
+    data = extract_json(text)
+    if data:
+        return _normalize_scoring_result(data, "gemini")
+    return None
+
+
+def _batch_scoring_prompt(jobs, history=None):
+    cv_summary = get_personal_experience()
+    history_context = ""
+    if history:
+        liked = "\n".join([f"- {h['title']} в {h['company']}" for h in history.get('liked', [])])
+        disliked = "\n".join([f"- {h['title']} в {h['company']}" for h in history.get('disliked', [])])
+        if liked:
+            history_context += f"\nПонравились:\n{liked}"
+        if disliked:
+            history_context += f"\nОтклонены:\n{disliked}"
+
+    blocks = []
+    for i, job in enumerate(jobs):
+        blocks.append(
+            f"--- JOB {i} ---\n"
+            f"Title: {job['title']}\n"
+            f"Company: {job['company']}\n"
+            f"Description:\n{job.get('description', '')[:1200]}"
+        )
+
+    return f"""Оцени каждую FRONTEND вакансию для кандидата (Vue 3/Nuxt приоритет, React/TS вторично, remote).
+{cv_summary}
+{history_context}
+
+ПРАВИЛА: если title не developer/engineer/frontend (sales, director, support, marketing) — score 0.
+Vue 3/Nuxt+TS remote: 9-10. React+TS remote: 7-8. On-site only вне KZ: 0.
+
+{chr(10).join(blocks)}
+
+Верни ТОЛЬКО JSON-массив (по одному объекту на JOB index):
+[
+  {{
+    "index": 0,
+    "score": 0,
+    "is_worldwide": true,
+    "core_stack_match": true,
+    "matching_skills": [],
+    "missing_skills": [],
+    "location_reason": "...",
+    "verdict": "...",
+    "has_salary": false
+  }}
+]"""
+
+
+async def _score_batch_with_groq(jobs, history=None):
+    text = await _groq_chat(_batch_scoring_prompt(jobs, history))
+    if not text:
+        return None
+    data = extract_json(text)
+    if not isinstance(data, list):
+        return None
+    results = [None] * len(jobs)
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        idx = int(item.get("index", -1))
+        if 0 <= idx < len(jobs):
+            results[idx] = _normalize_scoring_result(item, "groq")
+    return results
+
+
+async def _score_batch_with_gemini(jobs, history=None):
+    text = await _gemini_chat(_batch_scoring_prompt(jobs, history), GEMINI_JOB_MODEL)
+    if not text:
+        return None
+    data = extract_json(text)
+    if not isinstance(data, list):
+        return None
+    results = [None] * len(jobs)
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        idx = int(item.get("index", -1))
+        if 0 <= idx < len(jobs):
+            results[idx] = _normalize_scoring_result(item, "gemini")
+    return results
+
+
+async def _score_batch_with_local(jobs, history=None):
+    text = await _local_chat(_batch_scoring_prompt(jobs, history))
+    if not text:
+        logger.error("AI local failed: batch scoring empty")
+        return None
+    data = extract_json(text)
+    if not isinstance(data, list):
+        logger.error("AI local failed: batch scoring JSON is not a list")
+        return None
+    results = [None] * len(jobs)
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        idx = int(item.get("index", -1))
+        if 0 <= idx < len(jobs):
+            results[idx] = _normalize_scoring_result(item, "local")
+    return results
+
+
+async def process_jobs_scoring_batch(jobs, history=None, use_cache=True):
+    """Батч-скоринг: кеш → local LLM пачками → эвристика. Groq/Gemini отключены."""
+    if not jobs:
+        return []
+
+    final = [None] * len(jobs)
+    jobs_to_score = []
+    index_map = []
+
+    if use_cache:
+        for i, job in enumerate(jobs):
+            cached = await get_cached_job_score(job.get("url", ""))
+            if cached:
+                cached["scoring_mode"] = "cache"
+                final[i] = cached
+            else:
+                jobs_to_score.append(job)
+                index_map.append(i)
+    else:
+        jobs_to_score = list(jobs)
+        index_map = list(range(len(jobs)))
+
+    if not jobs_to_score:
+        return final
+
+    batch_scorers = [_score_batch_with_local]
+
+    scored_slice = [None] * len(jobs_to_score)
+    for scorer in batch_scorers:
+        try:
+            batch_results = await scorer(jobs_to_score, history)
+            if batch_results and any(r and r.get("score", 0) > 0 for r in batch_results):
+                for i, job in enumerate(jobs_to_score):
+                    r = batch_results[i] if batch_results[i] else None
+                    if not r or r.get("score", 0) <= 0:
+                        r = score_job_rules(job["title"], job["company"], job.get("description", ""))
+                    scored_slice[i] = r
+                break
+        except Exception as e:
+            logger.error(f"Batch scoring error: {e}")
+
+    for i, job in enumerate(jobs_to_score):
+        result = scored_slice[i] or score_job_rules(
+            job["title"], job["company"], job.get("description", "")
+        )
+        await save_job_score_cache(job.get("url", ""), result)
+        final[index_map[i]] = result
+
+    return final
+
+
+async def expand_search_query(base_query):
+    base_query = base_query.strip().strip('"').strip("'")
+    prompt = f"""Сгенерируй 5-7 поисковых фраз (на английском) для вакансий по запросу: "{base_query}".
+Включи роли (Senior Frontend, Vue Engineer, Nuxt Developer), технологии (Vue 3, Nuxt 3, Composition API, Pinia, TypeScript), Remote/Worldwide.
+Верни ТОЛЬКО JSON список строк: ["фраза 1", "фраза 2", ...]"""
+
+    providers = [("local", lambda: _local_chat(prompt))]
+
+    for name, fn in providers:
+        try:
+            text = await fn()
+            if text:
+                variations = extract_json(text)
+                if variations and isinstance(variations, list):
+                    if base_query not in variations:
+                        variations.insert(0, base_query)
+                    logger.info(f"Query expansion via {name}: {len(variations)} variations")
+                    return variations[:8]
+        except Exception as e:
+            logger.error(f"Query expansion error ({name}): {e}")
+
+    logger.info("Query expansion fallback: rules")
+    return expand_query_rules(base_query)
+
+
+async def expand_search_query_safe(base_query, timeout: float = 50):
+    try:
+        return await asyncio.wait_for(expand_search_query(base_query), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.error("Query expansion timed out, using rules fallback")
+        return expand_query_rules(base_query)
+
+
+async def process_job_scoring(job_title, company, description, history=None, url=None):
+    """local LLM → rule-based fallback (с кешем по URL). Groq/Gemini отключены."""
+    if url:
+        cached = await get_cached_job_score(url)
+        if cached:
+            cached["scoring_mode"] = "cache"
+            return cached
+
+    results = await process_jobs_scoring_batch(
+        [{"title": job_title, "company": company, "description": description, "url": url or ""}],
+        history=history,
+        use_cache=False,
+    )
+    return results[0] if results else score_job_rules(job_title, company, description)
+
+
+async def suggest_new_companies(prompt_context):
+    prompt = f"""Найди 5-10 IT-компаний по запросу: {prompt_context}
+Для каждой — прямая ссылка на career page или Greenhouse/Lever/Ashby.
+Верни ТОЛЬКО JSON:
+[{{"name": "...", "url": "https://...", "keywords": ["Frontend", "Vue"]}}]"""
+
+    text = await _local_chat(prompt)
+    if not text:
+        logger.error("AI local failed: company discovery")
+
+    if text:
+        companies = extract_json(text)
+        if companies and isinstance(companies, list):
+            added_count = 0
+            for c in companies:
+                if await add_target_company(c['name'], c['url'], c.get('keywords', [])):
+                    added_count += 1
+            return added_count, companies
+    return 0, []
+
+
+async def generate_cover_letter(job_title, company, description):
+    cv_summary = get_personal_experience()
+    prompt = f"""Напиши короткое cover letter (3-5 предложений, один абзац) на языке вакансии.
+
+Кандидат: Sadu Nurzhan
+Опыт: {cv_summary[:2000]}
+Вакансия: {job_title} в {company}
+Описание: {description[:3000]}
+
+Без шапки, только текст письма."""
+
+    text = await _local_chat(prompt)
+    if not text:
+        logger.error("AI local failed: cover letter")
+
+    if text:
+        return text.strip()
+    return cover_letter_template(job_title, company)
