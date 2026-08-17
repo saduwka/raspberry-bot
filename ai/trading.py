@@ -1,16 +1,16 @@
 import json
 import logging
 import asyncio
-from ai.base import extract_json, clean_html
-from ai import local as local_llm
+
+from ai import client as local_llm
+from core.html import clean_html
+from core.jsonutil import extract_json
 
 logger = logging.getLogger(__name__)
 
-async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, avg_sentiment, retries=1):
-    """
-    Просит локальную модель подтвердить или отклонить торговый сигнал.
-    Gemini отключен.
-    """
+
+async def evaluate_trade(pair, market_snapshot, technical_signal, avg_sentiment, retries=1):
+    """Просит локальную модель подтвердить или отклонить торговый сигнал."""
     prompt = f"""Ты — профессиональный квантовый трейдер с 10+ годами опыта на крипто-рынках.
 Твоя задача — принять ОКОНЧАТЕЛЬНОЕ решение по сделке, игнорируя шум и ложные пробои.
 
@@ -107,12 +107,12 @@ async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, av
                 confidence = max(0.0, min(confidence, 1.0))
 
                 reason = str(data.get("reason", "local LLM не дал объяснение")).strip()[:300]
-                
+
                 if action in {"BUY", "SELL"} and confidence < 0.3:
-                    logger.warning(f"Low confidence {confidence} for {action}, forcing HOLD")
+                    logger.warning("Low confidence %s for %s, forcing HOLD", confidence, action)
                     action = "HOLD"
                     reason = f"Низкая уверенность ({confidence:.2f}): {reason}"
-                
+
                 return {
                     "action": action,
                     "confidence": confidence,
@@ -120,18 +120,19 @@ async def evaluate_trade_with_gemini(pair, market_snapshot, technical_signal, av
                     "provider": local_llm.model_label(),
                 }
 
-            logger.info(f"Trade local attempt {attempt+1}: invalid JSON, retrying...")
+            logger.info("Trade local attempt %s: invalid JSON, retrying...", attempt + 1)
             await asyncio.sleep(1)
         except Exception as e:
-            logger.error(f"Trade local attempt {attempt+1}: {e}")
+            logger.error("Trade local attempt %s: %s", attempt + 1, e)
             await asyncio.sleep(1)
-            
+
     return {
         "action": "HOLD",
         "confidence": 0.0,
         "reason": f"локальная модель недоступна ({local_llm.last_error or 'нет ответа'})",
         "provider": local_llm.model_label(),
     }
+
 
 async def generate_daily_analytics(trades_summary):
     """Генерирует аналитический отчет по итогам торгового дня через локальную модель."""
@@ -153,5 +154,8 @@ async def generate_daily_analytics(trades_summary):
             return clean_html(text)
         logger.error("Daily analytics local failed: %s", local_llm.last_error)
     except Exception as e:
-        logger.error(f"Daily analytics generation error: {e}")
-    return f"Не удалось сгенерировать аналитику: локальная модель недоступна ({local_llm.last_error or 'нет ответа'})."
+        logger.error("Daily analytics generation error: %s", e)
+    return (
+        f"Не удалось сгенерировать аналитику: локальная модель недоступна "
+        f"({local_llm.last_error or 'нет ответа'})."
+    )

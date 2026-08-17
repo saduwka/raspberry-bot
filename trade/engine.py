@@ -10,7 +10,7 @@ from config import (
     TRADE_STOP_LOSS_PCT,
     TRADE_TAKE_PROFIT_PCT,
 )
-from database import save_trade, set_trade_state, get_trade_state
+from trade.repo import save_trade, set_trade_state, get_trade_state
 
 logger = logging.getLogger(__name__)
 

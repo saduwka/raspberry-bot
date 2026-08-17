@@ -11,6 +11,8 @@ last_error: str | None = None
 last_ok_at: float | None = None
 last_latency_ms: int | None = None
 
+_client: httpx.AsyncClient | None = None
+
 
 def model_label() -> str:
     return f"local/{LOCAL_LLM_MODEL}"
@@ -30,12 +32,31 @@ def _headers() -> dict:
     return headers
 
 
+async def startup() -> None:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(timeout=LOCAL_LLM_TIMEOUT, headers=_headers())
+
+
+async def shutdown() -> None:
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None
+
+
+async def _get_client() -> httpx.AsyncClient:
+    if _client is None:
+        await startup()
+    return _client
+
+
 async def health() -> tuple[bool, str]:
     global last_error
     url = f"{_origin()}/health"
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            response = await client.get(url, headers=_headers())
+        client = await _get_client()
+        response = await client.get(url, timeout=8.0)
         if response.status_code == 200:
             return True, response.text.strip()[:200]
         last_error = f"health HTTP {response.status_code}: {response.text[:200]}"
@@ -57,8 +78,8 @@ async def chat(prompt: str, timeout: float | None = None) -> str | None:
         "temperature": 0.2,
     }
     try:
-        async with httpx.AsyncClient(timeout=timeout or LOCAL_LLM_TIMEOUT) as client:
-            response = await client.post(url, headers=_headers(), json=payload)
+        client = await _get_client()
+        response = await client.post(url, json=payload, timeout=timeout or LOCAL_LLM_TIMEOUT)
         last_latency_ms = int((time.monotonic() - started) * 1000)
         if response.status_code != 200:
             last_error = f"chat HTTP {response.status_code}: {response.text[:300]}"

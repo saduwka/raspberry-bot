@@ -1,13 +1,15 @@
-import json
-import logging
 import asyncio
-from ai.base import extract_json, clean_html
-from ai import local as local_llm
+import logging
+
+from ai import client as local_llm
+from core.html import clean_html
+from core.jsonutil import extract_json
 
 logger = logging.getLogger(__name__)
 
-async def process_with_gemini(title, summary, retries=2):
-    """Пересказывает новость через локальную модель. Gemini отключен."""
+
+async def summarize_news(title, summary, retries=2):
+    """Пересказывает новость через локальную модель."""
     prompt = f"""Ты — ведущий аналитик игровой и финансовой индустрии. Подготовь сжатую авторскую заметку по новости на русском языке.
 Стиль: серьезный, профессиональный, "человеческий". 
 Никаких эмодзи. Объем: до 1200 символов.

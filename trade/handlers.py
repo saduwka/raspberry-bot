@@ -3,9 +3,9 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
-from database import get_trade_stats, get_open_position, get_trade_state
+from trade.repo import get_trade_stats, get_open_position, get_trade_state
 from config import PAPER_MODE, TRADE_PAIRS, TRADE_QTY
-import trade_engine
+from trade import engine as trade_engine
 
 logger = logging.getLogger(__name__)
 
@@ -217,3 +217,30 @@ async def trade_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.callback_query.message.reply_text(error_msg)
         else:
             await update.message.reply_text(error_msg)
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    query = update.callback_query
+    if data == "trade_menu":
+        await show_trade_menu(update, context)
+        return True
+    if data.startswith("trade_select_"):
+        pair = data.replace("trade_select_", "")
+        await trade_stats_handler(update, context, pair=pair)
+        return True
+    if data.startswith("trade_stats_"):
+        pair = data.replace("trade_stats_", "")
+        await trade_stats_handler(update, context, pair=pair)
+        return True
+    if data.startswith("trade_refresh_"):
+        pair = data.replace("trade_refresh_", "")
+        await query.answer(f"📊 Обновляю {pair}...")
+        await trade_stats_handler(update, context, pair=pair)
+        return True
+    if data.startswith("trade_signal_"):
+        pair = data.replace("trade_signal_", "")
+        await query.answer(f"🧠 Анализирую {pair}...")
+        await trade_signal_handler(update, context, pair=pair)
+        return True
+    return None
+

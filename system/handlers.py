@@ -1,14 +1,20 @@
-import os
-import sys
-import logging
-import subprocess
 import html
-import aiosqlite
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes
-from config import DB_PATH, ADMIN_ID
+import logging
+import os
+import subprocess
+import sys
 
-from states import INPUT_SCROLL_TEXT
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler
+
+from config import ADMIN_ID
+from core.auth import admin_only
+from core.db import cleanup_old_data
+from core.states import ADD_KW, ADD_RSS, INPUT_SCROLL_TEXT
+from core.ui import reply_keyboard
+from news.repo import get_blocked_tags, get_gaming_keywords, get_rss_feeds, remove_keyword, remove_rss_feed
+from system.health import get_stats, restart_bot
+from system.repo import set_oled_config
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +22,17 @@ OLED_MODE_SCRIPT = "/usr/local/bin/oled-mode"
 OLED_DIR = "/root/oled"
 if OLED_DIR not in sys.path:
     sys.path.insert(0, OLED_DIR)
+
+
+def system_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Статус RPi", callback_data="cmd_status"),
+         InlineKeyboardButton("🤖 Local AI", callback_data="cmd_ai")],
+        [InlineKeyboardButton("🎵 Музыка", callback_data="music_menu"),
+         InlineKeyboardButton("📺 OLED Дисплей", callback_data="oled_menu")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="set_back")],
+        [InlineKeyboardButton("🔄 Перезапуск", callback_data="set_restart")],
+    ])
 
 
 def get_oled_mode() -> str:
@@ -58,6 +75,21 @@ def oled_mode_keyboard(mode: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+@admin_only
+async def show_system_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "⚙️ <b>Системное меню</b>\n\nПроверка состояния оборудования и управление основными настройками бота."
+    if update.callback_query:
+        try:
+            await update.callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=system_keyboard())
+        except Exception:
+            await update.callback_query.message.delete()
+            await context.bot.send_message(
+                update.effective_chat.id, text, parse_mode="HTML", reply_markup=system_keyboard()
+            )
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=system_keyboard())
+
+
 async def oled_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -78,33 +110,6 @@ async def oled_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def jira_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.from_user.id != ADMIN_ID:
-        return
-
-    await query.edit_message_text("📋 Jira — загружаю…", parse_mode="HTML")
-    try:
-        from jira_client import JiraClient, format_stats_message
-
-        stats = JiraClient().fetch_stats()
-        text = format_stats_message(stats)
-    except Exception as exc:
-        logger.exception("Jira stats failed")
-        text = f"📋 <b>Jira</b>\n\n❌ Ошибка:\n<code>{exc}</code>"
-
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Обновить", callback_data="jira_stats")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_system")],
-        ]),
-    )
-
-
 async def oled_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -112,8 +117,6 @@ async def oled_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     if query.from_user.id != ADMIN_ID:
         return
-
-    from telegram.ext import ConversationHandler
 
     if data == "oled_mode_console":
         kb = InlineKeyboardMarkup([
@@ -173,40 +176,41 @@ async def oled_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Введите текст для бегущей строки (или /cancel):")
         return INPUT_SCROLL_TEXT
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
-            if data.startswith("oled_pwr_"):
-                pwr = data.split("_")[2]
-                await db.execute("INSERT OR REPLACE INTO oled_config (key, value) VALUES ('power', ?)", (pwr,))
-            elif data.startswith("oled_scr_"):
-                scr = data.split("_")[2]
-                await db.execute("INSERT OR REPLACE INTO oled_config (key, value) VALUES ('forced_screen', ?)", (scr,))
-            await db.commit()
+        if data.startswith("oled_pwr_"):
+            pwr = data.split("_")[2]
+            await set_oled_config("power", pwr)
+        elif data.startswith("oled_scr_"):
+            scr = data.split("_")[2]
+            await set_oled_config("forced_screen", scr)
         msg = f"✅ Команда OLED сохранена ({data})"
 
-    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="oled_menu")]]))
+    await query.edit_message_text(
+        msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="oled_menu")]])
+    )
     return ConversationHandler.END
 
+
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from telegram import InlineKeyboardMarkup, InlineKeyboardButton
     keyboard = [
         [InlineKeyboardButton("📰 Управление RSS", callback_data="set_rss"),
          InlineKeyboardButton("🔑 Ключевые слова", callback_data="set_kw")],
         [InlineKeyboardButton("🚫 Стоп-теги", callback_data="set_tags"),
          InlineKeyboardButton("🧹 Очистка БД", callback_data="set_cleanup")],
         [InlineKeyboardButton("🔄 ПЕРЕЗАПУСК", callback_data="set_restart"),
-         InlineKeyboardButton("❌ Закрыть", callback_data="set_close")]
+         InlineKeyboardButton("❌ Закрыть", callback_data="set_close")],
     ]
-    await update.message.reply_text("⚙️ <b>Настройки бота</b>\n\nВыберите раздел для управления:",
-                                   reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+    await update.message.reply_text(
+        "⚙️ <b>Настройки бота</b>\n\nВыберите раздел для управления:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
+    )
+
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from telegram import InlineKeyboardMarkup, InlineKeyboardButton
-    from database import get_rss_feeds, get_gaming_keywords, get_blocked_tags, cleanup_old_data, remove_rss_feed, remove_keyword
-    from config import ADMIN_ID
-    from jobs import restart_bot
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID: return
+    if query.from_user.id != ADMIN_ID:
+        return
     data = query.data
 
     if data == "set_close":
@@ -214,16 +218,22 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "set_rss":
         feeds = await get_rss_feeds()
         text = "📰 <b>RSS-ленты:</b>\n\n" + ("\n".join([f"• {html.escape(f)}" for f in feeds]) if feeds else "Пусто")
-        kb = [[InlineKeyboardButton("➕ Добавить ленту", callback_data="add_rss_ui")],
-              [InlineKeyboardButton("🗑 Удалить ленту", callback_data="del_rss_ui")],
-              [InlineKeyboardButton("⬅️ Назад", callback_data="set_back")]]
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML", disable_web_page_preview=True)
+        kb = [
+            [InlineKeyboardButton("➕ Добавить ленту", callback_data="add_rss_ui")],
+            [InlineKeyboardButton("🗑 Удалить ленту", callback_data="del_rss_ui")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="set_back")],
+        ]
+        await query.message.edit_text(
+            text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML", disable_web_page_preview=True
+        )
     elif data == "set_kw":
         kws = await get_gaming_keywords()
         text = "🔑 <b>Ключевые слова:</b>\n\n" + (", ".join([html.escape(k) for k in kws]) if kws else "Пусто")
-        kb = [[InlineKeyboardButton("➕ Добавить слово", callback_data="add_kw_ui")],
-              [InlineKeyboardButton("🗑 Удалить слово", callback_data="del_kw_ui")],
-              [InlineKeyboardButton("⬅️ Назад", callback_data="set_back")]]
+        kb = [
+            [InlineKeyboardButton("➕ Добавить слово", callback_data="add_kw_ui")],
+            [InlineKeyboardButton("🗑 Удалить слово", callback_data="del_kw_ui")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="set_back")],
+        ]
         await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     elif data == "set_tags":
         tags = await get_blocked_tags()
@@ -237,26 +247,36 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🚫 Стоп-теги", callback_data="set_tags"),
              InlineKeyboardButton("🧹 Очистка БД", callback_data="set_cleanup")],
             [InlineKeyboardButton("🔄 ПЕРЕЗАПУСК", callback_data="set_restart"),
-             InlineKeyboardButton("❌ Закрыть", callback_data="set_close")]
+             InlineKeyboardButton("❌ Закрыть", callback_data="set_close")],
         ]
-        await query.message.edit_text("⚙️ <b>Настройки бота</b>\n\nВыберите раздел для управления:",
-                                     reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        await query.message.edit_text(
+            "⚙️ <b>Настройки бота</b>\n\nВыберите раздел для управления:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
     elif data == "set_restart":
-        kb = [[InlineKeyboardButton("✅ ДА, ПЕРЕЗАГРУЗИТЬ", callback_data="confirm_restart")],
-              [InlineKeyboardButton("⬅️ НАЗАД", callback_data="set_back")]]
-        await query.message.edit_text("⚠️ <b>Вы уверены, что хотите перезагрузить бота?</b>",
-                                     reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        kb = [
+            [InlineKeyboardButton("✅ ДА, ПЕРЕЗАГРУЗИТЬ", callback_data="confirm_restart")],
+            [InlineKeyboardButton("⬅️ НАЗАД", callback_data="set_back")],
+        ]
+        await query.message.edit_text(
+            "⚠️ <b>Вы уверены, что хотите перезагрузить бота?</b>",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="HTML",
+        )
     elif data == "confirm_restart":
         await query.message.delete()
         await restart_bot(context=context)
     elif data == "set_cleanup":
         await cleanup_old_data()
-        await query.message.edit_text("✅ База данных очищена (удалены старые логи и новости).",
-                                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="set_back")]]))
+        await query.message.edit_text(
+            "✅ База данных очищена (удалены старые логи и новости).",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="set_back")]]),
+        )
 
 
 async def ai_status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from ai import local as local_llm
+    from ai import client as local_llm
 
     query = update.callback_query
     waiting = "🤖 Проверяю локальную модель..."
@@ -286,3 +306,82 @@ async def ai_status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     else:
         await wait_msg.edit_text(text, parse_mode="HTML")
+
+
+@admin_only
+async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ai_status_handler(update, context)
+
+
+async def show_music_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    text = "🎵 <b>Управление музыкой</b>\n\nСинхронизация библиотеки с YouTube Music и перенос на iPod."
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Синхронизация (Полная)", callback_data="music_sync_full")],
+        [InlineKeyboardButton("📤 Только перенос", callback_data="ipod_sync_push")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_system")],
+    ])
+    if query:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def process_scroll_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    await set_oled_config("scrolling_text", text)
+    await update.message.reply_text("✅ Текст бегущей строки обновлен!", reply_markup=reply_keyboard())
+    return ConversationHandler.END
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    query = update.callback_query
+    if data == "add_rss_ui":
+        await query.message.reply_text("Отправьте URL RSS-ленты (или /cancel):")
+        return ADD_RSS
+    if data == "add_kw_ui":
+        await query.message.reply_text("Отправьте ключевое слово (или /cancel):")
+        return ADD_KW
+    if data.startswith(("set_", "add_", "del_", "drss_", "dkw_", "confirm_")):
+        return await settings_callback(update, context) or True
+    if data == "oled_scroll_set":
+        await query.message.reply_text("Введите текст для бегущей строки (или /cancel):")
+        return INPUT_SCROLL_TEXT
+    if data == "music_menu":
+        await show_music_menu(update, context)
+        return True
+    if data == "music_sync_full":
+        await query.answer("🎵 Запускаю синхронизацию...")
+        try:
+            subprocess.Popen(["python3", "/root/music_sync/sync.py"])
+        except Exception as e:
+            await query.message.reply_text(f"❌ Ошибка запуска: {e}")
+        return True
+    if data == "ipod_sync_push":
+        await query.answer("🚀 Запускаю перенос...")
+        try:
+            subprocess.Popen(["python3", "/root/music_sync/sync.py", "--push-only"])
+        except Exception as e:
+            await query.message.reply_text(f"❌ Ошибка запуска: {e}")
+        return True
+    if data == "back_to_system":
+        await show_system_menu(update, context)
+        return True
+    if data == "cmd_status":
+        await query.message.edit_text(
+            get_stats(),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_system")]]),
+        )
+        return True
+    if data == "cmd_ai":
+        await ai_status_handler(update, context)
+        return True
+    return None
+
+
+def register(app):
+    app.add_handler(CommandHandler("restart", restart_bot))
+    app.add_handler(CommandHandler("ai", ai_command))
+    app.add_handler(CallbackQueryHandler(oled_menu_handler, pattern="^oled_menu$"))
+    app.add_handler(CallbackQueryHandler(oled_callback_handler, pattern="^oled_(pwr|scr|restart|mode_)"))

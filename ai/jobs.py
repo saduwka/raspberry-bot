@@ -1,34 +1,12 @@
-import json
-import logging
 import asyncio
-from config import (
-    GEMINI_JOB_API_KEY, GROQ_API_KEY, GROQ_MODEL, GEMINI_JOB_MODEL,
-    JOB_SCORING_PROVIDER, JOB_AI_BATCH_SIZE,
-)
-from ai.base import extract_json
-from ai.local import chat as _local_chat
-from ai.job_scoring_rules import (
-    score_job_rules, expand_query_rules, cover_letter_template,
-)
-from database import add_target_company, get_cached_job_score, save_job_score_cache
+import logging
+
+from ai.client import chat as _local_chat
+from ai.job_scoring_rules import cover_letter_template, expand_query_rules, score_job_rules
+from core.jsonutil import extract_json
+from jobs.repo import add_target_company, get_cached_job_score, save_job_score_cache
 
 logger = logging.getLogger(__name__)
-
-# Groq/Gemini clients kept for rollback, but are not called.
-_groq_client = None
-
-
-def _get_groq_client():
-    global _groq_client
-    if _groq_client is None and GROQ_API_KEY:
-        from groq import AsyncGroq
-        _groq_client = AsyncGroq(api_key=GROQ_API_KEY)
-    return _groq_client
-
-
-def _get_gemini_model(model_name: str):
-    import google.generativeai as genai
-    return genai.GenerativeModel(model_name)
 
 
 def get_personal_experience():
@@ -36,7 +14,7 @@ def get_personal_experience():
         with open("knowledge_base.md", "r", encoding="utf-8") as f:
             return f.read()
     except Exception as e:
-        logger.error(f"Error reading knowledge_base.md: {e}")
+        logger.error("Error reading knowledge_base.md: %s", e)
         return "Sadu Nurzhan. Frontend Developer (Vue/React/TS)."
 
 
@@ -58,8 +36,8 @@ def _scoring_prompt(job_title, company, description, history=None):
     cv_summary = get_personal_experience()
     history_context = ""
     if history:
-        liked = "\n".join([f"- {h['title']} в {h['company']}" for h in history.get('liked', [])])
-        disliked = "\n".join([f"- {h['title']} в {h['company']}" for h in history.get('disliked', [])])
+        liked = "\n".join([f"- {h['title']} в {h['company']}" for h in history.get("liked", [])])
+        disliked = "\n".join([f"- {h['title']} в {h['company']}" for h in history.get("disliked", [])])
         if liked:
             history_context += f"\nПользователю РАНЕЕ ПОНРАВИЛИСЬ эти вакансии:\n{liked}"
         if disliked:
@@ -95,67 +73,12 @@ def _scoring_prompt(job_title, company, description, history=None):
 }}"""
 
 
-async def _groq_chat(prompt: str, timeout: float = 45) -> str | None:
-    client = _get_groq_client()
-    if not client:
-        return None
-    try:
-        response = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            ),
-            timeout=timeout,
-        )
-        return response.choices[0].message.content
-    except asyncio.TimeoutError:
-        logger.error("Groq error: request timed out")
-        return None
-    except Exception as e:
-        logger.error(f"Groq error: {e}")
-        return None
-
-
-async def _gemini_chat(prompt: str, model_name: str = "gemini-2.0-flash") -> str | None:
-    if not GEMINI_JOB_API_KEY:
-        return None
-    try:
-        model = _get_gemini_model(model_name)
-        response = await model.generate_content_async(prompt)
-        if response and response.text:
-            return response.text.strip()
-    except Exception as e:
-        logger.error(f"Gemini error ({model_name}): {e}")
-    return None
-
-
-async def _score_with_groq(job_title, company, description, history=None):
-    text = await _groq_chat(_scoring_prompt(job_title, company, description, history))
-    if not text:
-        return None
-    data = extract_json(text)
-    if data:
-        return _normalize_scoring_result(data, "groq")
-    return None
-
-
-async def _score_with_gemini(job_title, company, description, history=None):
-    text = await _gemini_chat(_scoring_prompt(job_title, company, description, history), GEMINI_JOB_MODEL)
-    if not text:
-        return None
-    data = extract_json(text)
-    if data:
-        return _normalize_scoring_result(data, "gemini")
-    return None
-
-
 def _batch_scoring_prompt(jobs, history=None):
     cv_summary = get_personal_experience()
     history_context = ""
     if history:
-        liked = "\n".join([f"- {h['title']} в {h['company']}" for h in history.get('liked', [])])
-        disliked = "\n".join([f"- {h['title']} в {h['company']}" for h in history.get('disliked', [])])
+        liked = "\n".join([f"- {h['title']} в {h['company']}" for h in history.get("liked", [])])
+        disliked = "\n".join([f"- {h['title']} в {h['company']}" for h in history.get("disliked", [])])
         if liked:
             history_context += f"\nПонравились:\n{liked}"
         if disliked:
@@ -195,40 +118,6 @@ Vue 3/Nuxt+TS remote: 9-10. React+TS remote: 7-8. On-site only вне KZ: 0.
 ]"""
 
 
-async def _score_batch_with_groq(jobs, history=None):
-    text = await _groq_chat(_batch_scoring_prompt(jobs, history))
-    if not text:
-        return None
-    data = extract_json(text)
-    if not isinstance(data, list):
-        return None
-    results = [None] * len(jobs)
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        idx = int(item.get("index", -1))
-        if 0 <= idx < len(jobs):
-            results[idx] = _normalize_scoring_result(item, "groq")
-    return results
-
-
-async def _score_batch_with_gemini(jobs, history=None):
-    text = await _gemini_chat(_batch_scoring_prompt(jobs, history), GEMINI_JOB_MODEL)
-    if not text:
-        return None
-    data = extract_json(text)
-    if not isinstance(data, list):
-        return None
-    results = [None] * len(jobs)
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        idx = int(item.get("index", -1))
-        if 0 <= idx < len(jobs):
-            results[idx] = _normalize_scoring_result(item, "gemini")
-    return results
-
-
 async def _score_batch_with_local(jobs, history=None):
     text = await _local_chat(_batch_scoring_prompt(jobs, history))
     if not text:
@@ -249,7 +138,7 @@ async def _score_batch_with_local(jobs, history=None):
 
 
 async def process_jobs_scoring_batch(jobs, history=None, use_cache=True):
-    """Батч-скоринг: кеш → local LLM пачками → эвристика. Groq/Gemini отключены."""
+    """Батч-скоринг: кеш → local LLM пачками → эвристика."""
     if not jobs:
         return []
 
@@ -273,21 +162,17 @@ async def process_jobs_scoring_batch(jobs, history=None, use_cache=True):
     if not jobs_to_score:
         return final
 
-    batch_scorers = [_score_batch_with_local]
-
     scored_slice = [None] * len(jobs_to_score)
-    for scorer in batch_scorers:
-        try:
-            batch_results = await scorer(jobs_to_score, history)
-            if batch_results and any(r and r.get("score", 0) > 0 for r in batch_results):
-                for i, job in enumerate(jobs_to_score):
-                    r = batch_results[i] if batch_results[i] else None
-                    if not r or r.get("score", 0) <= 0:
-                        r = score_job_rules(job["title"], job["company"], job.get("description", ""))
-                    scored_slice[i] = r
-                break
-        except Exception as e:
-            logger.error(f"Batch scoring error: {e}")
+    try:
+        batch_results = await _score_batch_with_local(jobs_to_score, history)
+        if batch_results and any(r and r.get("score", 0) > 0 for r in batch_results):
+            for i, job in enumerate(jobs_to_score):
+                r = batch_results[i] if batch_results[i] else None
+                if not r or r.get("score", 0) <= 0:
+                    r = score_job_rules(job["title"], job["company"], job.get("description", ""))
+                scored_slice[i] = r
+    except Exception as e:
+        logger.error("Batch scoring error: %s", e)
 
     for i, job in enumerate(jobs_to_score):
         result = scored_slice[i] or score_job_rules(
@@ -305,20 +190,17 @@ async def expand_search_query(base_query):
 Включи роли (Senior Frontend, Vue Engineer, Nuxt Developer), технологии (Vue 3, Nuxt 3, Composition API, Pinia, TypeScript), Remote/Worldwide.
 Верни ТОЛЬКО JSON список строк: ["фраза 1", "фраза 2", ...]"""
 
-    providers = [("local", lambda: _local_chat(prompt))]
-
-    for name, fn in providers:
-        try:
-            text = await fn()
-            if text:
-                variations = extract_json(text)
-                if variations and isinstance(variations, list):
-                    if base_query not in variations:
-                        variations.insert(0, base_query)
-                    logger.info(f"Query expansion via {name}: {len(variations)} variations")
-                    return variations[:8]
-        except Exception as e:
-            logger.error(f"Query expansion error ({name}): {e}")
+    try:
+        text = await _local_chat(prompt)
+        if text:
+            variations = extract_json(text)
+            if variations and isinstance(variations, list):
+                if base_query not in variations:
+                    variations.insert(0, base_query)
+                logger.info("Query expansion via local: %s variations", len(variations))
+                return variations[:8]
+    except Exception as e:
+        logger.error("Query expansion error (local): %s", e)
 
     logger.info("Query expansion fallback: rules")
     return expand_query_rules(base_query)
@@ -333,7 +215,6 @@ async def expand_search_query_safe(base_query, timeout: float = 50):
 
 
 async def process_job_scoring(job_title, company, description, history=None, url=None):
-    """local LLM → rule-based fallback (с кешем по URL). Groq/Gemini отключены."""
     if url:
         cached = await get_cached_job_score(url)
         if cached:
@@ -363,7 +244,7 @@ async def suggest_new_companies(prompt_context):
         if companies and isinstance(companies, list):
             added_count = 0
             for c in companies:
-                if await add_target_company(c['name'], c['url'], c.get('keywords', [])):
+                if await add_target_company(c["name"], c["url"], c.get("keywords", [])):
                     added_count += 1
             return added_count, companies
     return 0, []

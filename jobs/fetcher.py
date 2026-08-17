@@ -4,7 +4,9 @@ import logging
 import asyncio
 import urllib.parse
 from bs4 import BeautifulSoup
-from database import is_vacancy_seen, get_trade_state, get_target_companies
+from jobs.repo import is_vacancy_seen, get_target_companies
+from trade.repo import get_trade_state
+from core.db import normalize_job_url
 from ai.jobs import expand_search_query_safe
 from ai.job_role_filters import passes_title_filter
 
@@ -140,11 +142,6 @@ def _build_vacancy(
         "description": description,
     }
 
-
-def normalize_job_url(url):
-    if not url:
-        return None
-    return url.split("#")[0].rstrip("/")
 
 def looks_remote(text):
     if not text:
