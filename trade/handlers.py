@@ -3,9 +3,10 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
-from trade.repo import get_trade_stats, get_open_position, get_trade_state
+from trade.repo import get_last_trade_at, get_trade_stats, get_open_position, get_trade_state
 from config import PAPER_MODE, TRADE_PAIRS, TRADE_QTY
 from trade import engine as trade_engine
+from trade.policy import format_policy, load_policy, silence_days_from
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,10 @@ def trade_keyboard(pair=None):
         InlineKeyboardButton("🧠 Сигнал", callback_data=f"trade_signal_{active_pair}")
     ])
     keyboard.append([
+        InlineKeyboardButton("⚙️ Политика", callback_data="trade_policy"),
         InlineKeyboardButton("🔄 Обновить", callback_data=f"trade_refresh_{active_pair}"),
+    ])
+    keyboard.append([
         InlineKeyboardButton("📈 Меню", callback_data="trade_menu")
     ])
     
@@ -162,6 +166,16 @@ async def trade_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         last_gemini_reason = await get_trade_state("last_gemini_reason", active_pair)
         last_risk_exit_reason = await get_trade_state("last_risk_exit_reason", active_pair)
 
+        policy = await load_policy()
+        silence_days = silence_days_from(await get_last_trade_at())
+        silence_text = f"{silence_days:.0f} дн." if silence_days is not None else "нет сделок"
+        policy_text = (
+            f"\n⚙️ Агрессия: <code>{policy['aggression']}/5</code> | "
+            f"тишина: <code>{silence_text}</code> | "
+            f"ADX min: <code>{policy['adx_min']}</code> | "
+            f"conf: <code>{policy['min_confidence']}</code>\n"
+        )
+
         gemini_text = ""
         if last_trade_signal or last_gemini_action or last_trade_decision:
             confidence_text = (
@@ -184,6 +198,7 @@ async def trade_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"📈 <b>Торговая статистика: {active_pair}</b>\n\n"
             f"Текущий статус: <b>{pos_text}</b>\n"
             f"Режим: <code>{mode_text}</code>"
+            f"{policy_text}"
             f"{position_text}"
             f"{indicators_text}\n"
             f"{gemini_text}"
@@ -219,6 +234,25 @@ async def trade_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(error_msg)
 
 
+async def trade_policy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, pair=None):
+    active_pair = pair or TRADE_PAIRS[0]
+    policy = await load_policy()
+    silence_days = silence_days_from(await get_last_trade_at())
+    text = (
+        f"{format_policy(policy, silence_days)}\n\n"
+        "<i>Лимиты правит ИИ. Дневной убыток, PAPER/LIVE и стоп вручную не отключаются.</i>"
+    )
+    markup = trade_keyboard(active_pair)
+    if update.callback_query:
+        try:
+            await update.callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                raise
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
     query = update.callback_query
     if data == "trade_menu":
@@ -236,6 +270,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
         pair = data.replace("trade_refresh_", "")
         await query.answer(f"📊 Обновляю {pair}...")
         await trade_stats_handler(update, context, pair=pair)
+        return True
+    if data == "trade_policy":
+        await query.answer("⚙️ Политика")
+        await trade_policy_handler(update, context)
         return True
     if data.startswith("trade_signal_"):
         pair = data.replace("trade_signal_", "")

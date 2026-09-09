@@ -11,3 +11,4 @@ playwright>=1.49.0
 ccxt>=4.2.0
 ta>=0.11.0
 pandas>=2.0.0
+yandex-music>=3.0.0

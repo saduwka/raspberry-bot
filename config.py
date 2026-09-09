@@ -29,6 +29,8 @@ TRADE_TAKE_PROFIT_PCT = float(os.getenv("TRADE_TAKE_PROFIT_PCT", "0.03"))
 
 # Risk Management
 MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "5"))
+MAX_DAILY_LOSS_USDT = float(os.getenv("MAX_DAILY_LOSS_USDT", "100"))
+ENTRY_COOLDOWN_SECONDS = int(os.getenv("ENTRY_COOLDOWN_SECONDS", "900"))
 MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "0.05")) # 5% от депо
 TRADE_RISK_PER_TRADE_USDT = float(os.getenv("TRADE_RISK_PER_TRADE_USDT", "10.0")) # Риск в долларах на сделку
 
@@ -49,6 +51,9 @@ LOCAL_LLM_API_KEY = os.getenv("LOCAL_LLM_API_KEY", "")
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "qwen3.5-coder")
 LOCAL_LLM_TIMEOUT = float(os.getenv("LOCAL_LLM_TIMEOUT", "60"))
 AI_PROVIDER = os.getenv("AI_PROVIDER", "local").lower()
+
+YANDEX_MUSIC_TOKEN = os.getenv("YANDEX_MUSIC_TOKEN")
+YANDEX_MUSIC_WAVE_STATION = os.getenv("YANDEX_MUSIC_WAVE_STATION", "user:onyourwave")
 
 DB_PATH = "bot.db"
 

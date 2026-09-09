@@ -1,0 +1,314 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import signal
+import socket
+import subprocess
+import time
+from html import escape
+from pathlib import Path
+
+from music.bluetooth import pulse_env
+from music.yandex_client import WaveTrack, YandexMusicController
+
+logger = logging.getLogger(__name__)
+
+STATE_PATH = Path("/root/bot/music_state.json")
+IPC_SOCKET = "/tmp/yamusic_mpv.sock"
+MPV_LOG = Path("/root/bot/music_mpv.log")
+CACHE_DIR = Path("/tmp/yamusic-cache")
+CACHE_KEEP = 6
+
+
+class MusicPlayerService:
+    def __init__(self) -> None:
+        self.yandex = YandexMusicController()
+        self._mpv_proc: subprocess.Popen | None = None
+
+    def _load_state(self) -> dict:
+        if not STATE_PATH.exists():
+            return {
+                "batch_id": None,
+                "playlist": [],
+                "current_index": 0,
+                "started_at": 0,
+                "station": None,
+            }
+        return json.loads(STATE_PATH.read_text())
+
+    def _save_state(self, state: dict) -> None:
+        STATE_PATH.write_text(json.dumps(state, ensure_ascii=True, indent=2))
+
+    def _socket_request(self, payload: dict) -> dict:
+        if not os.path.exists(IPC_SOCKET):
+            raise RuntimeError("Локальный плеер не запущен.")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(5)
+            client.connect(IPC_SOCKET)
+            client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            buffer = ""
+            while True:
+                chunk = client.recv(65535).decode("utf-8")
+                if not chunk:
+                    break
+                buffer += chunk
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    if "event" not in data:
+                        return data
+        raise RuntimeError("mpv не ответил на команду.")
+
+    def _kill_existing_mpv(self) -> None:
+        if self._mpv_proc and self._mpv_proc.poll() is None:
+            try:
+                self._mpv_proc.send_signal(signal.SIGTERM)
+                self._mpv_proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self._mpv_proc.kill()
+                except Exception:
+                    pass
+            self._mpv_proc = None
+
+        subprocess.run(["pkill", "-f", IPC_SOCKET], capture_output=True, check=False)
+        if os.path.exists(IPC_SOCKET):
+            try:
+                os.unlink(IPC_SOCKET)
+            except OSError:
+                pass
+
+    def _wait_for_ipc_socket(self, timeout: float = 15.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._mpv_proc and self._mpv_proc.poll() is not None:
+                log_tail = ""
+                if MPV_LOG.exists():
+                    log_tail = MPV_LOG.read_text()[-500:]
+                raise RuntimeError(f"mpv завершился с кодом {self._mpv_proc.returncode}. {log_tail}")
+            if os.path.exists(IPC_SOCKET):
+                return
+            time.sleep(0.2)
+        raise RuntimeError("mpv не успел запуститься. Попробуйте ещё раз через несколько секунд.")
+
+    def _prune_cache(self) -> None:
+        files = sorted(CACHE_DIR.glob("*.mp3"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for stale in files[CACHE_KEEP:]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
+    def _cache_url(self, track_id: str, url: str) -> str:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        dest = CACHE_DIR / f"{track_id.replace(':', '_')}.mp3"
+        if dest.exists() and dest.stat().st_size > 32_000:
+            return str(dest)
+
+        part = dest.with_suffix(".part")
+        result = subprocess.run(
+            ["curl", "-fsSL", "--retry", "2", "--max-time", "60", "-o", str(part), url],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0 or not part.exists() or part.stat().st_size < 32_000:
+            if part.exists():
+                part.unlink(missing_ok=True)
+            raise RuntimeError(f"Не удалось скачать трек {track_id}: {result.stderr[-300:]}")
+        part.replace(dest)
+        self._prune_cache()
+        return str(dest)
+
+    def _local_path(self, track_item: dict) -> str:
+        url = track_item.get("url") or self.yandex.resolve_stream_url(track_item["track_id"])
+        track_item["url"] = url
+        path = self._cache_url(track_item["track_id"], url)
+        track_item["file"] = path
+        return path
+
+    def _spawn_mpv(self, first_track: WaveTrack) -> None:
+        self._kill_existing_mpv()
+        MPV_LOG.write_text("")
+        local_file = self._cache_url(first_track.track_id, first_track.url)
+
+        args = [
+            "mpv",
+            "--idle=yes",
+            f"--input-ipc-server={IPC_SOCKET}",
+            "--no-video",
+            "--really-quiet",
+            "--audio-device=pulse",
+            "--audio-buffer=0.5",
+            "--audio-format=s16",
+            "--audio-channels=stereo",
+            "--cache=yes",
+            "--cache-secs=20",
+            "--demuxer-max-bytes=67108864",
+            "--demuxer-readahead-secs=15",
+            "--audio-stream-silence=yes",
+            "--gapless-audio=no",
+            f"--log-file={MPV_LOG}",
+        ]
+        self._mpv_proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=pulse_env(),
+        )
+        self._wait_for_ipc_socket()
+
+        result = self._socket_request({"command": ["loadfile", local_file, "replace"]})
+        if result.get("error") not in (None, "success"):
+            raise RuntimeError(f"mpv не смог загрузить трек: {result}")
+
+    def _to_state_item(self, track: WaveTrack) -> dict:
+        return {
+            "track_id": track.track_id,
+            "title": track.title,
+            "artists": track.artists,
+            "duration_sec": track.duration_sec,
+            "url": track.url,
+            "cover_uri": track.cover_uri or "",
+        }
+
+    def _append_track(self, track_item: dict) -> None:
+        path = self._local_path(track_item)
+        result = self._socket_request({"command": ["loadfile", path, "append-play"]})
+        if result.get("error") not in (None, "success"):
+            raise RuntimeError(f"mpv не смог добавить трек в очередь: {result}")
+
+    def _ensure_prefetch(self, state: dict) -> dict:
+        status = self.get_status()
+        current_index = status.get("playlist_pos", state.get("current_index", 0))
+        playlist = state.get("playlist", [])
+        if len(playlist) - current_index > 2 or not playlist:
+            state["current_index"] = current_index
+            self._save_state(state)
+            return state
+
+        queue_track_id = playlist[current_index]["track_id"]
+        new_tracks, new_batch_id = self.yandex.fetch_wave_batch(queue_track_id=queue_track_id)
+        known_ids = {item["track_id"] for item in playlist}
+        appended = 0
+        for track in new_tracks:
+            if track.track_id in known_ids:
+                continue
+            item = self._to_state_item(track)
+            self._append_track(item)
+            playlist.append(item)
+            known_ids.add(track.track_id)
+            appended += 1
+        if appended:
+            state["batch_id"] = new_batch_id or state.get("batch_id")
+            state["playlist"] = playlist
+        state["current_index"] = current_index
+        self._save_state(state)
+        return state
+
+    def start_my_wave(self) -> str:
+        tracks, batch_id = self.yandex.fetch_wave_batch()
+        self._spawn_mpv(tracks[0])
+        self.yandex.mark_radio_started(batch_id)
+        self.yandex.mark_track_started(tracks[0].track_id, batch_id)
+
+        playlist = [self._to_state_item(tracks[0])]
+        for track in tracks[1:3]:
+            item = self._to_state_item(track)
+            try:
+                self._append_track(item)
+                playlist.append(item)
+            except Exception as exc:
+                logger.warning("Prefetch append failed for %s: %s", track.track_id, exc)
+                playlist.append(item)
+                break
+
+        state = {
+            "station": "user:onyourwave",
+            "batch_id": batch_id,
+            "playlist": playlist,
+            "current_index": 0,
+            "started_at": int(time.time()),
+        }
+        self._save_state(state)
+        return f"▶️ Моя волна запущена: {escape(tracks[0].artists)} - {escape(tracks[0].title)}"
+
+    def toggle_pause(self) -> str:
+        result = self._socket_request({"command": ["cycle", "pause"]})
+        paused = self._socket_request({"command": ["get_property", "pause"]}).get("data", False)
+        if result.get("error") not in (None, "success"):
+            raise RuntimeError("Не удалось переключить паузу.")
+        return "⏸ Пауза" if paused else "▶️ Продолжил воспроизведение"
+
+    def stop(self) -> str:
+        try:
+            self._socket_request({"command": ["stop"]})
+            self._socket_request({"command": ["quit"]})
+        except Exception:
+            pass
+        self._kill_existing_mpv()
+        self._save_state({"batch_id": None, "playlist": [], "current_index": 0, "started_at": 0, "station": None})
+        return "⏹ Воспроизведение остановлено."
+
+    def next_track(self) -> str:
+        state = self._load_state()
+        status = self.get_status()
+        current_index = status.get("playlist_pos", state.get("current_index", 0))
+        playlist = state.get("playlist", [])
+        if playlist:
+            current = playlist[min(current_index, len(playlist) - 1)]
+            played_seconds = int(status.get("time_pos", 0))
+            self.yandex.mark_track_skipped(current["track_id"], played_seconds, state.get("batch_id"))
+
+        result = self._socket_request({"command": ["playlist-next", "force"]})
+        if result.get("error") not in (None, "success"):
+            raise RuntimeError("Не удалось переключить трек.")
+
+        time.sleep(0.3)
+        status = self.get_status()
+        new_index = status.get("playlist_pos", current_index + 1)
+        state["current_index"] = new_index
+        self._save_state(state)
+        state = self._ensure_prefetch(state)
+        playlist = state.get("playlist", [])
+        if new_index < len(playlist):
+            current = playlist[new_index]
+            self.yandex.mark_track_started(current["track_id"], state.get("batch_id"))
+            return f"⏭ {escape(current['artists'])} - {escape(current['title'])}"
+        return "⏭ Переключил трек."
+
+    def get_status(self) -> dict:
+        playlist_pos = self._socket_request({"command": ["get_property", "playlist-pos"]}).get("data", 0)
+        pause = self._socket_request({"command": ["get_property", "pause"]}).get("data", False)
+        time_pos = self._socket_request({"command": ["get_property", "time-pos"]}).get("data", 0) or 0
+        return {
+            "playlist_pos": int(playlist_pos or 0),
+            "pause": bool(pause),
+            "time_pos": int(float(time_pos)),
+        }
+
+    def now_playing_text(self) -> str:
+        state = self._load_state()
+        playlist = state.get("playlist", [])
+        if not playlist:
+            return "ℹ️ Сейчас ничего не играет."
+        try:
+            status = self.get_status()
+        except Exception:
+            current = playlist[min(state.get("current_index", 0), len(playlist) - 1)]
+            return f"⏹ Плеер остановлен\n🎵 {escape(current['artists'])} - {escape(current['title'])}"
+        index = min(status.get("playlist_pos", 0), len(playlist) - 1)
+        current = playlist[index]
+        state["current_index"] = index
+        self._save_state(state)
+        play_state = "⏸ Пауза" if status.get("pause") else "▶️ Играет"
+        return (
+            f"{play_state}\n"
+            f"🎵 {escape(current['artists'])} - {escape(current['title'])}\n"
+            f"⏱ {status.get('time_pos', 0)} / {current.get('duration_sec', 0)} сек"
+        )

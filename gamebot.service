@@ -1,11 +1,17 @@
 [Unit]
 Description=GameBot v2 - Multi-Assistant Telegram Bot
-After=network.target
+After=network.target bluetooth.service
+Wants=bluetooth.service
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/root/bot
+Environment=XDG_RUNTIME_DIR=/run/user/0
+Environment=PULSE_RUNTIME_PATH=/run/user/0/pulse
+Environment=HOME=/root
+ExecStartPre=/bin/mkdir -p /run/user/0/pulse
+ExecStartPre=/bin/bash -c 'export XDG_RUNTIME_DIR=/run/user/0 PULSE_RUNTIME_PATH=/run/user/0/pulse HOME=/root; want=$(cat /run/user/0/pulse/pid 2>/dev/null || true); for pid in $(pgrep -x pulseaudio || true); do if [ -n "$want" ] && [ "$pid" = "$want" ]; then continue; fi; kill "$pid" 2>/dev/null || true; done; sleep 0.3; pulseaudio --check || pulseaudio --start --exit-idle-time=-1'
 ExecStart=/usr/bin/python3 /root/bot/bot.py
 Restart=always
 RestartSec=10

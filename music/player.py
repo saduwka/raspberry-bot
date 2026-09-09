@@ -1,0 +1,667 @@
+from __future__ import annotations
+
+import fcntl
+import json
+import logging
+import os
+import signal
+import socket
+import subprocess
+import threading
+import time
+from contextlib import contextmanager
+from html import escape
+from pathlib import Path
+from typing import Any
+
+from music.bluetooth import pulse_env
+from music.yandex_client import WaveTrack, YandexMusicController
+
+logger = logging.getLogger(__name__)
+
+STATE_PATH = Path("/root/bot/music_state.json")
+LOCK_PATH = Path("/tmp/yamusic.lock")
+IPC_SOCKET = "/tmp/yamusic_mpv.sock"
+MPV_LOG = Path("/root/bot/music_mpv.log")
+CACHE_DIR = Path("/tmp/yamusic-cache")
+CACHE_KEEP = 6
+PREFETCH_AHEAD = 2
+WATCHDOG_INTERVAL = 4.0
+
+
+DEFAULT_VOLUME = 70
+
+
+def clamp_volume(level) -> int:
+    try:
+        value = int(round(float(level)))
+    except (TypeError, ValueError):
+        value = DEFAULT_VOLUME
+    return max(0, min(100, value))
+
+
+def _empty_state() -> dict:
+    return {
+        "batch_id": None,
+        "playlist": [],
+        "current_index": 0,
+        "started_at": 0,
+        "station": None,
+        "volume": DEFAULT_VOLUME,
+    }
+
+
+def _empty_now_playing() -> dict:
+    return {
+        "ok": False,
+        "playing": False,
+        "paused": False,
+        "track_id": "",
+        "title": "",
+        "artists": "",
+        "time_pos": 0,
+        "duration": 0,
+        "cover_uri": "",
+        "station": "",
+        "playlist_pos": 0,
+        "playlist_len": 0,
+        "volume": DEFAULT_VOLUME,
+    }
+
+
+class MusicPlayerService:
+    def __init__(self) -> None:
+        self.yandex = YandexMusicController()
+        self._mpv_proc: subprocess.Popen | None = None
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_running = False
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_lock = threading.Lock()
+
+    # --- locking / state -------------------------------------------------
+
+    @contextmanager
+    def _music_lock(self, *, blocking: bool = True):
+        LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(LOCK_PATH, "a+", encoding="utf-8")
+        try:
+            flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                fcntl.flock(fh.fileno(), flags)
+            except BlockingIOError:
+                fh.close()
+                raise
+            yield
+        finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            fh.close()
+
+    def _load_state(self) -> dict:
+        if not STATE_PATH.exists():
+            return _empty_state()
+        try:
+            data = json.loads(STATE_PATH.read_text())
+            if not isinstance(data, dict):
+                return _empty_state()
+            data.setdefault("playlist", [])
+            data.setdefault("current_index", 0)
+            data.setdefault("batch_id", None)
+            data.setdefault("started_at", 0)
+            data.setdefault("station", None)
+            data["volume"] = clamp_volume(data.get("volume", DEFAULT_VOLUME))
+            return data
+        except Exception as exc:
+            logger.warning("corrupt music state, resetting: %s", exc)
+            return _empty_state()
+
+    def _save_state(self, state: dict) -> None:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(state, ensure_ascii=True, indent=2)
+        tmp = STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(payload)
+        os.replace(tmp, STATE_PATH)
+
+    # --- mpv ipc ---------------------------------------------------------
+
+    def _socket_request(self, payload: dict, *, timeout: float = 5.0) -> dict:
+        if not os.path.exists(IPC_SOCKET):
+            raise RuntimeError("Локальный плеер не запущен.")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout)
+            client.connect(IPC_SOCKET)
+            client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            buffer = ""
+            while True:
+                chunk = client.recv(65535).decode("utf-8")
+                if not chunk:
+                    break
+                buffer += chunk
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    if "event" not in data:
+                        return data
+        raise RuntimeError("mpv не ответил на команду.")
+
+    def _ipc_alive(self) -> bool:
+        return os.path.exists(IPC_SOCKET)
+
+    def _kill_existing_mpv(self) -> None:
+        if self._mpv_proc and self._mpv_proc.poll() is None:
+            try:
+                self._mpv_proc.send_signal(signal.SIGTERM)
+                self._mpv_proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self._mpv_proc.kill()
+                except Exception:
+                    pass
+            self._mpv_proc = None
+
+        subprocess.run(["pkill", "-f", IPC_SOCKET], capture_output=True, check=False)
+        if os.path.exists(IPC_SOCKET):
+            try:
+                os.unlink(IPC_SOCKET)
+            except OSError:
+                pass
+
+    def _wait_for_ipc_socket(self, timeout: float = 15.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._mpv_proc and self._mpv_proc.poll() is not None:
+                log_tail = ""
+                if MPV_LOG.exists():
+                    log_tail = MPV_LOG.read_text()[-500:]
+                raise RuntimeError(f"mpv завершился с кодом {self._mpv_proc.returncode}. {log_tail}")
+            if os.path.exists(IPC_SOCKET):
+                return
+            time.sleep(0.15)
+        raise RuntimeError("mpv не успел запуститься. Попробуйте ещё раз через несколько секунд.")
+
+    def _prune_cache(self) -> None:
+        files = sorted(CACHE_DIR.glob("*.mp3"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for stale in files[CACHE_KEEP:]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
+    def _cache_url(self, track_id: str, url: str, *, retries: int = 1) -> str:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        dest = CACHE_DIR / f"{track_id.replace(':', '_')}.mp3"
+        if dest.exists() and dest.stat().st_size > 32_000:
+            return str(dest)
+
+        last_err = ""
+        for attempt in range(retries + 1):
+            part = dest.with_suffix(".part")
+            result = subprocess.run(
+                ["curl", "-fsSL", "--retry", "2", "--max-time", "60", "-o", str(part), url],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0 and part.exists() and part.stat().st_size > 32_000:
+                part.replace(dest)
+                self._prune_cache()
+                return str(dest)
+            last_err = (result.stderr or "")[-300:]
+            if part.exists():
+                part.unlink(missing_ok=True)
+            if attempt < retries:
+                # URL may have expired — caller should refresh before retrying at higher level
+                time.sleep(0.3)
+        raise RuntimeError(f"Не удалось скачать трек {track_id}: {last_err}")
+
+    def _local_path(self, track_item: dict) -> str:
+        url = track_item.get("url") or ""
+        track_id = track_item["track_id"]
+        try:
+            if not url:
+                url = self.yandex.resolve_stream_url(track_id)
+                track_item["url"] = url
+            path = self._cache_url(track_id, url, retries=0)
+        except Exception:
+            url = self.yandex.resolve_stream_url(track_id)
+            track_item["url"] = url
+            path = self._cache_url(track_id, url, retries=1)
+        track_item["file"] = path
+        return path
+
+    def _spawn_mpv(self, first_track: WaveTrack) -> None:
+        self._kill_existing_mpv()
+        MPV_LOG.write_text("")
+        local_file = self._cache_url(first_track.track_id, first_track.url)
+
+        args = [
+            "mpv",
+            "--idle=yes",
+            f"--input-ipc-server={IPC_SOCKET}",
+            "--no-video",
+            "--really-quiet",
+            "--audio-device=pulse",
+            "--audio-buffer=0.5",
+            "--audio-format=s16",
+            "--audio-channels=stereo",
+            "--cache=yes",
+            "--cache-secs=20",
+            "--demuxer-max-bytes=67108864",
+            "--demuxer-readahead-secs=15",
+            "--audio-stream-silence=yes",
+            "--gapless-audio=no",
+            f"--log-file={MPV_LOG}",
+        ]
+        self._mpv_proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=pulse_env(),
+        )
+        self._wait_for_ipc_socket()
+
+        result = self._socket_request({"command": ["loadfile", local_file, "replace"]})
+        if result.get("error") not in (None, "success"):
+            raise RuntimeError(f"mpv не смог загрузить трек: {result}")
+        self._apply_volume_unlocked(self._load_state().get("volume", DEFAULT_VOLUME))
+
+    def _apply_volume_unlocked(self, level) -> int:
+        vol = clamp_volume(level)
+        if self._ipc_alive():
+            result = self._socket_request({"command": ["set_property", "volume", vol]}, timeout=2.0)
+            if result.get("error") not in (None, "success"):
+                raise RuntimeError(f"Не удалось выставить громкость: {result}")
+        return vol
+
+    def set_volume(self, level) -> int:
+        with self._music_lock():
+            state = self._load_state()
+            vol = self._apply_volume_unlocked(level)
+            state["volume"] = vol
+            self._save_state(state)
+            return vol
+
+    def _to_state_item(self, track: WaveTrack) -> dict:
+        return {
+            "track_id": track.track_id,
+            "title": track.title,
+            "artists": track.artists,
+            "duration_sec": track.duration_sec,
+            "url": track.url,
+            "cover_uri": track.cover_uri or "",
+        }
+
+    def _append_track(self, track_item: dict) -> None:
+        path = self._local_path(track_item)
+        result = self._socket_request({"command": ["loadfile", path, "append-play"]})
+        if result.get("error") not in (None, "success"):
+            raise RuntimeError(f"mpv не смог добавить трек в очередь: {result}")
+
+    # --- status ----------------------------------------------------------
+
+    def get_status(self) -> dict:
+        playlist_pos = self._socket_request({"command": ["get_property", "playlist-pos"]}, timeout=2.0).get("data", 0)
+        pause = self._socket_request({"command": ["get_property", "pause"]}, timeout=2.0).get("data", False)
+        time_pos = self._socket_request({"command": ["get_property", "time-pos"]}, timeout=2.0).get("data", 0) or 0
+        return {
+            "playlist_pos": int(playlist_pos or 0),
+            "pause": bool(pause),
+            "time_pos": int(float(time_pos)),
+        }
+
+    def get_now_playing(self, *, sync_state: bool = False) -> dict:
+        """Single source of truth for UI / bridge."""
+        data = _empty_now_playing()
+        state = self._load_state()
+        playlist = state.get("playlist") or []
+        data["station"] = state.get("station") or ""
+        data["playlist_len"] = len(playlist)
+        data["volume"] = clamp_volume(state.get("volume", DEFAULT_VOLUME))
+
+        if not playlist:
+            return data
+
+        index = int(state.get("current_index") or 0)
+        paused = False
+        time_pos = 0
+        alive = self._ipc_alive()
+        if alive:
+            try:
+                status = self.get_status()
+                index = int(status.get("playlist_pos", index) or 0)
+                paused = bool(status.get("pause"))
+                time_pos = int(status.get("time_pos") or 0)
+                data["ok"] = True
+                data["playing"] = True
+            except Exception as exc:
+                logger.debug("mpv status failed: %s", exc)
+                alive = False
+
+        index = min(max(index, 0), len(playlist) - 1)
+        current = playlist[index]
+        data.update(
+            {
+                "paused": paused if alive else False,
+                "track_id": str(current.get("track_id") or ""),
+                "title": current.get("title") or "",
+                "artists": current.get("artists") or "",
+                "time_pos": time_pos if alive else 0,
+                "duration": int(current.get("duration_sec") or 0),
+                "cover_uri": current.get("cover_uri") or "",
+                "playlist_pos": index,
+                "ok": bool(alive or current.get("track_id")),
+                "playing": bool(alive),
+                "volume": clamp_volume(state.get("volume", DEFAULT_VOLUME)),
+            }
+        )
+
+        if sync_state and alive and int(state.get("current_index") or 0) != index:
+            state["current_index"] = index
+            try:
+                with self._music_lock(blocking=False):
+                    self._save_state(state)
+            except BlockingIOError:
+                pass
+
+        return data
+
+    # --- prefetch / watchdog ---------------------------------------------
+
+    def _ensure_prefetch_locked(self, state: dict) -> dict:
+        """Must be called under _music_lock."""
+        if not self._ipc_alive():
+            return state
+        try:
+            status = self.get_status()
+        except Exception:
+            return state
+
+        current_index = int(status.get("playlist_pos", state.get("current_index", 0)) or 0)
+        playlist = list(state.get("playlist") or [])
+        if not playlist:
+            return state
+
+        remaining = len(playlist) - current_index
+        if remaining > PREFETCH_AHEAD:
+            state["current_index"] = current_index
+            self._save_state(state)
+            return state
+
+        queue_track_id = playlist[min(current_index, len(playlist) - 1)]["track_id"]
+        try:
+            new_tracks, new_batch_id = self.yandex.fetch_wave_batch(queue_track_id=queue_track_id)
+        except Exception as exc:
+            logger.warning("prefetch batch failed: %s", exc)
+            state["current_index"] = current_index
+            self._save_state(state)
+            return state
+
+        known_ids = {item["track_id"] for item in playlist}
+        appended = 0
+        for track in new_tracks:
+            if track.track_id in known_ids:
+                continue
+            item = self._to_state_item(track)
+            try:
+                self._append_track(item)
+            except Exception as exc:
+                logger.warning("Prefetch append failed for %s: %s", track.track_id, exc)
+                break
+            playlist.append(item)
+            known_ids.add(track.track_id)
+            appended += 1
+            if remaining + appended > PREFETCH_AHEAD + 1:
+                break
+
+        if appended:
+            state["batch_id"] = new_batch_id or state.get("batch_id")
+            state["playlist"] = playlist
+        state["current_index"] = current_index
+        self._save_state(state)
+        return state
+
+    def _run_prefetch_job(self) -> None:
+        try:
+            # Download candidates without holding the cross-process lock.
+            state = self._load_state()
+            playlist = list(state.get("playlist") or [])
+            if not playlist or not self._ipc_alive():
+                return
+            try:
+                status = self.get_status()
+                current_index = int(status.get("playlist_pos", state.get("current_index", 0)) or 0)
+            except Exception:
+                current_index = int(state.get("current_index") or 0)
+            remaining = len(playlist) - current_index
+            if remaining > PREFETCH_AHEAD:
+                with self._music_lock():
+                    state = self._load_state()
+                    state["current_index"] = current_index
+                    self._save_state(state)
+                return
+
+            queue_track_id = playlist[min(current_index, len(playlist) - 1)]["track_id"]
+            try:
+                new_tracks, new_batch_id = self.yandex.fetch_wave_batch(queue_track_id=queue_track_id)
+            except Exception as exc:
+                logger.warning("prefetch batch failed: %s", exc)
+                return
+
+            prepared: list[dict] = []
+            known_ids = {item["track_id"] for item in playlist}
+            for track in new_tracks:
+                if track.track_id in known_ids:
+                    continue
+                item = self._to_state_item(track)
+                try:
+                    self._local_path(item)  # download only
+                    prepared.append(item)
+                    known_ids.add(track.track_id)
+                except Exception as exc:
+                    logger.warning("Prefetch download failed for %s: %s", track.track_id, exc)
+                    break
+                if remaining + len(prepared) > PREFETCH_AHEAD + 1:
+                    break
+
+            if not prepared:
+                return
+
+            with self._music_lock():
+                state = self._load_state()
+                playlist = list(state.get("playlist") or [])
+                known_ids = {item["track_id"] for item in playlist}
+                appended = 0
+                for item in prepared:
+                    if item["track_id"] in known_ids:
+                        continue
+                    try:
+                        # file already cached; append to mpv
+                        path = item.get("file") or self._local_path(item)
+                        result = self._socket_request({"command": ["loadfile", path, "append-play"]})
+                        if result.get("error") not in (None, "success"):
+                            raise RuntimeError(str(result))
+                        playlist.append(item)
+                        known_ids.add(item["track_id"])
+                        appended += 1
+                    except Exception as exc:
+                        logger.warning("Prefetch append failed for %s: %s", item.get("track_id"), exc)
+                        break
+                if appended:
+                    state["batch_id"] = new_batch_id or state.get("batch_id")
+                    state["playlist"] = playlist
+                try:
+                    status = self.get_status()
+                    state["current_index"] = int(status.get("playlist_pos", current_index) or current_index)
+                except Exception:
+                    state["current_index"] = current_index
+                self._save_state(state)
+        except Exception as exc:
+            logger.warning("prefetch job failed: %s", exc)
+        finally:
+            with self._prefetch_lock:
+                self._prefetch_running = False
+
+    def request_prefetch(self) -> None:
+        with self._prefetch_lock:
+            if self._prefetch_running:
+                return
+            self._prefetch_running = True
+        threading.Thread(target=self._run_prefetch_job, name="yamusic-prefetch", daemon=True).start()
+
+    def _watchdog_loop(self) -> None:
+        while not self._watchdog_stop.wait(WATCHDOG_INTERVAL):
+            if not self._ipc_alive():
+                continue
+            try:
+                np = self.get_now_playing()
+                if not np.get("playing"):
+                    continue
+                remaining = int(np.get("playlist_len") or 0) - int(np.get("playlist_pos") or 0)
+                if remaining <= PREFETCH_AHEAD:
+                    self.request_prefetch()
+            except Exception as exc:
+                logger.debug("watchdog tick failed: %s", exc)
+
+    def _ensure_watchdog(self) -> None:
+        with self._watchdog_lock:
+            if self._watchdog_thread and self._watchdog_thread.is_alive():
+                return
+            self._watchdog_stop.clear()
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop, name="yamusic-watchdog", daemon=True
+            )
+            self._watchdog_thread.start()
+
+    def _stop_watchdog(self) -> None:
+        self._watchdog_stop.set()
+
+    # --- public actions --------------------------------------------------
+
+    def start_my_wave(self) -> str:
+        with self._music_lock():
+            tracks, batch_id = self.yandex.fetch_wave_batch()
+            self._spawn_mpv(tracks[0])
+            self.yandex.mark_radio_started(batch_id)
+            self.yandex.mark_track_started(tracks[0].track_id, batch_id)
+
+            playlist = [self._to_state_item(tracks[0])]
+            for track in tracks[1:3]:
+                item = self._to_state_item(track)
+                try:
+                    self._append_track(item)
+                    playlist.append(item)
+                except Exception as exc:
+                    logger.warning("Prefetch append failed for %s: %s", track.track_id, exc)
+                    break
+
+            prev_vol = clamp_volume(self._load_state().get("volume", DEFAULT_VOLUME))
+            state = {
+                "station": "user:onyourwave",
+                "batch_id": batch_id,
+                "playlist": playlist,
+                "current_index": 0,
+                "started_at": int(time.time()),
+                "volume": prev_vol,
+            }
+            self._save_state(state)
+            self._apply_volume_unlocked(prev_vol)
+
+        self._ensure_watchdog()
+        self.request_prefetch()
+        return f"▶️ Моя волна запущена: {escape(tracks[0].artists)} - {escape(tracks[0].title)}"
+
+    def toggle_pause(self) -> str:
+        with self._music_lock():
+            result = self._socket_request({"command": ["cycle", "pause"]})
+            if result.get("error") not in (None, "success"):
+                raise RuntimeError("Не удалось переключить паузу.")
+            paused = self._socket_request({"command": ["get_property", "pause"]}).get("data", False)
+        return "⏸ Пауза" if paused else "▶️ Продолжил воспроизведение"
+
+    def stop(self) -> str:
+        self._stop_watchdog()
+        with self._music_lock():
+            try:
+                self._socket_request({"command": ["stop"]}, timeout=2.0)
+            except Exception:
+                pass
+            try:
+                self._socket_request({"command": ["quit"]}, timeout=2.0)
+            except Exception:
+                pass
+            self._kill_existing_mpv()
+            vol = clamp_volume(self._load_state().get("volume", DEFAULT_VOLUME))
+            cleared = _empty_state()
+            cleared["volume"] = vol
+            self._save_state(cleared)
+        return "⏹ Воспроизведение остановлено."
+
+    def next_track(self) -> str:
+        with self._music_lock():
+            state = self._load_state()
+            status = self.get_status()
+            current_index = int(status.get("playlist_pos", state.get("current_index", 0)) or 0)
+            playlist = state.get("playlist") or []
+            if playlist:
+                current = playlist[min(current_index, len(playlist) - 1)]
+                played_seconds = int(status.get("time_pos", 0))
+                self.yandex.mark_track_skipped(current["track_id"], played_seconds, state.get("batch_id"))
+
+            result = self._socket_request({"command": ["playlist-next", "force"]})
+            if result.get("error") not in (None, "success"):
+                raise RuntimeError("Не удалось переключить трек.")
+
+            # Short settle: one playlist-pos read, few quick retries
+            new_index = current_index + 1
+            for _ in range(3):
+                time.sleep(0.05)
+                try:
+                    pos = self._socket_request(
+                        {"command": ["get_property", "playlist-pos"]}, timeout=1.0
+                    ).get("data", new_index)
+                    new_index = int(pos or new_index)
+                    if new_index != current_index:
+                        break
+                except Exception:
+                    break
+
+            state["current_index"] = new_index
+            self._save_state(state)
+            playlist = state.get("playlist") or []
+            message = "⏭ Переключил трек."
+            if playlist and new_index < len(playlist):
+                current = playlist[new_index]
+                self.yandex.mark_track_started(current["track_id"], state.get("batch_id"))
+                message = f"⏭ {escape(current['artists'])} - {escape(current['title'])}"
+
+        self._ensure_watchdog()
+        self.request_prefetch()
+        return message
+
+    def now_playing_text(self) -> str:
+        np = self.get_now_playing(sync_state=True)
+        if not np.get("track_id") and not np.get("playing"):
+            return "ℹ️ Сейчас ничего не играет."
+        if not np.get("playing"):
+            return (
+                f"⏹ Плеер остановлен\n"
+                f"🎵 {escape(np.get('artists') or '')} - {escape(np.get('title') or '')}"
+            )
+        play_state = "⏸ Пауза" if np.get("paused") else "▶️ Играет"
+        return (
+            f"{play_state}\n"
+            f"🎵 {escape(np.get('artists') or '')} - {escape(np.get('title') or '')}\n"
+            f"⏱ {np.get('time_pos', 0)} / {np.get('duration', 0)} сек"
+        )
+
+    # Test helpers
+    def _test_atomic_save_roundtrip(self, payload: dict) -> dict:
+        with self._music_lock():
+            self._save_state(payload)
+            return self._load_state()

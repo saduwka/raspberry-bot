@@ -76,106 +76,108 @@ def calc_indicators(df):
     
     return df
 
-def get_signal(df, sentiment=0):
-    """
-    Улучшенная генерация сигнала.
-    BUY: 
-      - EMA Fast > EMA Slow (пересечение или удержание)
-      - ADX > 20 (есть тренд) и ADX_POS > ADX_NEG
-      - RSI < 60 (не перекуплено)
-      - Объем > Volume SMA (подтверждение объемом)
-      - Sentiment >= -0.1
-    SELL: 
-      - EMA Fast < EMA Slow
-      - ADX_NEG > ADX_POS
-      - RSI > 70 (перекупленность при слабости)
-      - Уход под EMA50
-    """
+def get_signal(df, sentiment=0, policy=None):
+    """Техническая подсказка. Пороги из policy, иначе как раньше (aggression 2)."""
     if df is None or len(df) < 20:
         return "HOLD"
-        
+
+    adx_min = 20.0
+    rsi_buy_max = 60.0
+    require_volume = True
+    if policy:
+        adx_min = float(policy.get("adx_min", adx_min))
+        rsi_buy_max = float(policy.get("rsi_buy_max", rsi_buy_max))
+        require_volume = bool(policy.get("require_volume", True))
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
-    
-    # Состояние тренда и силы
-    is_bullish = last['ema_fast'] > last['ema_slow']
-    is_bearish = last['ema_fast'] < last['ema_slow']
-    strong_trend = last['adx'] > 20
-    bullish_trend = last['adx_pos'] > last['adx_neg']
-    bearish_trend = last['adx_neg'] > last['adx_pos']
-    
-    above_trend = last['close'] > last['ema_trend']
-    below_trend = last['close'] < (last['ema_trend'] * 0.998) 
-    
-    # Объем: текущий объем выше среднего за 20 свечей
-    high_volume = last['volume'] > last['volume_sma']
-    
-    # Момент пересечения
-    ema_cross_up = prev['ema_fast'] <= prev['ema_slow'] and is_bullish
-    ema_cross_down = prev['ema_fast'] >= prev['ema_slow'] and is_bearish
-    
-    # Вход (BUY)
+
+    is_bullish = last["ema_fast"] > last["ema_slow"]
+    is_bearish = last["ema_fast"] < last["ema_slow"]
+    strong_trend = last["adx"] > adx_min
+    bullish_trend = last["adx_pos"] > last["adx_neg"]
+    bearish_trend = last["adx_neg"] > last["adx_pos"]
+
+    above_trend = last["close"] > last["ema_trend"]
+    below_trend = last["close"] < (last["ema_trend"] * 0.998)
+
+    high_volume = last["volume"] > last["volume_sma"]
+    volume_ok = high_volume if require_volume else True
+
+    ema_cross_up = prev["ema_fast"] <= prev["ema_slow"] and is_bullish
+    ema_cross_down = prev["ema_fast"] >= prev["ema_slow"] and is_bearish
+
     if above_trend and strong_trend and bullish_trend and sentiment >= -0.1:
-        # Входим на пересечении или на сильном импульсе с подтверждением объема
-        if (ema_cross_up or (is_bullish and high_volume)) and last['rsi'] < 60:
+        if (ema_cross_up or (is_bullish and volume_ok)) and last["rsi"] < rsi_buy_max:
             return "BUY"
 
-    # Выход (SELL) - технический
     if ema_cross_down or (is_bearish and bearish_trend) or below_trend:
-        # Если RSI очень высокий, выходим быстрее
-        if last['rsi'] > 75 or is_bearish:
+        if last["rsi"] > 75 or is_bearish:
             return "SELL"
-        
+
     return "HOLD"
 
-def get_risk_exit_signal(current_price, entry_price, atr, highest_price=None):
-    """
-    Динамический выход по риску с использованием ATR и Трейлинг-стопа.
-    ATR Multiplier: 2.0 (для стоп-лосса)
-    """
+
+def get_risk_exit_signal(current_price, entry_price, atr, highest_price=None, policy=None):
     if entry_price is None or atr is None:
         return None
 
-    # Базовый стоп-лосс по ATR (более гибкий, чем статический %)
-    # Если ATR высокий (волатильность), стоп дальше
-    stop_loss_distance = atr * 2.0
+    atr_stop = 2.0
+    atr_tp = 4.0
+    if policy:
+        atr_stop = float(policy.get("atr_stop", atr_stop))
+        atr_tp = float(policy.get("atr_tp", atr_tp))
+
+    stop_loss_distance = atr * atr_stop
     initial_stop_loss = entry_price - stop_loss_distance
-    
-    # Трейлинг-стоп: подтягиваем стоп за ценой
+
     if highest_price is not None:
-        trailing_stop = highest_price - (atr * 1.5)
+        trailing_stop = highest_price - (atr * max(1.2, atr_stop * 0.75))
         current_stop = max(initial_stop_loss, trailing_stop)
     else:
         current_stop = initial_stop_loss
 
-    # Тейк-профит (можно оставить статичным или тоже привязать к ATR)
-    take_profit_price = entry_price + (atr * 4.0) # Соотношение риск/прибыль 1:2
+    take_profit_price = entry_price + (atr * atr_tp)
 
     if current_price <= current_stop:
         return "TRAILING_STOP" if highest_price and current_stop > initial_stop_loss else "STOP_LOSS_ATR"
-    
+
     if current_price >= take_profit_price:
         return "TAKE_PROFIT_ATR"
-        
+
     return None
 
-async def execute_trade(signal, price, pair, sentiment_score=0, atr=None):
-    """Исполняет сделку с динамическим расчетом объема по ATR."""
+
+async def execute_trade(signal, price, pair, sentiment_score=0, atr=None, policy=None):
+    """Исполняет сделку. Размер: risk_usdt / (atr * atr_stop). Стоп нельзя выключить."""
     if signal == "HOLD":
         return
-        
-    logger.info(f"Executing {signal} for {pair} at {price} (Sentiment: {sentiment_score})")
-    
+
+    logger.info("Executing %s for %s at %s (Sentiment: %s)", signal, pair, price, sentiment_score)
+
     from config import TRADE_QTY_MAP, TRADE_RISK_PER_TRADE_USDT
-    
-    # Расчет объема на основе риска и волатильности (ATR)
-    # Формула: Qty = Risk_USDT / (ATR * 2.0)
+
+    risk_usdt = TRADE_RISK_PER_TRADE_USDT
+    atr_stop = 2.0
+    if policy:
+        try:
+            risk_usdt = float(policy.get("risk_usdt", risk_usdt))
+        except (TypeError, ValueError):
+            risk_usdt = TRADE_RISK_PER_TRADE_USDT
+        try:
+            atr_stop = float(policy.get("atr_stop", atr_stop))
+        except (TypeError, ValueError):
+            atr_stop = 2.0
+    risk_usdt = max(5.0, min(20.0, risk_usdt))
+    atr_stop = max(1.2, min(3.0, atr_stop))
+
     if signal == "BUY" and atr and atr > 0:
         try:
-            qty = TRADE_RISK_PER_TRADE_USDT / (atr * 2.0)
-            logger.info(f"Dynamic sizing for {pair}: ATR={atr}, Risk={TRADE_RISK_PER_TRADE_USDT} -> Qty={qty:.6f}")
+            qty = risk_usdt / (atr * atr_stop)
+            logger.info("Dynamic sizing for %s: ATR=%s, Risk=%s, stop=%s -> Qty=%s",
+                        pair, atr, risk_usdt, atr_stop, f"{qty:.6f}")
         except Exception as e:
-            logger.error(f"Error calculating dynamic qty: {e}")
+            logger.error("Error calculating dynamic qty: %s", e)
             qty = TRADE_QTY_MAP.get(pair, TRADE_QTY)
     else:
         qty = TRADE_QTY_MAP.get(pair, TRADE_QTY)

@@ -1,16 +1,32 @@
 import html
 import json
 import logging
+from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from ai.trading import evaluate_trade, generate_daily_analytics
-from config import ADMIN_ID, MAX_DAILY_TRADES, PAPER_MODE, TRADE_PAIRS
+from ai.trading import evaluate_cycle, generate_daily_analytics
+from config import (
+    ADMIN_ID,
+    ENTRY_COOLDOWN_SECONDS,
+    MAX_DAILY_LOSS_USDT,
+    PAPER_MODE,
+    TRADE_PAIRS,
+)
 from news.repo import get_recent_sentiments
 from trade import engine as trade_engine
+from trade.policy import (
+    apply_policy_patch,
+    format_policy,
+    load_policy,
+    maybe_boot_silence,
+    maybe_escalate_silence,
+    silence_days_from,
+)
 from trade.repo import (
     get_daily_trades,
+    get_last_trade_at,
     get_open_position,
     get_trade_state,
     set_trade_state,
@@ -19,32 +35,74 @@ from trade.repo import (
 logger = logging.getLogger(__name__)
 
 
+def _avg_sentiment(rows) -> float:
+    if not rows:
+        return 0.0
+    sentiments = []
+    for r in rows:
+        try:
+            if r[0]:
+                data = json.loads(r[0])
+                sentiments.append(data.get("sentiment", 0))
+        except Exception:
+            continue
+    if not sentiments:
+        return 0.0
+    return sum(sentiments) / len(sentiments)
+
+
+def _in_cooldown(last_entry_at) -> bool:
+    if not last_entry_at:
+        return False
+    try:
+        text = str(last_entry_at).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - dt).total_seconds()
+        return elapsed < ENTRY_COOLDOWN_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
+async def _notify(bot, text: str):
+    try:
+        await bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+    except Exception as e:
+        logger.error("Failed to send trade message: %s", e)
+
+
 async def trade_job(context: ContextTypes.DEFAULT_TYPE):
-    """Основной цикл трейдинга: для каждой пары OHLCV -> Indicators -> Signal -> Execute."""
+    """Цикл: политика -> снимки всех пар -> один LLM -> caps -> execute."""
+    policy = await load_policy()
+    last_trade_at = await get_last_trade_at()
+    silence_days = silence_days_from(last_trade_at)
+
+    policy, boot_msg = await maybe_boot_silence(policy, silence_days)
+    if boot_msg:
+        await _notify(context.bot, boot_msg)
+    else:
+        policy, esc_msg = await maybe_escalate_silence(policy, silence_days)
+        if esc_msg:
+            await _notify(context.bot, esc_msg)
+
+    rows = await get_recent_sentiments(12)
+    avg_sentiment = _avg_sentiment(rows)
+    daily_trades = await get_daily_trades(24)
+    buy_trades_count = len([t for t in daily_trades if t[1] == "BUY"])
+    total_daily_pnl = sum(float(t[4]) for t in daily_trades if t[4] is not None)
+
+    snapshots = []
+    pair_ctx = {}
+
     for pair in TRADE_PAIRS:
         logger.info("Starting trade cycle for %s...", pair)
-
         df = await trade_engine.fetch_ohlcv(pair)
-        if df is None:
+        if df is None or df.empty:
             logger.error("Failed to fetch OHLCV data for %s", pair)
             continue
 
         df = trade_engine.calc_indicators(df)
-
-        avg_sentiment = 0
-        rows = await get_recent_sentiments(12)
-        if rows:
-            sentiments = []
-            for r in rows:
-                try:
-                    if r[0]:
-                        data = json.loads(r[0])
-                        sentiments.append(data.get("sentiment", 0))
-                except Exception:
-                    continue
-            if sentiments:
-                avg_sentiment = sum(sentiments) / len(sentiments)
-
         if df is None or df.empty:
             logger.warning("No data for indicators for %s, skipping", pair)
             continue
@@ -71,20 +129,21 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
                     float(entry_price),
                     float(last_atr),
                     highest_price=float(highest_price) if highest_price else None,
+                    policy=policy,
                 )
             except (TypeError, ValueError) as e:
                 logger.warning("Error calculating risk exit for %s: %s", pair, e)
 
-        technical_signal = trade_engine.get_signal(df, sentiment=avg_sentiment)
+        technical_signal = trade_engine.get_signal(df, sentiment=avg_sentiment, policy=policy)
         if risk_exit_reason:
             technical_signal = "SELL"
 
         logger.info(
-            "[%s] Tech: %s | ADX: %.1f | ATR: %.4f | RiskExit: %s",
-            pair, technical_signal, last_adx, last_atr, risk_exit_reason,
+            "[%s] Tech hint: %s | ADX: %.1f | ATR: %.4f | RiskExit: %s | agg=%s",
+            pair, technical_signal, last_adx, last_atr, risk_exit_reason, policy["aggression"],
         )
 
-        market_snapshot = {
+        snap = {
             "pair": pair,
             "price": round(float(last_price), 4),
             "volume": round(float(last_row["volume"]), 2),
@@ -100,44 +159,70 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
             "entry_price": round(float(entry_price), 4) if entry_price is not None else None,
             "highest_price": round(float(highest_price), 4) if highest_price is not None else None,
             "risk_exit": risk_exit_reason,
-            "recent_candles": df[["close", "volume", "rsi"]].tail(3).to_dict("records"),
+        }
+        snapshots.append(snap)
+        pair_ctx[pair] = {
+            "snap": snap,
+            "last_price": last_price,
+            "last_atr": last_atr,
+            "current_pos": current_pos,
+            "risk_exit_reason": risk_exit_reason,
+            "technical_signal": technical_signal,
         }
 
-        should_call_ai = (technical_signal != "HOLD") or (risk_exit_reason is not None)
+    if not snapshots:
+        return
 
-        if not should_call_ai:
-            ai_decision = {
-                "action": "HOLD",
-                "confidence": 0.0,
-                "reason": "Технических сигналов нет, ADX низкий — экономим API",
-            }
-            signal = "HOLD"
-        elif risk_exit_reason:
+    stats = {
+        "days_silent": round(silence_days, 1) if silence_days is not None else None,
+        "buys_today": buy_trades_count,
+        "pnl_today": round(total_daily_pnl, 2),
+        "max_daily_loss_usdt": MAX_DAILY_LOSS_USDT,
+    }
+    cycle = await evaluate_cycle(snapshots, policy, stats)
+    logger.info(
+        "Trade cycle AI done ok=%s provider=local pairs=%s patch=%s",
+        cycle.get("ok"),
+        [d.get("pair") for d in cycle.get("decisions") or []],
+        bool(cycle.get("policy_patch")),
+    )
+    policy, patch_msg = await apply_policy_patch(policy, cycle.get("policy_patch"))
+    if patch_msg:
+        await _notify(context.bot, patch_msg)
+
+    decisions = {d["pair"]: d for d in cycle.get("decisions") or []}
+
+    for pair, ctx in pair_ctx.items():
+        ai_decision = decisions.get(pair) or {
+            "action": "HOLD",
+            "confidence": 0.0,
+            "reason": "нет решения",
+            "risk_usdt": policy["risk_usdt"],
+        }
+        technical_signal = ctx["technical_signal"]
+        risk_exit_reason = ctx["risk_exit_reason"]
+        current_pos = ctx["current_pos"]
+        last_price = ctx["last_price"]
+        last_atr = ctx["last_atr"]
+
+        if risk_exit_reason:
+            signal = "SELL"
             ai_decision = {
                 "action": "SELL",
                 "confidence": 1.0,
                 "reason": f"Сработал динамический выход: {risk_exit_reason}",
+                "risk_usdt": policy["risk_usdt"],
             }
-            signal = "SELL"
         else:
-            ai_decision = await evaluate_trade(
-                pair=pair,
-                market_snapshot=market_snapshot,
-                technical_signal=technical_signal,
-                avg_sentiment=avg_sentiment,
-            )
-
-            if technical_signal == "BUY":
-                if ai_decision["action"] == "BUY" and ai_decision["confidence"] >= 0.6:
-                    signal = "BUY"
-                else:
-                    signal = "HOLD"
-            elif technical_signal == "SELL":
-                if ai_decision["action"] == "BUY" and ai_decision["confidence"] >= 0.8:
-                    signal = "HOLD"
-                else:
-                    signal = "SELL"
-            else:
+            signal = ai_decision["action"]
+            min_conf = float(policy["min_confidence"])
+            if signal == "BUY" and ai_decision["confidence"] < min_conf:
+                signal = "HOLD"
+                ai_decision["reason"] = (
+                    f"Низкая уверенность ({ai_decision['confidence']:.2f} < {min_conf}): "
+                    f"{ai_decision.get('reason', '')}"
+                )
+            if signal == "BUY" and cycle.get("ok") is False and technical_signal != "BUY":
                 signal = "HOLD"
 
         await set_trade_state("last_trade_signal", technical_signal, pair)
@@ -148,23 +233,21 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
         await set_trade_state("last_risk_exit_reason", risk_exit_reason, pair)
 
         logger.info(
-            "[%s] Final Decision: %s | Price: %s | local/qwen3.5-coder: %s (%s)",
-            pair, signal, last_price, ai_decision["action"], ai_decision["confidence"],
+            "[%s] Final Decision: %s | Price: %s | AI: %s (%s) | agg=%s",
+            pair, signal, last_price, ai_decision["action"], ai_decision["confidence"], policy["aggression"],
         )
 
         if signal == "BUY":
             if current_pos == "in_position":
                 continue
-
-            daily_trades = await get_daily_trades(24)
-            buy_trades_count = len([t for t in daily_trades if t[1] == "BUY"])
-            total_daily_pnl = sum([float(t[4]) for t in daily_trades if t[4] is not None])
-
-            if buy_trades_count >= MAX_DAILY_TRADES:
-                logger.warning("Daily trade limit reached (%s). Skipping BUY for %s.", MAX_DAILY_TRADES, pair)
+            if _in_cooldown(await get_trade_state("last_entry_at", pair)):
+                logger.info("Cooldown active, skip BUY for %s", pair)
                 continue
-
-            if total_daily_pnl < -100:
+            if buy_trades_count >= int(policy["max_daily_buys"]):
+                logger.warning("Daily buy limit reached (%s). Skipping BUY for %s.",
+                               policy["max_daily_buys"], pair)
+                continue
+            if total_daily_pnl < -MAX_DAILY_LOSS_USDT:
                 logger.warning("Daily drawdown limit reached. Skipping BUY for %s.", pair)
                 continue
 
@@ -174,15 +257,29 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
         if signal == "HOLD":
             continue
 
-        trade_result = await trade_engine.execute_trade(signal, last_price, pair, avg_sentiment, atr=last_atr)
+        pair_policy = dict(policy)
+        if ai_decision.get("risk_usdt") is not None:
+            try:
+                pair_policy["risk_usdt"] = max(5.0, min(20.0, float(ai_decision["risk_usdt"])))
+            except (TypeError, ValueError):
+                pass
+
+        trade_result = await trade_engine.execute_trade(
+            signal, last_price, pair, avg_sentiment, atr=last_atr, policy=pair_policy,
+        )
 
         if trade_result and trade_result.get("success"):
+            if signal == "BUY":
+                buy_trades_count += 1
+                await set_trade_state("last_entry_at", datetime.now(timezone.utc).isoformat(), pair)
             if signal == "SELL":
                 await set_trade_state("highest_price", None, pair)
+                pnl = trade_result.get("pnl", 0.0) or 0.0
+                total_daily_pnl += float(pnl)
+
             side_emoji = "🚀" if signal == "BUY" else "🔻"
             side_text = "ПОКУПКА" if signal == "BUY" else "ПРОДАЖА"
             pnl_text = ""
-
             exec_price = trade_result.get("price", last_price)
             exec_qty = trade_result.get("qty", 0)
             total_amount = exec_price * exec_qty
@@ -205,26 +302,30 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
                 f"Цена {'входа' if signal == 'BUY' else 'выхода'}: <code>{exec_price}</code>\n"
                 f"Объем: <code>{exec_qty}</code>\n"
                 f"Сумма: <code>{total_amount:.2f} USDT</code>\n"
+                f"Агрессия: <code>{policy['aggression']}/5</code>\n"
                 f"local/qwen3.5-coder: <code>{ai_decision['action']}</code> ({ai_decision['confidence']:.2f})\n"
-                f"Причина: <code>{html.escape(ai_decision['reason'])}</code>{pnl_text}\n"
+                f"Причина: <code>{html.escape(str(ai_decision['reason']))}</code>{pnl_text}\n"
                 f"Режим: {'🧪 PAPER' if PAPER_MODE else '💰 LIVE'}"
             )
-
-            try:
-                await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
-            except Exception as e:
-                logger.error("Failed to send trade notification for %s: %s", pair, e)
+            await _notify(context.bot, text)
 
 
 async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE = None):
-    """Собирает сделки за 24 часа и отправляет аналитику от локальной модели."""
+    """Сделки за 24 часа + политика + аналитика модели."""
     if not hasattr(update, "update_id"):
         context = update
         update = None
 
     logger.info("Generating daily trade analytics...")
+    policy = await load_policy()
+    last_trade_at = await get_last_trade_at()
+    silence_days = silence_days_from(last_trade_at)
+    policy, esc_msg = await maybe_escalate_silence(policy, silence_days)
+    if esc_msg:
+        await _notify(context.bot, esc_msg)
 
     rows = await get_daily_trades(24)
+    policy_block = format_policy(policy, silence_days)
 
     if not rows:
         logger.info("No trades today, sending empty status report.")
@@ -232,12 +333,10 @@ async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE,
             f"💰 <b>Статистика за 24ч:</b>\n"
             f"PnL: <code>0.00 USDT</code>\n"
             f"Сделок: <code>0</code>\n"
-            f"Статус: <i>Активен, сигналов на вход не было.</i>"
+            f"Статус: <i>Активен, сделок не было.</i>\n\n"
+            f"{policy_block}"
         )
-        try:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=header, parse_mode="HTML")
-        except Exception as e:
-            logger.error("Error sending empty daily analytics: %s", e)
+        await _notify(context.bot, header)
         return
 
     trades_summary = []
@@ -252,7 +351,6 @@ async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE,
             wins += 1
         elif pnl < 0:
             losses += 1
-
         trades_summary.append({
             "pair": r[0],
             "side": r[1],
@@ -265,18 +363,13 @@ async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE,
         })
 
     winrate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-    ai_report = await generate_daily_analytics(trades_summary)
+    ai_report = await generate_daily_analytics(trades_summary, policy=policy, silence_days=silence_days)
 
     header = (
         f"💰 <b>Статистика за 24ч:</b>\n"
         f"PnL: <code>{total_pnl:.2f} USDT</code>\n"
         f"Сделок: <code>{len(trades_summary)}</code> (W:{wins} / L:{losses})\n"
         f"Winrate: <code>{winrate:.1f}%</code>\n\n"
+        f"{policy_block}\n\n"
     )
-
-    full_report = header + ai_report
-
-    try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=full_report, parse_mode="HTML")
-    except Exception as e:
-        logger.error("Error sending daily analytics: %s", e)
+    await _notify(context.bot, header + ai_report)

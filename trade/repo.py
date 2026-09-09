@@ -61,6 +61,13 @@ async def get_trade_state(key, pair="GLOBAL"):
             return _decode_trade_state_value(row[0]) if row else None
 
 
+async def get_last_trade_at():
+    async with connect() as db:
+        async with db.execute("SELECT MAX(created_at) FROM trades") as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+
 async def get_daily_trades(hours=24):
     async with connect() as db:
         time_ago = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")

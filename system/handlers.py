@@ -5,6 +5,7 @@ import subprocess
 import sys
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler
 
 from config import ADMIN_ID
@@ -12,9 +13,18 @@ from core.auth import admin_only
 from core.db import cleanup_old_data
 from core.states import ADD_KW, ADD_RSS, INPUT_SCROLL_TEXT
 from core.ui import reply_keyboard
+import json
+import urllib.error
+import urllib.request
+
 from news.repo import get_blocked_tags, get_gaming_keywords, get_rss_feeds, remove_keyword, remove_rss_feed
 from system.health import get_stats, restart_bot
 from system.repo import set_oled_config
+
+_MUSIC_ROOT = "/root"
+if _MUSIC_ROOT not in sys.path:
+    sys.path.insert(0, _MUSIC_ROOT)
+from music.bluetooth import connect_device, list_paired_devices
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +32,56 @@ OLED_MODE_SCRIPT = "/usr/local/bin/oled-mode"
 OLED_DIR = "/root/oled"
 if OLED_DIR not in sys.path:
     sys.path.insert(0, OLED_DIR)
+
+
+
+MUSIC_API = "http://127.0.0.1:8080/api/music"
+STATUS_API = "http://127.0.0.1:8080/api/status"
+
+
+def music_api(action: str, **extra) -> dict:
+    payload = {"action": action, **extra}
+    req = urllib.request.Request(
+        MUSIC_API,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            return json.loads(body)
+        except Exception:
+            return {"ok": False, "error": body or str(exc)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def music_now_playing_text() -> str:
+    try:
+        with urllib.request.urlopen(STATUS_API, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        m = data.get("music") or {}
+    except Exception as exc:
+        return f"ℹ️ Музыка недоступна: {html.escape(str(exc))}"
+
+    if m.get("buffering"):
+        return "⏳ Запуск волны…"
+    if not m.get("playing"):
+        title = m.get("title") or ""
+        artists = m.get("artists") or ""
+        if title:
+            return f"⏹ Плеер остановлен\n🎵 {html.escape(artists)} - {html.escape(title)}"
+        return "ℹ️ Сейчас ничего не играет."
+    play_state = "⏸ Пауза" if m.get("paused") else "▶️ Играет"
+    return (
+        f"{play_state}\n"
+        f"🎵 {html.escape(m.get('artists') or '')} - {html.escape(m.get('title') or '')}\n"
+        f"⏱ {m.get('time_pos', 0)} / {m.get('duration', 0)} сек"
+    )
 
 
 def system_keyboard():
@@ -313,18 +373,69 @@ async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ai_status_handler(update, context)
 
 
-async def show_music_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    text = "🎵 <b>Управление музыкой</b>\n\nСинхронизация библиотеки с YouTube Music и перенос на iPod."
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Синхронизация (Полная)", callback_data="music_sync_full")],
-        [InlineKeyboardButton("📤 Только перенос", callback_data="ipod_sync_push")],
+def music_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Моя волна", callback_data="music_wave_start")],
+        [InlineKeyboardButton("⏯ Пауза", callback_data="music_pause"),
+         InlineKeyboardButton("⏭ Далее", callback_data="music_next")],
+        [InlineKeyboardButton("⏹ Стоп", callback_data="music_stop"),
+         InlineKeyboardButton("ℹ️ Сейчас играет", callback_data="music_status")],
+        [InlineKeyboardButton("📶 Bluetooth", callback_data="music_bt_menu")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_system")],
     ])
+
+
+def bluetooth_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for device in list_paired_devices():
+        label = f"{'✅' if device.connected else '📶'} {device.name}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"music_bt_connect::{device.mac}")])
+    if not rows:
+        rows.append([InlineKeyboardButton("Нет спаренных устройств", callback_data="music_bt_refresh")])
+    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data="music_bt_refresh")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="music_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_music_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        status_text = music_now_playing_text()
+    except Exception as exc:
+        status_text = f"ℹ️ Плеер ещё не запущен.\n<code>{html.escape(str(exc))}</code>"
+
+    text = (
+        "🎵 <b>Яндекс Музыка</b>\n\n"
+        "Управление локальным плеером на Raspberry Pi.\n\n"
+        f"{status_text}"
+    )
+    keyboard = music_keyboard()
     if query:
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
     else:
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def show_bluetooth_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    devices = list_paired_devices()
+    if devices:
+        lines = [
+            f"{'✅' if device.connected else '•'} <code>{device.mac}</code> {html.escape(device.name)}"
+            for device in devices
+        ]
+        text = "📶 <b>Bluetooth-устройства</b>\n\n" + "\n".join(lines)
+    else:
+        text = (
+            "📶 <b>Bluetooth-устройства</b>\n\n"
+            "Пока нет спаренных колонок. Спарьте колонку через `bluetoothctl`, "
+            "после этого она появится здесь."
+        )
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=bluetooth_keyboard())
+    except BadRequest as exc:
+        if "Message is not modified" not in str(exc):
+            raise
 
 
 async def process_scroll_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -350,19 +461,83 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
     if data == "music_menu":
         await show_music_menu(update, context)
         return True
-    if data == "music_sync_full":
-        await query.answer("🎵 Запускаю синхронизацию...")
+    if data == "music_wave_start":
+        await query.answer("🎵 Запускаю Мою волну...")
         try:
-            subprocess.Popen(["python3", "/root/music_sync/sync.py"])
+            result = music_api("wave")
+            if not (result.get("ok") or result.get("accepted")):
+                raise RuntimeError(result.get("error") or "wave failed")
+            m = result.get("music") or {}
+            if m.get("buffering"):
+                message = "⏳ Запускаю Мою волну…"
+            else:
+                message = f"▶️ {html.escape(m.get('artists') or '')} - {html.escape(m.get('title') or '')}"
+            await query.message.edit_text(
+                message,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К музыке", callback_data="music_menu")]]),
+            )
         except Exception as e:
-            await query.message.reply_text(f"❌ Ошибка запуска: {e}")
+            await query.message.reply_text(f"❌ Ошибка запуска волны: {html.escape(str(e))}", parse_mode="HTML")
         return True
-    if data == "ipod_sync_push":
-        await query.answer("🚀 Запускаю перенос...")
+    if data == "music_pause":
         try:
-            subprocess.Popen(["python3", "/root/music_sync/sync.py", "--push-only"])
+            result = music_api("pause")
+            if not (result.get("ok") or result.get("accepted")):
+                raise RuntimeError(result.get("error") or "pause failed")
+            m = result.get("music") or {}
+            message = "⏸ Пауза" if m.get("paused") else "▶️ Продолжил"
+            await query.answer(message)
         except Exception as e:
-            await query.message.reply_text(f"❌ Ошибка запуска: {e}")
+            await query.message.reply_text(f"❌ Ошибка паузы: {html.escape(str(e))}", parse_mode="HTML")
+        await show_music_menu(update, context)
+        return True
+    if data == "music_next":
+        await query.answer("⏭ Переключаю трек...")
+        try:
+            result = music_api("next")
+            if not (result.get("ok") or result.get("accepted")):
+                raise RuntimeError(result.get("error") or "next failed")
+            m = result.get("music") or {}
+            message = f"⏭ {m.get('artists') or ''} - {m.get('title') or ''}".strip(" -") or "⏭ Далее"
+            await query.message.reply_text(html.escape(message), parse_mode="HTML")
+        except Exception as e:
+            await query.message.reply_text(f"❌ Ошибка next: {html.escape(str(e))}", parse_mode="HTML")
+        await show_music_menu(update, context)
+        return True
+    if data == "music_stop":
+        try:
+            result = music_api("stop")
+            if not (result.get("ok") or result.get("accepted")):
+                raise RuntimeError(result.get("error") or "stop failed")
+            await query.answer("⏹ Стоп")
+            await query.message.reply_text("⏹ Воспроизведение остановлено.", parse_mode="HTML")
+        except Exception as e:
+            await query.message.reply_text(f"❌ Ошибка stop: {html.escape(str(e))}", parse_mode="HTML")
+        await show_music_menu(update, context)
+        return True
+    if data == "music_status":
+        await show_music_menu(update, context)
+        return True
+    if data == "music_bt_menu":
+        await show_bluetooth_menu(update, context)
+        return True
+    if data == "music_bt_refresh":
+        await show_bluetooth_menu(update, context)
+        return True
+    if data.startswith("music_bt_connect::"):
+        mac = data.split("::", 1)[1]
+        await query.answer("📶 Подключаю колонку...")
+        try:
+            ok, output = connect_device(mac)
+            prefix = "✅ Устройство подключено." if ok else "⚠️ Подключение не подтверждено."
+            await query.message.reply_text(
+                f"{prefix}\n\n<code>{html.escape(output[-3000:])}</code>",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            await query.message.reply_text(f"❌ Ошибка Bluetooth: {html.escape(str(e))}", parse_mode="HTML")
+        await show_bluetooth_menu(update, context)
         return True
     if data == "back_to_system":
         await show_system_menu(update, context)
