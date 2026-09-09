@@ -36,6 +36,14 @@
 - **Thread Safety:** Use the global `db_lock` in `database.py` for all write operations to prevent `database is locked` errors.
 - **Deduplication:** Always deduplicate vacancies by both URL and a hash of `Company + Title`.
 
+<<<<<<< HEAD
+=======
+## Deployment & Service Management
+- **Systemd:** Use `gamebot.service` for managing the bot on Linux.
+- **Clean Restarts:** Always include `KillMode=control-group` and `TimeoutStopSec=10` in the service configuration to ensure orphaned processes (like Playwright instances) are terminated.
+- **Auto-Restart:** The bot is configured to restart via `sudo systemctl restart gamebot.service` when triggered from Telegram.
+
+>>>>>>> refactor/packages
 ## File Structure Conventions
 - `bot.py`: Main entry point and service orchestration.
 - `job_fetcher.py`: All logic for gathering raw vacancy data.
