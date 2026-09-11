@@ -24,7 +24,13 @@ from system.repo import set_oled_config
 _MUSIC_ROOT = "/root"
 if _MUSIC_ROOT not in sys.path:
     sys.path.insert(0, _MUSIC_ROOT)
-from music.bluetooth import connect_device, list_paired_devices
+from music.bluetooth import (
+    connect_device,
+    disconnect_device,
+    is_bluetooth_powered,
+    list_paired_devices,
+    set_bluetooth_power,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +95,9 @@ def system_keyboard():
         [InlineKeyboardButton("📊 Статус RPi", callback_data="cmd_status"),
          InlineKeyboardButton("🤖 Local AI", callback_data="cmd_ai")],
         [InlineKeyboardButton("🎵 Музыка", callback_data="music_menu"),
-         InlineKeyboardButton("📺 OLED Дисплей", callback_data="oled_menu")],
-        [InlineKeyboardButton("⚙️ Настройки", callback_data="set_back")],
+         InlineKeyboardButton("📶 Bluetooth", callback_data="music_bt_menu")],
+        [InlineKeyboardButton("📺 OLED Дисплей", callback_data="oled_menu"),
+         InlineKeyboardButton("⚙️ Настройки", callback_data="set_back")],
         [InlineKeyboardButton("🔄 Перезапуск", callback_data="set_restart")],
     ])
 
@@ -386,14 +393,31 @@ def music_keyboard() -> InlineKeyboardMarkup:
 
 
 def bluetooth_keyboard() -> InlineKeyboardMarkup:
+    is_on = is_bluetooth_powered()
     rows = []
-    for device in list_paired_devices():
-        label = f"{'✅' if device.connected else '📶'} {device.name}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"music_bt_connect::{device.mac}")])
-    if not rows:
-        rows.append([InlineKeyboardButton("Нет спаренных устройств", callback_data="music_bt_refresh")])
-    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data="music_bt_refresh")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="music_menu")])
+    if is_on:
+        devices = list_paired_devices()
+        for device in devices:
+            dev_name = device.name or device.mac
+            if len(dev_name) > 22:
+                dev_name = dev_name[:20] + "…"
+            if device.connected:
+                label = f"🔌 Отключить: {dev_name}"
+                cb = f"music_bt_disconnect::{device.mac}"
+            else:
+                label = f"📶 Подключить: {dev_name}"
+                cb = f"music_bt_connect::{device.mac}"
+            rows.append([InlineKeyboardButton(label, callback_data=cb)])
+        if not devices:
+            rows.append([InlineKeyboardButton("Нет спаренных устройств", callback_data="music_bt_refresh")])
+        rows.append([InlineKeyboardButton("⚡️ Выключить Bluetooth", callback_data="music_bt_power::off")])
+    else:
+        rows.append([InlineKeyboardButton("⚡️ Включить Bluetooth", callback_data="music_bt_power::on")])
+
+    rows.append([
+        InlineKeyboardButton("🔄 Обновить", callback_data="music_bt_refresh"),
+        InlineKeyboardButton("⬅️ Назад", callback_data="music_menu"),
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -418,24 +442,38 @@ async def show_music_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_bluetooth_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    devices = list_paired_devices()
-    if devices:
-        lines = [
-            f"{'✅' if device.connected else '•'} <code>{device.mac}</code> {html.escape(device.name)}"
-            for device in devices
-        ]
-        text = "📶 <b>Bluetooth-устройства</b>\n\n" + "\n".join(lines)
+    is_on = is_bluetooth_powered()
+    status_icon = "🟢" if is_on else "🔴"
+    status_text = "Включен" if is_on else "Выключен"
+
+    header = f"📶 <b>Bluetooth</b>: {status_icon} <b>{status_text}</b>\n\n"
+    if not is_on:
+        text = header + "Адаптер Bluetooth выключен. Нажмите «Включить Bluetooth», чтобы активировать."
     else:
-        text = (
-            "📶 <b>Bluetooth-устройства</b>\n\n"
-            "Пока нет спаренных колонок. Спарьте колонку через `bluetoothctl`, "
-            "после этого она появится здесь."
-        )
-    try:
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=bluetooth_keyboard())
-    except BadRequest as exc:
-        if "Message is not modified" not in str(exc):
-            raise
+        devices = list_paired_devices()
+        if devices:
+            lines = [
+                f"{'🟢' if device.connected else '⚪️'} <code>{device.mac}</code> {html.escape(device.name or 'Без имени')} "
+                f"({'Подключено' if device.connected else 'Отключено'})"
+                for device in devices
+            ]
+            text = header + "<b>Устройства:</b>\n" + "\n".join(lines)
+        else:
+            text = (
+                header +
+                "Пока нет спаренных устройств. Спарьте колонку через <code>bluetoothctl</code>, "
+                "после этого она появится здесь."
+            )
+
+    keyboard = bluetooth_keyboard()
+    if query:
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+        except BadRequest as exc:
+            if "Message is not modified" not in str(exc):
+                raise
+    else:
+        await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def process_scroll_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -539,6 +577,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
             await query.message.reply_text(f"❌ Ошибка Bluetooth: {html.escape(str(e))}", parse_mode="HTML")
         await show_bluetooth_menu(update, context)
         return True
+    if data.startswith("music_bt_disconnect::"):
+        mac = data.split("::", 1)[1]
+        await query.answer("🔌 Отключаю устройство...")
+        try:
+            ok, output = disconnect_device(mac)
+            prefix = "✅ Устройство отключено." if ok else "⚠️ Не удалось отключить устройство."
+            clean_out = output.strip()
+            msg = f"{prefix}\n\n<code>{html.escape(clean_out[-2000:])}</code>" if clean_out else prefix
+            await query.message.reply_text(msg, parse_mode="HTML")
+        except Exception as e:
+            await query.message.reply_text(f"❌ Ошибка Bluetooth: {html.escape(str(e))}", parse_mode="HTML")
+        await show_bluetooth_menu(update, context)
+        return True
+    if data.startswith("music_bt_power::"):
+        action = data.split("::", 1)[1]
+        turn_on = (action == "on")
+        action_text = "Включаю Bluetooth..." if turn_on else "Выключаю Bluetooth..."
+        await query.answer(f"⚡️ {action_text}")
+        try:
+            ok, output = set_bluetooth_power(turn_on)
+            state_word = "включен" if turn_on else "выключен"
+            prefix = f"✅ Bluetooth {state_word}." if ok else "⚠️ Не удалось изменить состояние Bluetooth."
+            clean_out = output.strip()
+            msg = f"{prefix}\n\n<code>{html.escape(clean_out[-2000:])}</code>" if clean_out else prefix
+            await query.message.reply_text(msg, parse_mode="HTML")
+        except Exception as e:
+            await query.message.reply_text(f"❌ Ошибка питания Bluetooth: {html.escape(str(e))}", parse_mode="HTML")
+        await show_bluetooth_menu(update, context)
+        return True
     if data == "back_to_system":
         await show_system_menu(update, context)
         return True
@@ -555,8 +622,61 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
     return None
 
 
+@admin_only
+async def bt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_bluetooth_menu(update, context)
+
+
+@admin_only
+async def bt_power_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        ok, output = set_bluetooth_power(True)
+        status = "✅ Bluetooth включен." if ok else "⚠️ Не удалось включить Bluetooth."
+        clean_out = output.strip()
+        msg = f"{status}\n\n<code>{html.escape(clean_out[-1000:])}</code>" if clean_out else status
+        await update.effective_message.reply_text(msg, parse_mode="HTML")
+    except Exception as exc:
+        await update.effective_message.reply_text(f"❌ Ошибка: {html.escape(str(exc))}", parse_mode="HTML")
+
+
+@admin_only
+async def bt_power_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        ok, output = set_bluetooth_power(False)
+        status = "✅ Bluetooth выключен." if ok else "⚠️ Не удалось выключить Bluetooth."
+        clean_out = output.strip()
+        msg = f"{status}\n\n<code>{html.escape(clean_out[-1000:])}</code>" if clean_out else status
+        await update.effective_message.reply_text(msg, parse_mode="HTML")
+    except Exception as exc:
+        await update.effective_message.reply_text(f"❌ Ошибка: {html.escape(str(exc))}", parse_mode="HTML")
+
+
+@admin_only
+async def bt_disconnect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mac = context.args[0] if context.args else None
+    if not mac:
+        connected = [d for d in list_paired_devices() if d.connected]
+        if not connected:
+            await update.effective_message.reply_text("ℹ️ Нет подключенных Bluetooth-устройств.")
+            return
+        mac = connected[0].mac
+    try:
+        ok, output = disconnect_device(mac)
+        status = f"✅ Устройство <code>{mac}</code> отключено." if ok else f"⚠️ Не удалось отключить <code>{mac}</code>."
+        clean_out = output.strip()
+        msg = f"{status}\n\n<code>{html.escape(clean_out[-1000:])}</code>" if clean_out else status
+        await update.effective_message.reply_text(msg, parse_mode="HTML")
+    except Exception as exc:
+        await update.effective_message.reply_text(f"❌ Ошибка: {html.escape(str(exc))}", parse_mode="HTML")
+
+
 def register(app):
     app.add_handler(CommandHandler("restart", restart_bot))
     app.add_handler(CommandHandler("ai", ai_command))
+    app.add_handler(CommandHandler("bt", bt_command))
+    app.add_handler(CommandHandler("bluetooth", bt_command))
+    app.add_handler(CommandHandler("bton", bt_power_on_command))
+    app.add_handler(CommandHandler("btoff", bt_power_off_command))
+    app.add_handler(CommandHandler("btdisconnect", bt_disconnect_command))
     app.add_handler(CallbackQueryHandler(oled_menu_handler, pattern="^oled_menu$"))
     app.add_handler(CallbackQueryHandler(oled_callback_handler, pattern="^oled_(pwr|scr|restart|mode_)"))

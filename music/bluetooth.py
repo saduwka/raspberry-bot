@@ -168,6 +168,18 @@ def _device_connected(mac: str) -> bool:
     return "Connected: yes" in output
 
 
+def connected_device_name() -> str:
+    """Return alias/name of the first connected Bluetooth audio device."""
+    output = _bt("devices", "Connected")
+    for raw in output.splitlines():
+        match = re.match(r"Device ([0-9A-F:]{17}) (.+)", raw.strip())
+        if match:
+            name = (match.group(2) or "").strip()
+            if name:
+                return name
+    return ""
+
+
 def list_paired_devices() -> list[BluetoothDevice]:
     output = _bt("devices")
     connected_output = _bt("devices", "Connected")
@@ -317,7 +329,30 @@ def connect_device(mac: str) -> tuple[bool, str]:
     return ok, message
 
 
+def is_bluetooth_powered() -> bool:
+    """Check if the Bluetooth controller is powered on."""
+    output = _bt("show")
+    return "Powered: yes" in output
+
+
+def set_bluetooth_power(power_on: bool) -> tuple[bool, str]:
+    """Turn Bluetooth controller power on or off."""
+    action = "on" if power_on else "off"
+    output = _bt("power", action)
+    time.sleep(0.5)
+    current = is_bluetooth_powered()
+    ok = (current == power_on)
+    if power_on and ok:
+        try:
+            ensure_audio_stack()
+        except Exception:
+            pass
+    return ok, output
+
+
 def disconnect_device(mac: str) -> tuple[bool, str]:
+    """Disconnect a Bluetooth device by MAC address."""
     output = _bt("disconnect", mac)
-    ok = "Successful disconnected" in output or "successful disconnected" in output.lower()
+    time.sleep(0.5)
+    ok = ("successful disconnected" in output.lower() or not _device_connected(mac))
     return ok, output

@@ -5,11 +5,8 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-<<<<<<< HEAD
-=======
 GEMINI_JOB_API_KEY = os.getenv("GEMINI_JOB_API_KEY") or GEMINI_API_KEY
 GEMINI_TRADE_API_KEY = os.getenv("GEMINI_TRADE_API_KEY") or GEMINI_API_KEY
->>>>>>> refactor/packages
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 
@@ -32,21 +29,14 @@ TRADE_TAKE_PROFIT_PCT = float(os.getenv("TRADE_TAKE_PROFIT_PCT", "0.03"))
 
 # Risk Management
 MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "5"))
-<<<<<<< HEAD
-=======
 MAX_DAILY_LOSS_USDT = float(os.getenv("MAX_DAILY_LOSS_USDT", "100"))
 ENTRY_COOLDOWN_SECONDS = int(os.getenv("ENTRY_COOLDOWN_SECONDS", "900"))
->>>>>>> refactor/packages
 MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "0.05")) # 5% от депо
 TRADE_RISK_PER_TRADE_USDT = float(os.getenv("TRADE_RISK_PER_TRADE_USDT", "10.0")) # Риск в долларах на сделку
 
 GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.2"))
 JOB_MIN_SCORE = int(os.getenv("JOB_MIN_SCORE", "6"))
 JOB_REQUIRE_WORLDWIDE = os.getenv("JOB_REQUIRE_WORLDWIDE", "False").lower() == "true"
-<<<<<<< HEAD
-RESUME_URL = os.getenv("RESUME_URL", "https://your-resume-link.com")
-
-=======
 JOB_AI_SCORE_LIMIT = int(os.getenv("JOB_AI_SCORE_LIMIT", "50"))
 JOB_AI_BATCH_SIZE = int(os.getenv("JOB_AI_BATCH_SIZE", "8"))
 JOB_RAW_QUEUE_LIMIT = int(os.getenv("JOB_RAW_QUEUE_LIMIT", "200"))
@@ -65,7 +55,6 @@ AI_PROVIDER = os.getenv("AI_PROVIDER", "local").lower()
 YANDEX_MUSIC_TOKEN = os.getenv("YANDEX_MUSIC_TOKEN")
 YANDEX_MUSIC_WAVE_STATION = os.getenv("YANDEX_MUSIC_WAVE_STATION", "user:onyourwave")
 
->>>>>>> refactor/packages
 DB_PATH = "bot.db"
 
 GAMING_KEYWORDS = [
