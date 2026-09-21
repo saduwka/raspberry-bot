@@ -1,3 +1,4 @@
+import html
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -6,6 +7,8 @@ from trade.repo import get_trade_state, set_trade_state
 logger = logging.getLogger(__name__)
 
 POLICY_KEY = "trader_policy"
+LESSONS_KEY = "trader_lessons"
+LESSONS_MAX = 10
 PATCH_COOLDOWN = timedelta(hours=6)
 SILENCE_NOTICE_COOLDOWN = timedelta(days=1)
 BOOT_SILENCE_DAYS = 14
@@ -90,11 +93,13 @@ def policy_can_patch(policy: dict) -> bool:
     return datetime.now(timezone.utc) - last >= PATCH_COOLDOWN
 
 
-async def apply_policy_patch(policy: dict, patch: dict | None) -> tuple[dict, str | None]:
+async def apply_policy_patch(
+    policy: dict, patch: dict | None, force: bool = False,
+) -> tuple[dict, str | None]:
     """Merge AI patch. Returns (policy, notify_text_or_none)."""
     if not isinstance(patch, dict):
         return policy, None
-    if not policy_can_patch(policy):
+    if not force and not policy_can_patch(policy):
         logger.info("Ignoring policy_patch: cooldown")
         return policy, None
 
@@ -114,7 +119,7 @@ async def apply_policy_patch(policy: dict, patch: dict | None) -> tuple[dict, st
             if key in patch and patch[key] is not None:
                 merged[key] = patch[key]
 
-    why = str(patch.get("why") or "policy_patch").strip()[:200]
+    why = str(patch.get("why") or "policy_patch").strip().replace("<", "")[:200]
     merged["last_patch_at"] = datetime.now(timezone.utc).isoformat()
     merged["last_patch_why"] = why
     saved = await save_policy(merged)
@@ -126,9 +131,72 @@ async def apply_policy_patch(policy: dict, patch: dict | None) -> tuple[dict, st
         f"⚙️ <b>Политика трейдера обновлена</b>\n"
         f"Агрессия: <code>{saved['aggression']}/5</code>\n"
         f"{changed}\n"
-        f"Почему: <i>{why}</i>"
+        f"Почему: <i>{html.escape(why)}</i>"
     )
     return saved, text
+
+
+async def load_trade_lessons(limit: int = 5) -> list:
+    stored = await get_trade_state(LESSONS_KEY, "GLOBAL")
+    if not isinstance(stored, list):
+        return []
+    return stored[-limit:]
+
+
+async def append_trade_lesson(pair: str, pnl: float, lesson: str) -> list:
+    stored = await get_trade_state(LESSONS_KEY, "GLOBAL")
+    lessons = list(stored) if isinstance(stored, list) else []
+    lessons.append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "pair": pair,
+        "pnl": round(float(pnl), 4),
+        "lesson": str(lesson or "").strip().replace("<", "")[:400],
+    })
+    lessons = lessons[-LESSONS_MAX:]
+    await set_trade_state(LESSONS_KEY, lessons, "GLOBAL")
+    return lessons
+
+
+async def review_closed_trade(policy: dict, trade_ctx: dict) -> tuple[dict, str | None]:
+    """LLM-разбор закрытой сделки: урок в память + optional policy_patch."""
+    from ai.trading import analyze_closed_trade
+
+    pnl = float(trade_ctx.get("pnl") or 0.0)
+    pair = str(trade_ctx.get("pair") or "?")
+    review = await analyze_closed_trade(trade_ctx, policy)
+    lesson = review.get("lesson") or f"Закрытие {pair}: pnl={pnl:.2f} USDT"
+    await append_trade_lesson(pair, pnl, lesson)
+
+    notify_parts = [
+        f"🧠 <b>Разбор сделки: {html.escape(pair)}</b>\n"
+        f"PnL: <code>{'+' if pnl > 0 else ''}{pnl:.2f} USDT</code>\n"
+        f"<i>{html.escape(lesson)}</i>"
+    ]
+
+    patch = review.get("policy_patch")
+    if isinstance(patch, dict):
+        policy, patch_msg = await apply_policy_patch(policy, patch, force=True)
+        if patch_msg:
+            notify_parts.append(patch_msg)
+    elif pnl < 0 and int(policy.get("aggression", 2)) > 1:
+        new_level = int(policy.get("aggression", 2)) - 1
+        merged = apply_aggression(new_level)
+        for key in ("last_silence_notice_at", "boot_notified"):
+            merged[key] = policy.get(key)
+        merged["last_patch_at"] = datetime.now(timezone.utc).isoformat()
+        merged["last_patch_why"] = f"убыток {pnl:.2f} USDT по {pair}, LLM без патча"
+        before = dict(policy)
+        policy = await save_policy(merged)
+        changed = _policy_delta(before, policy)
+        if changed:
+            notify_parts.append(
+                f"⚙️ <b>Политика трейдера обновлена</b>\n"
+                f"Агрессия: <code>{policy['aggression']}/5</code>\n"
+                f"{changed}\n"
+                f"Почему: <i>{html.escape(policy['last_patch_why'])}</i>"
+            )
+
+    return policy, "\n\n".join(notify_parts)
 
 
 async def maybe_boot_silence(policy: dict, silence_days: float | None) -> tuple[dict, str | None]:
@@ -193,7 +261,7 @@ def silence_days_from(last_trade_at) -> float | None:
 
 def format_policy(policy: dict, silence_days: float | None = None) -> str:
     silence = f"{silence_days:.0f} дн." if silence_days is not None else "нет сделок в БД"
-    why = policy.get("last_patch_why") or "—"
+    why = html.escape(str(policy.get("last_patch_why") or "—"))
     return (
         f"⚙️ <b>Политика ИИ-трейдера</b>\n\n"
         f"Агрессия: <code>{policy['aggression']}/5</code>\n"

@@ -3,7 +3,7 @@ import logging
 import asyncio
 
 from ai import client as local_llm
-from core.html import clean_html
+from core.html import clean_html, ensure_valid_html
 from core.jsonutil import extract_json
 
 logger = logging.getLogger(__name__)
@@ -43,6 +43,7 @@ async def evaluate_cycle(snapshots, policy, stats, retries=1):
 - BUY при уже открытой позиции — HOLD (не удваивать).
 - risk_usdt в 5..20. Стоп нельзя выключить.
 - policy_patch не обязателен, кроме тишины >= 7 дней.
+- Учитывай recent_lessons из статистики (уроки прошлых сделок).
 
 Верни ТОЛЬКО JSON:
 {{
@@ -133,6 +134,68 @@ policy_patch пример: {{"aggression": 4, "adx_min": 12, "why": "0 trades in
     return {"decisions": fallback, "policy_patch": None, "ok": False}
 
 
+async def analyze_closed_trade(trade_ctx: dict, policy: dict, retries=1) -> dict:
+    """Разбор закрытой сделки: lesson + optional policy_patch."""
+    pnl = float(trade_ctx.get("pnl") or 0.0)
+    outcome = "profit" if pnl > 0 else ("loss" if pnl < 0 else "flat")
+    prompt = f"""Ты — тренер торгового бота. Разбери закрытую сделку и извлеки урок.
+
+Сделка:
+{json.dumps(trade_ctx, ensure_ascii=False, default=str)}
+
+Политика сейчас:
+{json.dumps({k: policy.get(k) for k in ("aggression","adx_min","rsi_buy_max","require_volume","min_confidence","risk_usdt","atr_stop","atr_tp","max_daily_buys")}, ensure_ascii=False)}
+
+Исход: {outcome} (pnl={pnl}).
+
+Правила:
+- lesson: 1-2 предложения по-русски, без символа <.
+- После убытка обычно ужесточи фильтры (ниже aggression / выше adx_min / ниже rsi_buy_max / выше min_confidence). Не поднимай aggression после лосса.
+- После профита обычно policy_patch: null; меняй только при явном перекосе риска.
+- why в патче коротко по-русски, без <.
+
+Верни ТОЛЬКО JSON:
+{{"lesson": "...", "policy_patch": null}}
+или
+{{"lesson": "...", "policy_patch": {{"aggression": 2, "adx_min": 20, "why": "..."}}}}
+"""
+
+    for attempt in range(retries + 1):
+        try:
+            text = await local_llm.chat(prompt)
+            if not text:
+                logger.error("Closed-trade review attempt %s: %s", attempt + 1, local_llm.last_error)
+                await asyncio.sleep(1)
+                continue
+            data = extract_json(text)
+            if not isinstance(data, dict):
+                logger.info("Closed-trade review attempt %s: invalid JSON", attempt + 1)
+                await asyncio.sleep(1)
+                continue
+            lesson = str(data.get("lesson") or "").strip().replace("<", "")[:400]
+            patch = data.get("policy_patch")
+            if patch is not None and not isinstance(patch, dict):
+                patch = None
+            if patch and pnl < 0 and patch.get("aggression") is not None:
+                try:
+                    if int(patch["aggression"]) > int(policy.get("aggression", 2)):
+                        patch["aggression"] = policy.get("aggression", 2)
+                except (TypeError, ValueError):
+                    pass
+            if not lesson:
+                lesson = f"Закрытие {trade_ctx.get('pair')}: pnl={pnl:.2f} USDT"
+            return {"lesson": lesson, "policy_patch": patch, "ok": True}
+        except Exception as e:
+            logger.error("Closed-trade review attempt %s: %s", attempt + 1, e)
+            await asyncio.sleep(1)
+
+    return {
+        "lesson": f"Закрытие {trade_ctx.get('pair')}: pnl={pnl:.2f} USDT (LLM недоступна)",
+        "policy_patch": None,
+        "ok": False,
+    }
+
+
 async def generate_daily_analytics(trades_summary, policy=None, silence_days=None):
     """Генерирует аналитический отчет по итогам торгового дня через локальную модель."""
     extra = ""
@@ -158,11 +221,16 @@ async def generate_daily_analytics(trades_summary, policy=None, silence_days=Non
     try:
         text = await local_llm.chat(prompt)
         if text:
-            return clean_html(text)
+            cleaned = clean_html(text)
+            if cleaned.strip():
+                logger.debug("Daily analytics cleaned HTML: %s", cleaned[:100] + "..." if len(cleaned) > 100 else cleaned)
+                return ensure_valid_html(cleaned)
         logger.error("Daily analytics local failed: %s", local_llm.last_error)
+        return (
+            f"Не удалось сгенерировать аналитику: локальная модель недоступна "
+            f"({local_llm.last_error or 'нет ответа'})."
+        )
     except Exception as e:
         logger.error("Daily analytics generation error: %s", e)
-    return (
-        f"Не удалось сгенерировать аналитику: локальная модель недоступна "
-        f"({local_llm.last_error or 'нет ответа'})."
-    )
+        return f"Не удалось сгенерировать аналитику: {e}."
+

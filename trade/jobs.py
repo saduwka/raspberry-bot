@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timezone
 
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from ai.trading import evaluate_cycle, generate_daily_analytics
@@ -14,14 +15,17 @@ from config import (
     PAPER_MODE,
     TRADE_PAIRS,
 )
+from core.html import ensure_valid_html
 from news.repo import get_recent_sentiments
 from trade import engine as trade_engine
 from trade.policy import (
     apply_policy_patch,
     format_policy,
     load_policy,
+    load_trade_lessons,
     maybe_boot_silence,
     maybe_escalate_silence,
+    review_closed_trade,
     silence_days_from,
 )
 from trade.repo import (
@@ -31,6 +35,7 @@ from trade.repo import (
     get_trade_state,
     set_trade_state,
 )
+from trade.wallet import can_open_position, get_wallet_summary
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +73,16 @@ def _in_cooldown(last_entry_at) -> bool:
 async def _notify(bot, text: str):
     try:
         await bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+    except BadRequest as e:
+        if "Can't parse entities" in str(e):
+            logger.warning("HTML parse failed, retrying plain text: %s", e)
+            try:
+                await bot.send_message(chat_id=ADMIN_ID, text=text)
+                return
+            except Exception as retry_err:
+                logger.error("Failed to send trade message (plain): %s", retry_err)
+                return
+        logger.error("Failed to send trade message: %s", e)
     except Exception as e:
         logger.error("Failed to send trade message: %s", e)
 
@@ -178,6 +193,7 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
         "buys_today": buy_trades_count,
         "pnl_today": round(total_daily_pnl, 2),
         "max_daily_loss_usdt": MAX_DAILY_LOSS_USDT,
+        "recent_lessons": await load_trade_lessons(5),
     }
     cycle = await evaluate_cycle(snapshots, policy, stats)
     logger.info(
@@ -243,6 +259,10 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
             if _in_cooldown(await get_trade_state("last_entry_at", pair)):
                 logger.info("Cooldown active, skip BUY for %s", pair)
                 continue
+            can_buy, wallet_reason = await can_open_position(pair)
+            if not can_buy:
+                logger.info("Wallet limit reached, skip BUY for %s: %s", pair, wallet_reason)
+                continue
             if buy_trades_count >= int(policy["max_daily_buys"]):
                 logger.warning("Daily buy limit reached (%s). Skipping BUY for %s.",
                                policy["max_daily_buys"], pair)
@@ -297,6 +317,13 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     pnl_text = f"\nРезультат: <b>{pnl:.2f} USDT</b>"
 
+            wallet_sum = await get_wallet_summary({pair: exec_price})
+            wallet_info_text = (
+                f"\n💼 <b>Кошелек:</b> <code>{wallet_sum['cash_kzt']:,.0f} ₸</code> "
+                f"(<code>{wallet_sum['cash_usdt']:.2f} USDT</code>) свободно | "
+                f"Слоты: <code>{wallet_sum['positions_count']}/{wallet_sum['max_positions']}</code>"
+            )
+
             text = (
                 f"{side_emoji} <b>{side_text}: {pair}</b>\n\n"
                 f"Цена {'входа' if signal == 'BUY' else 'выхода'}: <code>{exec_price}</code>\n"
@@ -305,9 +332,25 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
                 f"Агрессия: <code>{policy['aggression']}/5</code>\n"
                 f"local/qwen3.5-coder: <code>{ai_decision['action']}</code> ({ai_decision['confidence']:.2f})\n"
                 f"Причина: <code>{html.escape(str(ai_decision['reason']))}</code>{pnl_text}\n"
+                f"{wallet_info_text}\n"
                 f"Режим: {'🧪 PAPER' if PAPER_MODE else '💰 LIVE'}"
             )
             await _notify(context.bot, text)
+
+            if signal == "SELL":
+                trade_ctx = {
+                    "pair": pair,
+                    "entry_price": trade_result.get("entry_price"),
+                    "exit_price": exec_price,
+                    "qty": exec_qty,
+                    "pnl": float(pnl or 0.0),
+                    "ai_action": ai_decision.get("action"),
+                    "ai_reason": ai_decision.get("reason"),
+                    "ai_confidence": ai_decision.get("confidence"),
+                }
+                policy, review_msg = await review_closed_trade(policy, trade_ctx)
+                if review_msg:
+                    await _notify(context.bot, review_msg)
 
 
 async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE = None):
@@ -326,6 +369,17 @@ async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE,
 
     rows = await get_daily_trades(24)
     policy_block = format_policy(policy, silence_days)
+    wallet_sum = await get_wallet_summary()
+    pnl_sign = "+" if wallet_sum["total_pnl_usdt"] >= 0 else ""
+    wallet_block = (
+        f"💼 <b>Кошелек:</b>\n"
+        f"Депозит: <code>{wallet_sum['initial_kzt']:,.0f} ₸</code> ({wallet_sum['initial_usdt']:.2f} USDT)\n"
+        f"Свободно: <code>{wallet_sum['cash_kzt']:,.0f} ₸</code> ({wallet_sum['cash_usdt']:.2f} USDT)\n"
+        f"Оценка (Equity): <code>{wallet_sum['equity_kzt']:,.0f} ₸</code> ({wallet_sum['equity_usdt']:.2f} USDT)\n"
+        f"Общий PnL: <code>{pnl_sign}{wallet_sum['total_pnl_kzt']:,.0f} ₸</code> "
+        f"({pnl_sign}{wallet_sum['total_pnl_usdt']:.2f} USDT / {pnl_sign}{wallet_sum['roi_pct']}%)\n"
+        f"Слоты: <code>{wallet_sum['positions_count']}/{wallet_sum['max_positions']}</code>\n"
+    )
 
     if not rows:
         logger.info("No trades today, sending empty status report.")
@@ -334,6 +388,7 @@ async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE,
             f"PnL: <code>0.00 USDT</code>\n"
             f"Сделок: <code>0</code>\n"
             f"Статус: <i>Активен, сделок не было.</i>\n\n"
+            f"{wallet_block}\n"
             f"{policy_block}"
         )
         await _notify(context.bot, header)
@@ -364,12 +419,14 @@ async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE,
 
     winrate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
     ai_report = await generate_daily_analytics(trades_summary, policy=policy, silence_days=silence_days)
+    ai_report = ensure_valid_html(ai_report)
 
     header = (
         f"💰 <b>Статистика за 24ч:</b>\n"
         f"PnL: <code>{total_pnl:.2f} USDT</code>\n"
         f"Сделок: <code>{len(trades_summary)}</code> (W:{wins} / L:{losses})\n"
         f"Winrate: <code>{winrate:.1f}%</code>\n\n"
+        f"{wallet_block}\n"
         f"{policy_block}\n\n"
     )
     await _notify(context.bot, header + ai_report)

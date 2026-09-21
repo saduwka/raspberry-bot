@@ -7,6 +7,7 @@ from trade.repo import get_last_trade_at, get_trade_stats, get_open_position, ge
 from config import PAPER_MODE, TRADE_PAIRS, TRADE_QTY
 from trade import engine as trade_engine
 from trade.policy import format_policy, load_policy, silence_days_from
+from trade.wallet import format_wallet_message, get_wallet_summary, reset_wallet
 
 logger = logging.getLogger(__name__)
 
@@ -32,20 +33,38 @@ def trade_keyboard(pair=None):
         InlineKeyboardButton("🧠 Сигнал", callback_data=f"trade_signal_{active_pair}")
     ])
     keyboard.append([
+        InlineKeyboardButton("💼 Кошелек", callback_data="trade_wallet"),
         InlineKeyboardButton("⚙️ Политика", callback_data="trade_policy"),
-        InlineKeyboardButton("🔄 Обновить", callback_data=f"trade_refresh_{active_pair}"),
     ])
     keyboard.append([
-        InlineKeyboardButton("📈 Меню", callback_data="trade_menu")
+        InlineKeyboardButton("🔄 Обновить", callback_data=f"trade_refresh_{active_pair}"),
+        InlineKeyboardButton("📈 Меню", callback_data="trade_menu"),
     ])
     
     return InlineKeyboardMarkup(keyboard)
 
+def wallet_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Обновить", callback_data="trade_wallet_refresh"),
+            InlineKeyboardButton("⚙️ Сбросить (10 000 ₸)", callback_data="trade_wallet_reset"),
+        ],
+        [
+            InlineKeyboardButton("📈 Меню пар", callback_data="trade_menu"),
+        ],
+    ])
+
 async def show_trade_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # По умолчанию показываем первую пару
     pair = TRADE_PAIRS[0]
+    wallet_sum = await get_wallet_summary()
+    pnl_sign = "+" if wallet_sum["total_pnl_usdt"] >= 0 else ""
     text = (
         f"📈 <b>Трейдинг: {pair}</b>\n\n"
+        f"💼 <b>Кошелек:</b> <code>{wallet_sum['equity_kzt']:,.0f} ₸</code> ({wallet_sum['equity_usdt']:.2f} USDT) | "
+        f"PnL: <code>{pnl_sign}{wallet_sum['total_pnl_kzt']:,.0f} ₸ ({pnl_sign}{wallet_sum['roi_pct']}%)</code>\n"
+        f"💵 <b>Свободно:</b> <code>{wallet_sum['cash_kzt']:,.0f} ₸</code> | "
+        f"🎰 <b>Слоты:</b> <code>{wallet_sum['positions_count']}/{wallet_sum['max_positions']}</code>\n\n"
         "Управление торговым модулем через кнопки. Выберите пару для просмотра деталей."
     )
     if update.callback_query:
@@ -253,6 +272,40 @@ async def trade_policy_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
+async def trade_wallet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает подробное состояние виртуального кошелька (KZT и USDT)."""
+    current_prices = {}
+    for p in TRADE_PAIRS:
+        try:
+            df = await trade_engine.fetch_ohlcv(p, limit=2)
+            if df is not None and not df.empty:
+                current_prices[p] = float(df.iloc[-1]["close"])
+        except Exception as e:
+            logger.debug("Failed to fetch price for %s: %s", p, e)
+
+    summary = await get_wallet_summary(current_prices)
+    text = format_wallet_message(summary)
+    markup = wallet_keyboard()
+
+    if update.callback_query:
+        try:
+            await update.callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                await update.callback_query.message.delete()
+                await context.bot.send_message(update.effective_chat.id, text, parse_mode="HTML", reply_markup=markup)
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def trade_wallet_reset_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сбрасывает виртуальный кошелек к начальному депозиту (10 000 ₸)."""
+    await reset_wallet()
+    if update.callback_query:
+        await update.callback_query.answer("✅ Кошелек сброшен до 10 000 ₸ (20 USDT)!")
+    await trade_wallet_handler(update, context)
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
     query = update.callback_query
     if data == "trade_menu":
@@ -274,6 +327,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
     if data == "trade_policy":
         await query.answer("⚙️ Политика")
         await trade_policy_handler(update, context)
+        return True
+    if data == "trade_wallet":
+        await query.answer("💼 Кошелек")
+        await trade_wallet_handler(update, context)
+        return True
+    if data == "trade_wallet_refresh":
+        await query.answer("🔄 Обновляю кошелек...")
+        await trade_wallet_handler(update, context)
+        return True
+    if data == "trade_wallet_reset":
+        await trade_wallet_reset_handler(update, context)
         return True
     if data.startswith("trade_signal_"):
         pair = data.replace("trade_signal_", "")

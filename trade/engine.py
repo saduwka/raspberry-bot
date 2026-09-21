@@ -149,56 +149,64 @@ def get_risk_exit_signal(current_price, entry_price, atr, highest_price=None, po
 
 
 async def execute_trade(signal, price, pair, sentiment_score=0, atr=None, policy=None):
-    """Исполняет сделку. Размер: risk_usdt / (atr * atr_stop). Стоп нельзя выключить."""
+    """Исполняет сделку строго в рамках виртуального кошелька (10 000 ₸ / 20 USDT)."""
     if signal == "HOLD":
-        return
+        return None
+
+    from trade.wallet import (
+        allocate_buy,
+        calculate_buy_qty,
+        can_open_position,
+        release_sell,
+    )
 
     logger.info("Executing %s for %s at %s (Sentiment: %s)", signal, pair, price, sentiment_score)
 
-    from config import TRADE_QTY_MAP, TRADE_RISK_PER_TRADE_USDT
-
-    risk_usdt = TRADE_RISK_PER_TRADE_USDT
-    atr_stop = 2.0
-    if policy:
-        try:
-            risk_usdt = float(policy.get("risk_usdt", risk_usdt))
-        except (TypeError, ValueError):
-            risk_usdt = TRADE_RISK_PER_TRADE_USDT
-        try:
-            atr_stop = float(policy.get("atr_stop", atr_stop))
-        except (TypeError, ValueError):
-            atr_stop = 2.0
-    risk_usdt = max(5.0, min(20.0, risk_usdt))
-    atr_stop = max(1.2, min(3.0, atr_stop))
-
-    if signal == "BUY" and atr and atr > 0:
-        try:
-            qty = risk_usdt / (atr * atr_stop)
-            logger.info("Dynamic sizing for %s: ATR=%s, Risk=%s, stop=%s -> Qty=%s",
-                        pair, atr, risk_usdt, atr_stop, f"{qty:.6f}")
-        except Exception as e:
-            logger.error("Error calculating dynamic qty: %s", e)
-            qty = TRADE_QTY_MAP.get(pair, TRADE_QTY)
-    else:
-        qty = TRADE_QTY_MAP.get(pair, TRADE_QTY)
-
     pnl = 0.0
     entry_price = None
-    trade_qty = qty
-    
-    if signal == "SELL":
-        entry_price_raw = await get_trade_state("entry_price", pair)
+    wallet_info = None
+
+    if signal == "BUY":
+        can_buy, reason = await can_open_position(pair)
+        if not can_buy:
+            logger.warning("BUY rejected by wallet for %s: %s", pair, reason)
+            return {"success": False, "reason": reason}
+
+        qty, cost = await calculate_buy_qty(pair, price)
+        if qty <= 0:
+            logger.warning("BUY rejected for %s: calculated qty is 0 or below minimum order", pair)
+            return {"success": False, "reason": "Размер ордера ниже минимального порога"}
+
+        trade_qty = qty
+        logger.info("Wallet allocated BUY for %s: qty=%s, cost=%s USDT", pair, trade_qty, cost)
+        wallet_info = await allocate_buy(pair, price, trade_qty)
+
+    elif signal == "SELL":
         stored_qty = await get_trade_state("position_qty", pair)
+        entry_price_raw = await get_trade_state("entry_price", pair)
         if entry_price_raw is not None:
             try:
                 entry_price = float(entry_price_raw)
-                trade_qty = float(stored_qty) if stored_qty is not None else qty
-                pnl = (price - entry_price) * trade_qty
-                logger.info(f"Closed trade for {pair} with PnL: {pnl:.4f} (Entry: {entry_price}, Exit: {price}, Qty: {trade_qty})")
-            except Exception as e:
-                logger.error(f"Error calculating PnL for {pair}: {e}")
+            except (TypeError, ValueError):
+                entry_price = price
         else:
-            logger.warning(f"SELL signal received for {pair} without entry_price in trade_state")
+            entry_price = price
+
+        try:
+            trade_qty = float(stored_qty) if stored_qty is not None else 0.0
+        except (TypeError, ValueError):
+            trade_qty = 0.0
+
+        if trade_qty <= 0:
+            logger.warning("SELL received for %s but position_qty is 0 or not found", pair)
+            return {"success": False, "reason": "Позиция не найдена"}
+
+        wallet_info = await release_sell(pair, price, trade_qty)
+        pnl = wallet_info.get("pnl", (price - entry_price) * trade_qty)
+        logger.info("Wallet released SELL for %s: PnL=%s USDT, cash now=%s USDT",
+                    pair, pnl, wallet_info.get("cash_usdt"))
+    else:
+        return None
 
     await save_trade(
         pair=pair,
@@ -207,9 +215,9 @@ async def execute_trade(signal, price, pair, sentiment_score=0, atr=None, policy
         qty=trade_qty,
         pnl=pnl,
         signal=f"AGGRESSIVE_{signal}",
-        sentiment=str(sentiment_score)
+        sentiment=str(sentiment_score),
     )
-    
+
     if signal == "BUY":
         await set_trade_state("current_position", "in_position", pair)
         await set_trade_state("entry_price", price, pair)
@@ -219,4 +227,11 @@ async def execute_trade(signal, price, pair, sentiment_score=0, atr=None, policy
         await set_trade_state("entry_price", None, pair)
         await set_trade_state("position_qty", None, pair)
 
-    return {"success": True, "pnl": pnl, "entry_price": entry_price, "price": price, "qty": trade_qty}
+    return {
+        "success": True,
+        "pnl": pnl,
+        "entry_price": entry_price,
+        "price": price,
+        "qty": trade_qty,
+        "wallet_info": wallet_info,
+    }

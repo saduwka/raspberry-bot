@@ -34,6 +34,12 @@ ENTRY_COOLDOWN_SECONDS = int(os.getenv("ENTRY_COOLDOWN_SECONDS", "900"))
 MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "0.05")) # 5% от депо
 TRADE_RISK_PER_TRADE_USDT = float(os.getenv("TRADE_RISK_PER_TRADE_USDT", "10.0")) # Риск в долларах на сделку
 
+# Wallet Management
+WALLET_INITIAL_KZT = float(os.getenv("WALLET_INITIAL_KZT", "10000.0"))
+USDT_KZT_RATE = float(os.getenv("USDT_KZT_RATE", "500.0"))
+WALLET_MAX_POSITIONS = int(os.getenv("WALLET_MAX_POSITIONS", "2"))
+WALLET_MIN_ORDER_USDT = float(os.getenv("WALLET_MIN_ORDER_USDT", "5.0"))
+
 GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.2"))
 JOB_MIN_SCORE = int(os.getenv("JOB_MIN_SCORE", "6"))
 JOB_REQUIRE_WORLDWIDE = os.getenv("JOB_REQUIRE_WORLDWIDE", "False").lower() == "true"
