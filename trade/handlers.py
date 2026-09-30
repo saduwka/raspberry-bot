@@ -11,6 +11,16 @@ from trade.wallet import format_wallet_message, get_wallet_summary, reset_wallet
 
 logger = logging.getLogger(__name__)
 
+def _with_trade_engine_cleanup(func):
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        finally:
+            from trade.engine import release_heavy_libs
+            release_heavy_libs()
+    return wrapper
+
+
 def trade_keyboard(pair=None):
     active_pair = pair or TRADE_PAIRS[0]
     keyboard = []
@@ -77,16 +87,15 @@ async def show_trade_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=trade_keyboard(pair))
 
+@_with_trade_engine_cleanup
 async def trade_signal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, pair=None):
     """Показывает текущий технический сигнал и решение локальной модели для конкретной пары."""
     try:
         active_pair = pair or TRADE_PAIRS[0]
-        df = await trade_engine.fetch_ohlcv(active_pair)
-        if df is None or df.empty:
+        analysis = await trade_engine.analyze_pair(active_pair)
+        if not analysis or not analysis.get("last_price"):
             text = f"❌ Не удалось получить рыночные данные для {active_pair}."
         else:
-            df = trade_engine.calc_indicators(df)
-            last = df.iloc[-1]
             technical_signal = await get_trade_state("last_trade_signal", active_pair)
             gemini_action = await get_trade_state("last_gemini_action", active_pair)
             gemini_confidence = await get_trade_state("last_gemini_confidence", active_pair)
@@ -99,10 +108,10 @@ async def trade_signal_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             # Упрощенные названия для индикаторов
             text = (
                 f"🧠 <b>Анализ рынка: {active_pair}</b>\n\n"
-                f"💰 Текущая цена: <code>{float(last['close']):.2f}</code>\n"
-                f"📈 Средняя цена (быстрая): <code>{float(last['ema_fast']):.2f}</code>\n"
-                f"📉 Средняя цена (тренд): <code>{float(last['ema_slow']):.2f}</code>\n"
-                f"🌡 Настроение рынка (RSI): <code>{float(last['rsi']):.1f}</code>\n\n"
+                f"💰 Текущая цена: <code>{float(analysis['last_price']):.2f}</code>\n"
+                f"📈 Средняя цена (быстрая): <code>{float(analysis.get('ema_fast') or 0):.2f}</code>\n"
+                f"📉 Средняя цена (тренд): <code>{float(analysis.get('ema_slow') or 0):.2f}</code>\n"
+                f"🌡 Настроение рынка (RSI): <code>{float(analysis.get('rsi') or 0):.1f}</code>\n\n"
                 f"🤖 <b>Вердикт ИИ: {gemini_action or 'HOLD'}</b>\n"
                 f"🎯 Уверенность: <code>{confidence_text}</code>\n"
                 f"📝 <b>Почему так:</b>\n<i>{html.escape(str(gemini_reason or 'Анализирую данные...'))}</i>"
@@ -124,24 +133,22 @@ async def trade_signal_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             await update.message.reply_text(error_msg)
 
+@_with_trade_engine_cleanup
 async def trade_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, pair=None):
     """Показывает статистику торгов и текущие индикаторы для конкретной пары."""
     try:
         active_pair = pair or TRADE_PAIRS[0]
-        # 1. Получаем индикаторы
-        df = await trade_engine.fetch_ohlcv(active_pair)
+        # 1. Получаем индикаторы (subprocess)
+        analysis = await trade_engine.analyze_pair(active_pair)
         indicators_text = ""
-        if df is not None:
-            df = trade_engine.calc_indicators(df)
-            if df is not None and not df.empty:
-                last = df.iloc[-1]
-                indicators_text = (
-                    f"\n📊 <b>Текущие индикаторы:</b>\n"
-                    f"Цена: <code>{last['close']:.2f}</code>\n"
-                    f"EMA Fast: <code>{last['ema_fast']:.2f}</code>\n"
-                    f"EMA Slow: <code>{last['ema_slow']:.2f}</code>\n"
-                    f"RSI: <code>{last['rsi']:.2f}</code>\n"
-                )
+        if analysis and analysis.get("last_price") is not None:
+            indicators_text = (
+                f"\n📊 <b>Текущие индикаторы:</b>\n"
+                f"Цена: <code>{float(analysis['last_price']):.2f}</code>\n"
+                f"EMA Fast: <code>{float(analysis.get('ema_fast') or 0):.2f}</code>\n"
+                f"EMA Slow: <code>{float(analysis.get('ema_slow') or 0):.2f}</code>\n"
+                f"RSI: <code>{float(analysis.get('rsi') or 0):.2f}</code>\n"
+            )
 
         # 2. Получаем статику за 7 и 30 дней
         stats7 = await get_trade_stats(7, active_pair)
@@ -272,14 +279,15 @@ async def trade_policy_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
+@_with_trade_engine_cleanup
 async def trade_wallet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает подробное состояние виртуального кошелька (KZT и USDT)."""
     current_prices = {}
     for p in TRADE_PAIRS:
         try:
-            df = await trade_engine.fetch_ohlcv(p, limit=2)
-            if df is not None and not df.empty:
-                current_prices[p] = float(df.iloc[-1]["close"])
+            analysis = await trade_engine.analyze_pair(p, limit=30)
+            if analysis and analysis.get("last_price") is not None:
+                current_prices[p] = float(analysis["last_price"])
         except Exception as e:
             logger.debug("Failed to fetch price for %s: %s", p, e)
 

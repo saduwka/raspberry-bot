@@ -15,6 +15,27 @@ WALLET_KEY = "virtual_wallet"
 WALLET_PAIR = "WALLET"
 
 
+def format_money(
+    usdt: float,
+    rate: float | None = None,
+    *,
+    signed: bool = False,
+    code: bool = False,
+) -> str:
+    """Формат суммы: «12.34 USDT (6 170 ₸)» или со знаком для PnL."""
+    rate = float(rate if rate is not None else (USDT_KZT_RATE or 500.0))
+    kzt = round(float(usdt) * rate, 0)
+    if signed:
+        usdt_sign = "+" if usdt > 0 else ""
+        kzt_sign = "+" if kzt > 0 else ""
+        text = f"{usdt_sign}{usdt:.2f} USDT ({kzt_sign}{kzt:,.0f} ₸)"
+    else:
+        text = f"{usdt:.2f} USDT ({kzt:,.0f} ₸)"
+    if code:
+        return f"<code>{text}</code>"
+    return text
+
+
 def _round_qty(qty: float, price: float) -> float:
     """Округление объема с учетом стоимости инструмента."""
     if price >= 10000:
@@ -109,7 +130,11 @@ async def can_open_position(pair: str) -> tuple[bool, str]:
 
     cash = float(wallet.get("cash_usdt", 0.0))
     if cash < WALLET_MIN_ORDER_USDT:
-        return False, f"Недостаточно средств: свободно {cash:.2f} USDT (мин. {WALLET_MIN_ORDER_USDT} USDT)"
+        rate = float(wallet.get("usdt_kzt_rate", USDT_KZT_RATE or 500.0))
+        return False, (
+            f"Недостаточно средств: свободно {format_money(cash, rate)} "
+            f"(мин. {format_money(WALLET_MIN_ORDER_USDT, rate)})"
+        )
 
     return True, "OK"
 
@@ -278,8 +303,9 @@ async def get_wallet_summary(current_prices: dict = None) -> dict:
 
 def format_wallet_message(summary: dict) -> str:
     """Форматирует сводку кошелька в красивое HTML-сообщение."""
-    pnl_sign = "+" if summary["total_pnl_usdt"] >= 0 else ""
+    rate = summary["usdt_kzt_rate"]
     pnl_emoji = "🟢" if summary["total_pnl_usdt"] >= 0 else "🔴"
+    pnl_text = format_money(summary["total_pnl_usdt"], rate, signed=True)
 
     pos_lines = []
     if summary["positions"]:
@@ -287,8 +313,9 @@ def format_wallet_message(summary: dict) -> str:
             u_sign = "+" if p["unrealized_pnl"] >= 0 else ""
             pos_lines.append(
                 f"  • <b>{p['pair']}</b>: {p['qty']} (вход: <code>{p['entry_price']}</code>) "
-                f"→ <code>{p['market_usdt']:.2f} USDT</code> "
-                f"({u_sign}{p['unrealized_pnl']:.2f}$ / {u_sign}{p['unrealized_pct']:.1f}%)"
+                f"→ {format_money(p['market_usdt'], rate, code=True)} "
+                f"({format_money(p['unrealized_pnl'], rate, signed=True)} / "
+                f"{u_sign}{p['unrealized_pct']:.1f}%)"
             )
         pos_block = "\n".join(pos_lines)
     else:
@@ -296,19 +323,16 @@ def format_wallet_message(summary: dict) -> str:
 
     return (
         f"💼 <b>Торговый кошелек (PAPER)</b>\n\n"
-        f"💰 <b>Начальный депозит:</b> <code>{summary['initial_kzt']:,.0f} ₸</code> "
-        f"(<code>{summary['initial_usdt']:.2f} USDT</code>)\n"
-        f"💵 <b>Свободно (Cash):</b> <code>{summary['cash_kzt']:,.0f} ₸</code> "
-        f"(<code>{summary['cash_usdt']:.2f} USDT</code>)\n"
-        f"📊 <b>В позициях:</b> <code>{summary['positions_market_usdt'] * summary['usdt_kzt_rate']:,.0f} ₸</code> "
-        f"(<code>{summary['positions_market_usdt']:.2f} USDT</code>)\n"
-        f"📈 <b>Оценка (Equity):</b> <code>{summary['equity_kzt']:,.0f} ₸</code> "
-        f"(<code>{summary['equity_usdt']:.2f} USDT</code>)\n\n"
-        f"{pnl_emoji} <b>Общий PnL:</b> <b>{pnl_sign}{summary['total_pnl_kzt']:,.0f} ₸ "
-        f"({pnl_sign}{summary['total_pnl_usdt']:.2f} USDT / {pnl_sign}{summary['roi_pct']}%)</b>\n"
+        f"💰 <b>Начальный депозит:</b> {format_money(summary['initial_usdt'], rate, code=True)}\n"
+        f"💵 <b>Свободно (Cash):</b> {format_money(summary['cash_usdt'], rate, code=True)}\n"
+        f"📊 <b>В позициях:</b> {format_money(summary['positions_market_usdt'], rate, code=True)}\n"
+        f"📈 <b>Оценка (Equity):</b> {format_money(summary['equity_usdt'], rate, code=True)}\n\n"
+        f"{pnl_emoji} <b>Общий PnL:</b> <b>{pnl_text} / "
+        f"{'+' if summary['total_pnl_usdt'] >= 0 else ''}{summary['roi_pct']}%</b>\n"
         f"🎰 <b>Слоты:</b> <code>{summary['positions_count']} / {summary['max_positions']}</code>\n"
         f"🏆 <b>Сделок закрыто:</b> {summary['total_trades_count']} "
         f"(W: {summary['winning_trades']} / L: {summary['losing_trades']})\n\n"
         f"<b>Открытые позиции:</b>\n{pos_block}\n\n"
-        f"<i>Курс: 1 USDT = {summary['usdt_kzt_rate']:.0f} ₸ | Мин. сделка: {WALLET_MIN_ORDER_USDT} USDT</i>"
+        f"<i>Курс: 1 USDT = {rate:.0f} ₸ | "
+        f"Мин. сделка: {format_money(WALLET_MIN_ORDER_USDT, rate)}</i>"
     )

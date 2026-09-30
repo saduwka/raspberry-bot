@@ -196,8 +196,18 @@ async def analyze_closed_trade(trade_ctx: dict, policy: dict, retries=1) -> dict
     }
 
 
-async def generate_daily_analytics(trades_summary, policy=None, silence_days=None):
+async def generate_daily_analytics(trades_summary, policy=None, silence_days=None, usdt_kzt_rate=None):
     """Генерирует аналитический отчет по итогам торгового дня через локальную модель."""
+    from trade.wallet import format_money
+
+    rate = float(usdt_kzt_rate) if usdt_kzt_rate else None
+    enriched = []
+    for t in trades_summary:
+        item = dict(t)
+        pnl = float(item.get("pnl") or 0.0)
+        item["pnl_display"] = format_money(pnl, rate, signed=True)
+        enriched.append(item)
+
     extra = ""
     if policy is not None:
         extra = (
@@ -207,13 +217,16 @@ async def generate_daily_analytics(trades_summary, policy=None, silence_days=Non
         )
     prompt = f"""Ты — главный аналитик торгового фонда. Подведи итоги торгового дня на основе списка сделок.
 Список сделок за сегодня (JSON):
-{json.dumps(trades_summary, ensure_ascii=False)}
+{json.dumps(enriched, ensure_ascii=False)}
 {extra}
 
 Твоя задача:
 1. Кратко оцени общую эффективность (профит/убыток, винрейт).
 2. Выдели 1-2 ключевых момента (удачные входы или ошибки).
 3. Дай совет на завтра по агрессии.
+
+ВАЖНО: любые денежные суммы пиши ТОЛЬКО в формате из поля pnl_display, например «-0.02 USDT (-10 ₸)».
+Никогда не пиши голый USDT без тенге в скобках.
 
 Стиль: профессиональный, лаконичный, без воды. Используй HTML-теги <b> и <code> для Telegram.
 Никаких приветствий, начни сразу с заголовка <b>📊 Итоги торгового дня</b>."""

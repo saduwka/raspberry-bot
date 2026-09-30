@@ -1,4 +1,6 @@
 import logging
+import ccxt.async_support as ccxt
+import pandas as pd
 from config import (
     BINANCE_API_KEY,
     BINANCE_SECRET,
@@ -12,197 +14,38 @@ from trade.repo import save_trade, set_trade_state, get_trade_state
 
 logger = logging.getLogger(__name__)
 
-def _fetch_ohlcv_worker(symbol, timeframe, limit, api_key, secret, paper_mode):
-    """Child-process worker: ccxt+pandas live only here, then exit frees RAM."""
-    import asyncio
-    import ccxt.async_support as ccxt
-    import pandas as pd
-
-    async def _run():
-        exchange = ccxt.binance({
-            "apiKey": api_key,
-            "secret": secret,
-            "enableRateLimit": True,
-            "timeout": 20000,
-            "options": {"defaultType": "spot"},
-        })
-        try:
-            if paper_mode:
-                exchange.set_sandbox_mode(True)
-            last_err = None
-            for attempt in range(3):
-                try:
-                    ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-                    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-                    return df
-                except Exception as e:
-                    last_err = e
-                    if attempt == 2:
-                        raise
-                    await asyncio.sleep(1)
-            raise last_err
-        finally:
-            await exchange.close()
-
-    return asyncio.run(_run())
-
-
 async def fetch_ohlcv(symbol, timeframe=TRADE_TIMEFRAME, limit=100):
-    """Получает свечи в отдельном процессе, чтобы не держать ccxt/pandas в bot."""
-    import asyncio
-    import multiprocessing as mp
-    from concurrent.futures import ProcessPoolExecutor
-
-    loop = asyncio.get_running_loop()
+    """Получает исторические данные (свечи) с Binance с повторными попытками."""
+    exchange = ccxt.binance({
+        'apiKey': BINANCE_API_KEY,
+        'secret': BINANCE_SECRET,
+        'enableRateLimit': True,
+        'timeout': 20000,
+        'options': {'defaultType': 'spot'}
+    })
+    
     try:
-        ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
-            df = await loop.run_in_executor(
-                pool,
-                _fetch_ohlcv_worker,
-                symbol,
-                timeframe,
-                limit,
-                BINANCE_API_KEY,
-                BINANCE_SECRET,
-                PAPER_MODE,
-            )
-        return df
+        if PAPER_MODE:
+            exchange.set_sandbox_mode(True)
+            
+        for attempt in range(3):
+            try:
+                ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                return df
+            except Exception as e:
+                if attempt == 2:
+                    raise e
+                logger.warning(f"Attempt {attempt+1} failed to fetch OHLCV: {e}")
+                import asyncio
+                await asyncio.sleep(1)
+                
     except Exception as e:
         logger.error(f"Error fetching OHLCV after retries: {e}")
         return None
-
-
-def _analyze_pair_worker(symbol, timeframe, limit, api_key, secret, paper_mode, sentiment, policy):
-    """Fetch + indicators + technical signal entirely in child process."""
-    import asyncio
-    import ccxt.async_support as ccxt
-    import pandas as pd
-    from ta.trend import EMAIndicator, ADXIndicator, SMAIndicator
-    from ta.momentum import RSIIndicator
-    from ta.volatility import AverageTrueRange
-
-    async def _fetch():
-        exchange = ccxt.binance({
-            "apiKey": api_key,
-            "secret": secret,
-            "enableRateLimit": True,
-            "timeout": 20000,
-            "options": {"defaultType": "spot"},
-        })
-        try:
-            if paper_mode:
-                exchange.set_sandbox_mode(True)
-            last_err = None
-            for attempt in range(3):
-                try:
-                    return await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-                except Exception as e:
-                    last_err = e
-                    if attempt == 2:
-                        raise
-                    await asyncio.sleep(1)
-            raise last_err
-        finally:
-            await exchange.close()
-
-    ohlcv = asyncio.run(_fetch())
-    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-
-    df["ema_fast"] = EMAIndicator(close=df["close"], window=5).ema_indicator()
-    df["ema_slow"] = EMAIndicator(close=df["close"], window=13).ema_indicator()
-    df["ema_trend"] = EMAIndicator(close=df["close"], window=50).ema_indicator()
-    df["rsi"] = RSIIndicator(close=df["close"], window=14).rsi()
-    adx_ind = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14)
-    df["adx"] = adx_ind.adx()
-    df["adx_pos"] = adx_ind.adx_pos()
-    df["adx_neg"] = adx_ind.adx_neg()
-    df["atr"] = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=14).average_true_range()
-    df["volume_sma"] = SMAIndicator(close=df["volume"], window=20).sma_indicator()
-
-    # inline get_signal logic (same as get_signal)
-    technical_signal = "HOLD"
-    if df is not None and len(df) >= 20:
-        adx_min = 20.0
-        rsi_buy_max = 60.0
-        require_volume = True
-        if policy:
-            adx_min = float(policy.get("adx_min", adx_min))
-            rsi_buy_max = float(policy.get("rsi_buy_max", rsi_buy_max))
-            require_volume = bool(policy.get("require_volume", True))
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        is_bullish = last["ema_fast"] > last["ema_slow"]
-        is_bearish = last["ema_fast"] < last["ema_slow"]
-        strong_trend = last["adx"] > adx_min
-        bullish_trend = last["adx_pos"] > last["adx_neg"]
-        bearish_trend = last["adx_neg"] > last["adx_pos"]
-        above_trend = last["close"] > last["ema_trend"]
-        below_trend = last["close"] < (last["ema_trend"] * 0.998)
-        high_volume = last["volume"] > last["volume_sma"]
-        volume_ok = high_volume if require_volume else True
-        ema_cross_up = prev["ema_fast"] <= prev["ema_slow"] and is_bullish
-        ema_cross_down = prev["ema_fast"] >= prev["ema_slow"] and is_bearish
-        if above_trend and strong_trend and bullish_trend and sentiment >= -0.1:
-            if (ema_cross_up or (is_bullish and volume_ok)) and last["rsi"] < rsi_buy_max:
-                technical_signal = "BUY"
-        if ema_cross_down or (is_bearish and bearish_trend) or below_trend:
-            if last["rsi"] > 75 or is_bearish:
-                technical_signal = "SELL"
-
-    last = df.iloc[-1]
-
-    def _f(v):
-        try:
-            x = float(v)
-            if x != x:  # NaN
-                return None
-            return x
-        except (TypeError, ValueError):
-            return None
-
-    return {
-        "signal": technical_signal,
-        "last_price": _f(last["close"]),
-        "atr": _f(last["atr"]),
-        "rsi": _f(last["rsi"]),
-        "adx": _f(last["adx"]),
-        "volume": _f(last["volume"]),
-        "ema_fast": _f(last["ema_fast"]),
-        "ema_slow": _f(last["ema_slow"]),
-        "ema_trend": _f(last["ema_trend"]),
-        "rows": len(df),
-    }
-
-
-async def analyze_pair(symbol, sentiment=0, policy=None, timeframe=TRADE_TIMEFRAME, limit=100):
-    """OHLCV + indicators + signal in a child process (parent stays free of pandas/ccxt)."""
-    import asyncio
-    import multiprocessing as mp
-    from concurrent.futures import ProcessPoolExecutor
-
-    loop = asyncio.get_running_loop()
-    try:
-        ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
-            return await loop.run_in_executor(
-                pool,
-                _analyze_pair_worker,
-                symbol,
-                timeframe,
-                limit,
-                BINANCE_API_KEY,
-                BINANCE_SECRET,
-                PAPER_MODE,
-                float(sentiment or 0),
-                policy,
-            )
-    except Exception as e:
-        logger.error("analyze_pair failed for %s: %s", symbol, e)
-        return None
-
+    finally:
+        await exchange.close()
 
 def calc_indicators(df):
     """Рассчитывает EMA, RSI, ADX (сила тренда), ATR (волатильность) и SMA объема."""
@@ -392,13 +235,3 @@ async def execute_trade(signal, price, pair, sentiment_score=0, atr=None, policy
         "qty": trade_qty,
         "wallet_info": wallet_info,
     }
-
-def release_heavy_libs():
-    """Best-effort trim after trade. Cannot unload numpy C-ext mid-process."""
-    import gc
-    gc.collect()
-    try:
-        import ctypes
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass

@@ -35,7 +35,7 @@ from trade.repo import (
     get_trade_state,
     set_trade_state,
 )
-from trade.wallet import can_open_position, get_wallet_summary
+from trade.wallet import can_open_position, format_money, get_wallet_summary
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ async def _notify(bot, text: str):
         logger.error("Failed to send trade message: %s", e)
 
 
-async def trade_job(context: ContextTypes.DEFAULT_TYPE):
+async def _trade_job_impl(context: ContextTypes.DEFAULT_TYPE):
     """Цикл: политика -> снимки всех пар -> один LLM -> caps -> execute."""
     policy = await load_policy()
     last_trade_at = await get_last_trade_at()
@@ -112,20 +112,14 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
 
     for pair in TRADE_PAIRS:
         logger.info("Starting trade cycle for %s...", pair)
-        df = await trade_engine.fetch_ohlcv(pair)
-        if df is None or df.empty:
+        analysis = await trade_engine.analyze_pair(pair, sentiment=avg_sentiment, policy=policy)
+        if not analysis or not analysis.get("last_price"):
             logger.error("Failed to fetch OHLCV data for %s", pair)
             continue
 
-        df = trade_engine.calc_indicators(df)
-        if df is None or df.empty:
-            logger.warning("No data for indicators for %s, skipping", pair)
-            continue
-
-        last_row = df.iloc[-1]
-        last_price = last_row["close"]
-        last_atr = last_row["atr"]
-        last_adx = last_row["adx"]
+        last_price = analysis["last_price"]
+        last_atr = analysis.get("atr")
+        last_adx = analysis.get("adx") or 0.0
 
         current_pos = await get_open_position(pair)
         entry_price = await get_trade_state("entry_price", pair)
@@ -137,7 +131,7 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
                 await set_trade_state("highest_price", highest_price, pair)
 
         risk_exit_reason = None
-        if current_pos == "in_position" and entry_price is not None:
+        if current_pos == "in_position" and entry_price is not None and last_atr is not None:
             try:
                 risk_exit_reason = trade_engine.get_risk_exit_signal(
                     float(last_price),
@@ -149,26 +143,29 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
             except (TypeError, ValueError) as e:
                 logger.warning("Error calculating risk exit for %s: %s", pair, e)
 
-        technical_signal = trade_engine.get_signal(df, sentiment=avg_sentiment, policy=policy)
+        technical_signal = analysis.get("signal") or "HOLD"
         if risk_exit_reason:
             technical_signal = "SELL"
 
         logger.info(
             "[%s] Tech hint: %s | ADX: %.1f | ATR: %.4f | RiskExit: %s | agg=%s",
-            pair, technical_signal, last_adx, last_atr, risk_exit_reason, policy["aggression"],
+            pair, technical_signal, float(last_adx or 0), float(last_atr or 0),
+            risk_exit_reason, policy["aggression"],
         )
 
+        ema_fast = analysis.get("ema_fast") or 0.0
+        ema_slow = analysis.get("ema_slow") or 0.0
         snap = {
             "pair": pair,
             "price": round(float(last_price), 4),
-            "volume": round(float(last_row["volume"]), 2),
-            "ema_fast": round(float(last_row["ema_fast"]), 4),
-            "ema_slow": round(float(last_row["ema_slow"]), 4),
-            "ema_trend": round(float(last_row["ema_trend"]), 4),
-            "rsi": round(float(last_row["rsi"]), 2),
+            "volume": round(float(analysis.get("volume") or 0), 2),
+            "ema_fast": round(float(ema_fast), 4),
+            "ema_slow": round(float(ema_slow), 4),
+            "ema_trend": round(float(analysis.get("ema_trend") or 0), 4),
+            "rsi": round(float(analysis.get("rsi") or 0), 2),
             "adx": round(float(last_adx), 2),
-            "atr": round(float(last_atr), 4),
-            "ema_gap": round(float(last_row["ema_fast"] - last_row["ema_slow"]), 4),
+            "atr": round(float(last_atr or 0), 4),
+            "ema_gap": round(float(ema_fast) - float(ema_slow), 4),
             "technical_signal": technical_signal,
             "position_state": current_pos or "none",
             "entry_price": round(float(entry_price), 4) if entry_price is not None else None,
@@ -304,6 +301,9 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
             exec_qty = trade_result.get("qty", 0)
             total_amount = exec_price * exec_qty
 
+            wallet_sum = await get_wallet_summary({pair: exec_price})
+            rate = wallet_sum["usdt_kzt_rate"]
+
             if signal == "SELL":
                 pnl = trade_result.get("pnl", 0.0)
                 entry_p = trade_result.get("entry_price")
@@ -312,15 +312,14 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
                     plus_minus = "+" if pnl > 0 else ""
                     pnl_text = (
                         f"\nВход: <code>{entry_p:.2f}</code>"
-                        f"\nРезультат: <b>{plus_minus}{pnl:.2f} USDT ({plus_minus}{pnl_pct:.2f}%)</b>"
+                        f"\nРезультат: <b>{format_money(pnl, rate, signed=True)} "
+                        f"({plus_minus}{pnl_pct:.2f}%)</b>"
                     )
                 else:
-                    pnl_text = f"\nРезультат: <b>{pnl:.2f} USDT</b>"
+                    pnl_text = f"\nРезультат: <b>{format_money(pnl, rate, signed=True)}</b>"
 
-            wallet_sum = await get_wallet_summary({pair: exec_price})
             wallet_info_text = (
-                f"\n💼 <b>Кошелек:</b> <code>{wallet_sum['cash_kzt']:,.0f} ₸</code> "
-                f"(<code>{wallet_sum['cash_usdt']:.2f} USDT</code>) свободно | "
+                f"\n💼 <b>Кошелек:</b> {format_money(wallet_sum['cash_usdt'], rate, code=True)} свободно | "
                 f"Слоты: <code>{wallet_sum['positions_count']}/{wallet_sum['max_positions']}</code>"
             )
 
@@ -328,7 +327,7 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE):
                 f"{side_emoji} <b>{side_text}: {pair}</b>\n\n"
                 f"Цена {'входа' if signal == 'BUY' else 'выхода'}: <code>{exec_price}</code>\n"
                 f"Объем: <code>{exec_qty}</code>\n"
-                f"Сумма: <code>{total_amount:.2f} USDT</code>\n"
+                f"Сумма: {format_money(total_amount, rate, code=True)}\n"
                 f"Агрессия: <code>{policy['aggression']}/5</code>\n"
                 f"local/qwen3.5-coder: <code>{ai_decision['action']}</code> ({ai_decision['confidence']:.2f})\n"
                 f"Причина: <code>{html.escape(str(ai_decision['reason']))}</code>{pnl_text}\n"
@@ -370,14 +369,14 @@ async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE,
     rows = await get_daily_trades(24)
     policy_block = format_policy(policy, silence_days)
     wallet_sum = await get_wallet_summary()
-    pnl_sign = "+" if wallet_sum["total_pnl_usdt"] >= 0 else ""
+    rate = wallet_sum["usdt_kzt_rate"]
     wallet_block = (
         f"💼 <b>Кошелек:</b>\n"
-        f"Депозит: <code>{wallet_sum['initial_kzt']:,.0f} ₸</code> ({wallet_sum['initial_usdt']:.2f} USDT)\n"
-        f"Свободно: <code>{wallet_sum['cash_kzt']:,.0f} ₸</code> ({wallet_sum['cash_usdt']:.2f} USDT)\n"
-        f"Оценка (Equity): <code>{wallet_sum['equity_kzt']:,.0f} ₸</code> ({wallet_sum['equity_usdt']:.2f} USDT)\n"
-        f"Общий PnL: <code>{pnl_sign}{wallet_sum['total_pnl_kzt']:,.0f} ₸</code> "
-        f"({pnl_sign}{wallet_sum['total_pnl_usdt']:.2f} USDT / {pnl_sign}{wallet_sum['roi_pct']}%)\n"
+        f"Депозит: {format_money(wallet_sum['initial_usdt'], rate, code=True)}\n"
+        f"Свободно: {format_money(wallet_sum['cash_usdt'], rate, code=True)}\n"
+        f"Оценка (Equity): {format_money(wallet_sum['equity_usdt'], rate, code=True)}\n"
+        f"Общий PnL: <code>{format_money(wallet_sum['total_pnl_usdt'], rate, signed=True)} / "
+        f"{'+' if wallet_sum['total_pnl_usdt'] >= 0 else ''}{wallet_sum['roi_pct']}%</code>\n"
         f"Слоты: <code>{wallet_sum['positions_count']}/{wallet_sum['max_positions']}</code>\n"
     )
 
@@ -385,7 +384,7 @@ async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE,
         logger.info("No trades today, sending empty status report.")
         header = (
             f"💰 <b>Статистика за 24ч:</b>\n"
-            f"PnL: <code>0.00 USDT</code>\n"
+            f"PnL: {format_money(0.0, rate, code=True)}\n"
             f"Сделок: <code>0</code>\n"
             f"Статус: <i>Активен, сделок не было.</i>\n\n"
             f"{wallet_block}\n"
@@ -418,15 +417,25 @@ async def send_daily_trade_analytics(update: Update | ContextTypes.DEFAULT_TYPE,
         })
 
     winrate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-    ai_report = await generate_daily_analytics(trades_summary, policy=policy, silence_days=silence_days)
+    ai_report = await generate_daily_analytics(
+        trades_summary, policy=policy, silence_days=silence_days, usdt_kzt_rate=rate
+    )
     ai_report = ensure_valid_html(ai_report)
 
     header = (
         f"💰 <b>Статистика за 24ч:</b>\n"
-        f"PnL: <code>{total_pnl:.2f} USDT</code>\n"
+        f"PnL: <code>{format_money(total_pnl, rate, signed=True)}</code>\n"
         f"Сделок: <code>{len(trades_summary)}</code> (W:{wins} / L:{losses})\n"
         f"Winrate: <code>{winrate:.1f}%</code>\n\n"
         f"{wallet_block}\n"
         f"{policy_block}\n\n"
     )
     await _notify(context.bot, header + ai_report)
+
+
+async def trade_job(context: ContextTypes.DEFAULT_TYPE):
+    from trade.engine import release_heavy_libs
+    try:
+        return await _trade_job_impl(context)
+    finally:
+        release_heavy_libs()

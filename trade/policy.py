@@ -2,7 +2,9 @@ import html
 import logging
 from datetime import datetime, timedelta, timezone
 
+from config import USDT_KZT_RATE
 from trade.repo import get_trade_state, set_trade_state
+from trade.wallet import format_money
 
 logger = logging.getLogger(__name__)
 
@@ -163,13 +165,14 @@ async def review_closed_trade(policy: dict, trade_ctx: dict) -> tuple[dict, str 
 
     pnl = float(trade_ctx.get("pnl") or 0.0)
     pair = str(trade_ctx.get("pair") or "?")
+    rate = USDT_KZT_RATE or 500.0
     review = await analyze_closed_trade(trade_ctx, policy)
-    lesson = review.get("lesson") or f"Закрытие {pair}: pnl={pnl:.2f} USDT"
+    lesson = review.get("lesson") or f"Закрытие {pair}: pnl={format_money(pnl, rate)}"
     await append_trade_lesson(pair, pnl, lesson)
 
     notify_parts = [
         f"🧠 <b>Разбор сделки: {html.escape(pair)}</b>\n"
-        f"PnL: <code>{'+' if pnl > 0 else ''}{pnl:.2f} USDT</code>\n"
+        f"PnL: <code>{format_money(pnl, rate, signed=True)}</code>\n"
         f"<i>{html.escape(lesson)}</i>"
     ]
 
@@ -184,7 +187,7 @@ async def review_closed_trade(policy: dict, trade_ctx: dict) -> tuple[dict, str 
         for key in ("last_silence_notice_at", "boot_notified"):
             merged[key] = policy.get(key)
         merged["last_patch_at"] = datetime.now(timezone.utc).isoformat()
-        merged["last_patch_why"] = f"убыток {pnl:.2f} USDT по {pair}, LLM без патча"
+        merged["last_patch_why"] = f"убыток {format_money(pnl, rate)} по {pair}, LLM без патча"
         before = dict(policy)
         policy = await save_policy(merged)
         changed = _policy_delta(before, policy)
@@ -262,6 +265,8 @@ def silence_days_from(last_trade_at) -> float | None:
 def format_policy(policy: dict, silence_days: float | None = None) -> str:
     silence = f"{silence_days:.0f} дн." if silence_days is not None else "нет сделок в БД"
     why = html.escape(str(policy.get("last_patch_why") or "—"))
+    rate = USDT_KZT_RATE or 500.0
+    risk = float(policy.get("risk_usdt") or 0.0)
     return (
         f"⚙️ <b>Политика ИИ-трейдера</b>\n\n"
         f"Агрессия: <code>{policy['aggression']}/5</code>\n"
@@ -269,7 +274,7 @@ def format_policy(policy: dict, silence_days: float | None = None) -> str:
         f"RSI buy max: <code>{policy['rsi_buy_max']}</code>\n"
         f"Min confidence: <code>{policy['min_confidence']}</code>\n"
         f"Объём обязателен: <code>{'да' if policy['require_volume'] else 'нет'}</code>\n"
-        f"Риск/сделка: <code>{policy['risk_usdt']} USDT</code>\n"
+        f"Риск/сделка: <code>{format_money(risk, rate)}</code>\n"
         f"ATR stop/tp: <code>{policy['atr_stop']}</code> / <code>{policy['atr_tp']}</code>\n"
         f"Макс. BUY/день: <code>{policy['max_daily_buys']}</code>\n"
         f"Тишина: <code>{silence}</code>\n"
