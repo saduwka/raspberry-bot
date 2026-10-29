@@ -49,6 +49,8 @@ def _setup_logging():
     console_handler.setFormatter(log_formatter)
     console_handler.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
+    for noisy in ("httpx", "httpcore", "apscheduler.executors.default"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 @admin_only
