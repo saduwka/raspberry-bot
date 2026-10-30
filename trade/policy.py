@@ -10,34 +10,48 @@ logger = logging.getLogger(__name__)
 
 POLICY_KEY = "trader_policy"
 LESSONS_KEY = "trader_lessons"
+POLICY_VERSION = 2
 LESSONS_MAX = 10
-PATCH_COOLDOWN = timedelta(hours=6)
-SILENCE_NOTICE_COOLDOWN = timedelta(days=1)
-BOOT_SILENCE_DAYS = 14
-ESCALATE_SILENCE_DAYS = 7
+PATCH_COOLDOWN = timedelta(hours=12)
+SILENCE_NOTICE_COOLDOWN = timedelta(days=2)
+ESCALATE_SILENCE_DAYS = 14
+ESCALATE_MAX_AGGRESSION = 3
 
+# Агрессия меняет только частоту входов и строгость фильтра модели.
+# Стоп/трейлинг закреплены значениями, проверенными бэктестом.
 PRESETS = {
-    1: {"adx_min": 25, "rsi_buy_max": 55, "min_confidence": 0.70, "require_volume": True},
-    2: {"adx_min": 20, "rsi_buy_max": 60, "min_confidence": 0.60, "require_volume": True},
-    3: {"adx_min": 16, "rsi_buy_max": 65, "min_confidence": 0.50, "require_volume": True},
-    4: {"adx_min": 12, "rsi_buy_max": 70, "min_confidence": 0.45, "require_volume": False},
-    5: {"adx_min": 10, "rsi_buy_max": 75, "min_confidence": 0.40, "require_volume": False},
+    1: {"breakout_bars": 30, "min_confidence": 0.70, "max_daily_buys": 2},
+    2: {"breakout_bars": 20, "min_confidence": 0.60, "max_daily_buys": 3},
+    3: {"breakout_bars": 20, "min_confidence": 0.50, "max_daily_buys": 4},
+    4: {"breakout_bars": 15, "min_confidence": 0.45, "max_daily_buys": 5},
+    5: {"breakout_bars": 15, "min_confidence": 0.40, "max_daily_buys": 6},
 }
 
 _DEFAULTS = {
+    "version": POLICY_VERSION,
     "aggression": 2,
-    "adx_min": 20,
-    "rsi_buy_max": 60,
-    "require_volume": True,
+    "breakout_bars": 20,
     "min_confidence": 0.60,
-    "risk_usdt": 10.0,
+    "min_atr_pct": 0.3,
+    "risk_pct": 1.0,
     "atr_stop": 2.0,
-    "atr_tp": 4.0,
-    "max_daily_buys": 5,
+    "atr_trail": 3.0,
+    "max_daily_buys": 3,
     "last_patch_at": None,
     "last_patch_why": None,
     "last_silence_notice_at": None,
-    "boot_notified": False,
+}
+
+_META_KEYS = ("last_patch_at", "last_patch_why", "last_silence_notice_at")
+PATCHABLE = ("breakout_bars", "min_confidence", "risk_pct", "max_daily_buys", "min_atr_pct")
+_RANGES = {
+    "breakout_bars": (int, 15, 40),
+    "min_confidence": (float, 0.35, 0.80),
+    "min_atr_pct": (float, 0.15, 1.0),
+    "risk_pct": (float, 0.25, 2.0),
+    "atr_stop": (float, 1.5, 3.0),
+    "atr_trail": (float, 2.5, 4.0),
+    "max_daily_buys": (int, 1, 6),
 }
 
 
@@ -51,35 +65,26 @@ def apply_aggression(level: int) -> dict:
 
 def clamp_policy(raw: dict | None) -> dict:
     incoming = raw if isinstance(raw, dict) else {}
-    aggression = _clamp_int(incoming.get("aggression", _DEFAULTS["aggression"]), 1, 5, 2)
-    policy = apply_aggression(aggression)
-
-    if "adx_min" in incoming:
-        policy["adx_min"] = _clamp_float(incoming.get("adx_min"), 10, 25, policy["adx_min"])
-    if "rsi_buy_max" in incoming:
-        policy["rsi_buy_max"] = _clamp_float(incoming.get("rsi_buy_max"), 55, 75, policy["rsi_buy_max"])
-    if "min_confidence" in incoming:
-        policy["min_confidence"] = _clamp_float(incoming.get("min_confidence"), 0.35, 0.75, policy["min_confidence"])
-    if "require_volume" in incoming:
-        policy["require_volume"] = _as_bool(incoming.get("require_volume"), policy["require_volume"])
-    if "risk_usdt" in incoming:
-        policy["risk_usdt"] = _clamp_float(incoming.get("risk_usdt"), 5, 20, 10)
-    if "atr_stop" in incoming:
-        policy["atr_stop"] = _clamp_float(incoming.get("atr_stop"), 1.2, 3.0, 2.0)
-    if "atr_tp" in incoming:
-        policy["atr_tp"] = _clamp_float(incoming.get("atr_tp"), 2.0, 5.0, 4.0)
-    if "max_daily_buys" in incoming:
-        policy["max_daily_buys"] = _clamp_int(incoming.get("max_daily_buys"), 2, 8, 5)
-    policy["last_patch_at"] = incoming.get("last_patch_at")
-    policy["last_patch_why"] = incoming.get("last_patch_why")
-    policy["last_silence_notice_at"] = incoming.get("last_silence_notice_at")
-    policy["boot_notified"] = bool(incoming.get("boot_notified", False))
+    if incoming.get("version") != POLICY_VERSION:
+        incoming = {k: incoming.get(k) for k in _META_KEYS if incoming.get(k)}
+    policy = apply_aggression(_clamp_int(incoming.get("aggression", _DEFAULTS["aggression"]), 1, 5, 2))
+    for key, (typ, lo, hi) in _RANGES.items():
+        if key in incoming and incoming[key] is not None:
+            policy[key] = (_clamp_int if typ is int else _clamp_float)(incoming[key], lo, hi, policy[key])
+    for key in _META_KEYS:
+        policy[key] = incoming.get(key)
+    policy["version"] = POLICY_VERSION
     return policy
 
 
 async def load_policy() -> dict:
     stored = await get_trade_state(POLICY_KEY, "GLOBAL")
-    return clamp_policy(stored if isinstance(stored, dict) else None)
+    policy = clamp_policy(stored if isinstance(stored, dict) else None)
+    if not isinstance(stored, dict) or stored.get("version") != POLICY_VERSION:
+        policy["last_patch_why"] = "миграция на стратегию v2 (пробой 1h + тренд 4h)"
+        policy["last_patch_at"] = datetime.now(timezone.utc).isoformat()
+        await set_trade_state(POLICY_KEY, policy, "GLOBAL")
+    return policy
 
 
 async def save_policy(policy: dict) -> dict:
@@ -90,15 +95,30 @@ async def save_policy(policy: dict) -> dict:
 
 def policy_can_patch(policy: dict) -> bool:
     last = _parse_ts(policy.get("last_patch_at"))
-    if last is None:
-        return True
-    return datetime.now(timezone.utc) - last >= PATCH_COOLDOWN
+    return last is None or datetime.now(timezone.utc) - last >= PATCH_COOLDOWN
 
 
-async def apply_policy_patch(
-    policy: dict, patch: dict | None, force: bool = False,
-) -> tuple[dict, str | None]:
-    """Merge AI patch. Returns (policy, notify_text_or_none)."""
+async def set_aggression(policy: dict, level: int, why: str) -> tuple[dict, str | None]:
+    before = dict(policy)
+    merged = apply_aggression(level)
+    for key in ("risk_pct", "min_atr_pct"):
+        merged[key] = policy.get(key, merged[key])
+    merged["last_silence_notice_at"] = policy.get("last_silence_notice_at")
+    merged["last_patch_at"] = datetime.now(timezone.utc).isoformat()
+    merged["last_patch_why"] = why
+    saved = await save_policy(merged)
+    changed = _policy_delta(before, saved)
+    if not changed:
+        return saved, None
+    return saved, (
+        f"⚙️ <b>Политика трейдера обновлена</b>\n"
+        f"Агрессия: <code>{saved['aggression']}/5</code>\n{changed}\n"
+        f"Почему: <i>{html.escape(why)}</i>"
+    )
+
+
+async def apply_policy_patch(policy: dict, patch: dict | None, force: bool = False) -> tuple[dict, str | None]:
+    """Патч от модели: только мягкие параметры, не чаще раза в 12 часов, агрессия ±1 и не выше 3."""
     if not isinstance(patch, dict):
         return policy, None
     if not force and not policy_can_patch(policy):
@@ -107,42 +127,39 @@ async def apply_policy_patch(
 
     before = dict(policy)
     merged = dict(policy)
-    if "aggression" in patch and patch["aggression"] is not None:
-        merged = apply_aggression(patch["aggression"])
-        for key in ("last_patch_at", "last_patch_why", "last_silence_notice_at", "boot_notified"):
-            merged[key] = policy.get(key)
-        for key in ("adx_min", "rsi_buy_max", "min_confidence", "require_volume",
-                    "risk_usdt", "atr_stop", "atr_tp", "max_daily_buys"):
-            if key in patch and patch[key] is not None:
-                merged[key] = patch[key]
-    else:
-        for key in ("adx_min", "rsi_buy_max", "min_confidence", "require_volume",
-                    "risk_usdt", "atr_stop", "atr_tp", "max_daily_buys"):
-            if key in patch and patch[key] is not None:
-                merged[key] = patch[key]
+    if patch.get("aggression") is not None:
+        try:
+            cur = int(policy.get("aggression", 2))
+            want = int(patch["aggression"])
+            want = max(cur - 1, min(cur + 1, want))
+            want = min(want, max(cur, ESCALATE_MAX_AGGRESSION))
+            if want != cur:
+                merged = apply_aggression(want)
+                for key in ("risk_pct", "min_atr_pct") + _META_KEYS:
+                    merged[key] = policy.get(key, merged.get(key))
+        except (TypeError, ValueError):
+            pass
+    for key in PATCHABLE:
+        if patch.get(key) is not None:
+            merged[key] = patch[key]
 
     why = str(patch.get("why") or "policy_patch").strip().replace("<", "")[:200]
     merged["last_patch_at"] = datetime.now(timezone.utc).isoformat()
     merged["last_patch_why"] = why
     saved = await save_policy(merged)
-
     changed = _policy_delta(before, saved)
     if not changed:
         return saved, None
-    text = (
+    return saved, (
         f"⚙️ <b>Политика трейдера обновлена</b>\n"
-        f"Агрессия: <code>{saved['aggression']}/5</code>\n"
-        f"{changed}\n"
+        f"Агрессия: <code>{saved['aggression']}/5</code>\n{changed}\n"
         f"Почему: <i>{html.escape(why)}</i>"
     )
-    return saved, text
 
 
 async def load_trade_lessons(limit: int = 5) -> list:
     stored = await get_trade_state(LESSONS_KEY, "GLOBAL")
-    if not isinstance(stored, list):
-        return []
-    return stored[-limit:]
+    return stored[-limit:] if isinstance(stored, list) else []
 
 
 async def append_trade_lesson(pair: str, pnl: float, lesson: str) -> list:
@@ -160,7 +177,11 @@ async def append_trade_lesson(pair: str, pnl: float, lesson: str) -> list:
 
 
 async def review_closed_trade(policy: dict, trade_ctx: dict) -> tuple[dict, str | None]:
-    """LLM-разбор закрытой сделки: урок в память + optional policy_patch."""
+    """Разбор закрытой сделки моделью: урок в память, патч — только с кулдауном.
+
+    Одиночный убыток — норма для трендовой стратегии (винрейт ~30%), поэтому
+    агрессия автоматически после каждого лосса больше не снижается.
+    """
     from ai.trading import analyze_closed_trade
 
     pnl = float(trade_ctx.get("pnl") or 0.0)
@@ -170,84 +191,31 @@ async def review_closed_trade(policy: dict, trade_ctx: dict) -> tuple[dict, str 
     lesson = review.get("lesson") or f"Закрытие {pair}: pnl={format_money(pnl, rate)}"
     await append_trade_lesson(pair, pnl, lesson)
 
-    notify_parts = [
+    parts = [
         f"🧠 <b>Разбор сделки: {html.escape(pair)}</b>\n"
         f"PnL: <code>{format_money(pnl, rate, signed=True)}</code>\n"
         f"<i>{html.escape(lesson)}</i>"
     ]
-
-    patch = review.get("policy_patch")
-    if isinstance(patch, dict):
-        policy, patch_msg = await apply_policy_patch(policy, patch, force=True)
-        if patch_msg:
-            notify_parts.append(patch_msg)
-    elif pnl < 0 and int(policy.get("aggression", 2)) > 1:
-        new_level = int(policy.get("aggression", 2)) - 1
-        merged = apply_aggression(new_level)
-        for key in ("last_silence_notice_at", "boot_notified"):
-            merged[key] = policy.get(key)
-        merged["last_patch_at"] = datetime.now(timezone.utc).isoformat()
-        merged["last_patch_why"] = f"убыток {format_money(pnl, rate)} по {pair}, LLM без патча"
-        before = dict(policy)
-        policy = await save_policy(merged)
-        changed = _policy_delta(before, policy)
-        if changed:
-            notify_parts.append(
-                f"⚙️ <b>Политика трейдера обновлена</b>\n"
-                f"Агрессия: <code>{policy['aggression']}/5</code>\n"
-                f"{changed}\n"
-                f"Почему: <i>{html.escape(policy['last_patch_why'])}</i>"
-            )
-
-    return policy, "\n\n".join(notify_parts)
-
-
-async def maybe_boot_silence(policy: dict, silence_days: float | None) -> tuple[dict, str | None]:
-    if policy.get("boot_notified"):
-        return policy, None
-    effective_silence = 999.0 if silence_days is None else silence_days
-    if effective_silence < BOOT_SILENCE_DAYS:
-        policy["boot_notified"] = True
-        return await save_policy(policy), None
-
-    policy = apply_aggression(max(int(policy.get("aggression", 2)), 4))
-    policy["boot_notified"] = True
-    policy["last_patch_at"] = datetime.now(timezone.utc).isoformat()
-    policy["last_patch_why"] = f"тишина {int(effective_silence)} дней при старте"
-    saved = await save_policy(policy)
-    text = (
-        f"⚙️ <b>Тишина {int(effective_silence)} дней</b>\n"
-        f"Агрессия поднята до <code>{saved['aggression']}/5</code>.\n"
-        f"ADX min <code>{saved['adx_min']}</code>, conf <code>{saved['min_confidence']}</code>."
-    )
-    return saved, text
+    policy, patch_msg = await apply_policy_patch(policy, review.get("policy_patch"))
+    if patch_msg:
+        parts.append(patch_msg)
+    return policy, "\n\n".join(parts)
 
 
 async def maybe_escalate_silence(policy: dict, silence_days: float | None) -> tuple[dict, str | None]:
+    """Долгая тишина: +1 к агрессии раз в 2 дня, но не выше 3."""
     if silence_days is None or silence_days < ESCALATE_SILENCE_DAYS:
         return policy, None
-    if int(policy.get("aggression", 2)) >= 5:
+    if int(policy.get("aggression", 2)) >= ESCALATE_MAX_AGGRESSION:
         return policy, None
-
     last_notice = _parse_ts(policy.get("last_silence_notice_at"))
     now = datetime.now(timezone.utc)
     if last_notice and now - last_notice < SILENCE_NOTICE_COOLDOWN:
         return policy, None
-
-    new_level = min(5, int(policy.get("aggression", 2)) + 1)
-    merged = apply_aggression(new_level)
-    for key in ("boot_notified",):
-        merged[key] = policy.get(key)
-    merged["last_patch_at"] = now.isoformat()
-    merged["last_patch_why"] = f"автоэскалация: тишина {int(silence_days)} дней"
-    merged["last_silence_notice_at"] = now.isoformat()
-    saved = await save_policy(merged)
-    text = (
-        f"⚙️ <b>Тишина {int(silence_days)} дней</b>\n"
-        f"Агрессия {policy.get('aggression')} → <code>{saved['aggression']}/5</code>.\n"
-        f"ADX min <code>{saved['adx_min']}</code>, conf <code>{saved['min_confidence']}</code>."
+    policy = dict(policy, last_silence_notice_at=now.isoformat())
+    return await set_aggression(
+        policy, int(policy.get("aggression", 2)) + 1, f"автоэскалация: тишина {int(silence_days)} дней",
     )
-    return saved, text
 
 
 def silence_days_from(last_trade_at) -> float | None:
@@ -265,33 +233,19 @@ def silence_days_from(last_trade_at) -> float | None:
 def format_policy(policy: dict, silence_days: float | None = None) -> str:
     silence = f"{silence_days:.0f} дн." if silence_days is not None else "нет сделок в БД"
     why = html.escape(str(policy.get("last_patch_why") or "—"))
-    rate = USDT_KZT_RATE or 500.0
-    risk = float(policy.get("risk_usdt") or 0.0)
     return (
-        f"⚙️ <b>Политика ИИ-трейдера</b>\n\n"
+        f"⚙️ <b>Политика ИИ-трейдера (v2)</b>\n\n"
+        f"Стратегия: <code>пробой 1h + тренд 4h, ATR-трейлинг</code>\n"
         f"Агрессия: <code>{policy['aggression']}/5</code>\n"
-        f"ADX min: <code>{policy['adx_min']}</code>\n"
-        f"RSI buy max: <code>{policy['rsi_buy_max']}</code>\n"
-        f"Min confidence: <code>{policy['min_confidence']}</code>\n"
-        f"Объём обязателен: <code>{'да' if policy['require_volume'] else 'нет'}</code>\n"
-        f"Риск/сделка: <code>{format_money(risk, rate)}</code>\n"
-        f"ATR stop/tp: <code>{policy['atr_stop']}</code> / <code>{policy['atr_tp']}</code>\n"
+        f"Пробой: <code>{policy['breakout_bars']}</code> свечей 1h\n"
+        f"Min confidence модели: <code>{policy['min_confidence']}</code>\n"
+        f"Мин. волатильность: <code>{policy['min_atr_pct']}%</code>\n"
+        f"Риск/сделка: <code>{policy['risk_pct']}%</code> от капитала\n"
+        f"Стоп / трейлинг: <code>{policy['atr_stop']}</code> / <code>{policy['atr_trail']}</code> ATR\n"
         f"Макс. BUY/день: <code>{policy['max_daily_buys']}</code>\n"
         f"Тишина: <code>{silence}</code>\n"
         f"Последнее изменение: <i>{why}</i>"
     )
-
-
-def _as_bool(val, default=True):
-    if isinstance(val, bool):
-        return val
-    if val is None:
-        return default
-    if isinstance(val, (int, float)):
-        return bool(val)
-    if isinstance(val, str):
-        return val.strip().lower() in {"1", "true", "yes", "da", "да"}
-    return default
 
 
 def _clamp_int(val, lo, hi, default):
@@ -303,7 +257,7 @@ def _clamp_int(val, lo, hi, default):
 
 def _clamp_float(val, lo, hi, default):
     try:
-        return max(lo, min(hi, float(val)))
+        return round(max(lo, min(hi, float(val))), 4)
     except (TypeError, ValueError):
         return default
 
@@ -312,11 +266,8 @@ def _parse_ts(val):
     if not val:
         return None
     try:
-        text = str(val).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+        dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except (TypeError, ValueError):
         return None
 
@@ -324,17 +275,15 @@ def _parse_ts(val):
 def _policy_delta(before: dict, after: dict) -> str:
     labels = {
         "aggression": "агрессия",
-        "adx_min": "ADX min",
-        "rsi_buy_max": "RSI max",
+        "breakout_bars": "пробой, свечей",
         "min_confidence": "confidence",
-        "require_volume": "объём",
-        "risk_usdt": "риск",
+        "min_atr_pct": "мин. ATR%",
+        "risk_pct": "риск %",
         "atr_stop": "ATR stop",
-        "atr_tp": "ATR tp",
+        "atr_trail": "ATR trail",
         "max_daily_buys": "BUY/день",
     }
-    parts = []
-    for key, label in labels.items():
-        if before.get(key) != after.get(key):
-            parts.append(f"{label}: <code>{before.get(key)}</code> → <code>{after.get(key)}</code>")
-    return "\n".join(parts)
+    return "\n".join(
+        f"{label}: <code>{before.get(key)}</code> → <code>{after.get(key)}</code>"
+        for key, label in labels.items() if before.get(key) != after.get(key)
+    )

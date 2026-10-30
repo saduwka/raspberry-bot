@@ -21,38 +21,42 @@ def _normalize_confidence(value) -> float:
         return 0.0
 
 
-async def evaluate_cycle(snapshots, policy, stats, retries=1):
-    """Один вызов модели на все пары: решения + опциональный policy_patch."""
-    logger.info("Trade cycle LLM start pairs=%s aggression=%s",
-                [s.get("pair") for s in snapshots], policy.get("aggression"))
-    prompt = f"""Ты управляешь крипто-ботом. Техсигнал — совет, не вето. Ты решаешь BUY/SELL/HOLD.
-Торгуй внутри лимитов. HOLD только если нет края. Не будь параноиком.
-Если days_silent >= 7 — обязан предложить policy_patch с большей aggression.
+POLICY_KEYS = ("aggression", "breakout_bars", "min_confidence", "min_atr_pct", "risk_pct",
+               "atr_stop", "atr_trail", "max_daily_buys")
 
-Политика сейчас:
-{json.dumps({k: policy.get(k) for k in ("aggression","adx_min","rsi_buy_max","require_volume","min_confidence","risk_usdt","atr_stop","atr_tp","max_daily_buys")}, ensure_ascii=False)}
+
+async def evaluate_cycle(snapshots, policy, stats, retries=1):
+    """Модель — фильтр (вето): подтверждает или отклоняет BUY-кандидатов техстратегии."""
+    logger.info("Trade cycle LLM start candidates=%s aggression=%s",
+                [s.get("pair") for s in snapshots], policy.get("aggression"))
+    prompt = f"""Ты — риск-фильтр крипто-бота (спот, только long). Техстратегия уже дала сигнал BUY:
+пробой максимума последних {policy.get("breakout_bars")} часовых свечей при восходящем тренде 4h.
+Стоп и трейлинг ставятся автоматически, тейка нет — прибыль даёт удержание тренда.
+Винрейт такой стратегии ~30%: одиночные убытки — норма, большие выигрыши их окупают.
+
+Твоя задача: для каждого кандидата ответить BUY (подтвердить) или HOLD (отклонить).
+Отклоняй только при явной причине: RSI > 80 (перегрет), объём заметно ниже среднего на пробое
+(volume_vs_avg < 0.7), цена уже далеко над EMA50 (> 3 ATR), повторение ошибки из recent_lessons.
+Не торгуй пары, которых нет в списке кандидатов.
+
+Политика:
+{json.dumps({k: policy.get(k) for k in POLICY_KEYS}, ensure_ascii=False)}
 
 Статистика:
-{json.dumps(stats, ensure_ascii=False)}
+{json.dumps(stats, ensure_ascii=False, default=str)}
 
-Снимки рынка:
+Кандидаты:
 {json.dumps(snapshots, ensure_ascii=False, default=str)}
 
-Правила:
-- SELL без позиции бессмысленен — ставь HOLD.
-- BUY при уже открытой позиции — HOLD (не удваивать).
-- risk_usdt в 5..20. Стоп нельзя выключить.
-- policy_patch не обязателен, кроме тишины >= 7 дней.
-- Учитывай recent_lessons из статистики (уроки прошлых сделок).
+policy_patch — почти всегда null. Допустимые поля: min_confidence, breakout_bars, max_daily_buys, why.
 
 Верни ТОЛЬКО JSON:
 {{
   "decisions": [
-    {{"pair": "ETH/USDT", "action": "HOLD", "confidence": 0.4, "reason": "...", "risk_usdt": 10}}
+    {{"pair": "ETH/USDT", "action": "BUY", "confidence": 0.7, "reason": "коротко по-русски"}}
   ],
   "policy_patch": null
 }}
-policy_patch пример: {{"aggression": 4, "adx_min": 12, "why": "0 trades in 14d"}}
 """
 
     for attempt in range(retries + 1):
@@ -62,76 +66,45 @@ policy_patch пример: {{"aggression": 4, "adx_min": 12, "why": "0 trades in
                 logger.error("Cycle local attempt %s: %s", attempt + 1, local_llm.last_error)
                 await asyncio.sleep(1)
                 continue
-
             logger.info("Trade cycle %s raw: %s", local_llm.model_label(), text[:400])
             data = extract_json(text)
             if not isinstance(data, dict):
-                logger.info("Trade cycle attempt %s: invalid JSON, retrying...", attempt + 1)
                 await asyncio.sleep(1)
                 continue
-
-            decisions = []
-            raw_list = data.get("decisions")
-            if not isinstance(raw_list, list):
-                raw_list = []
             by_pair = {}
-            for item in raw_list:
+            for item in data.get("decisions") or []:
                 if not isinstance(item, dict):
                     continue
                 pair = str(item.get("pair") or "").strip()
-                if not pair:
-                    continue
-                risk = item.get("risk_usdt", policy.get("risk_usdt", 10))
-                try:
-                    risk = float(risk)
-                except (TypeError, ValueError):
-                    risk = policy.get("risk_usdt", 10)
-                by_pair[pair] = {
-                    "pair": pair,
-                    "action": _normalize_action(item.get("action")),
-                    "confidence": _normalize_confidence(item.get("confidence")),
-                    "reason": str(item.get("reason") or "нет объяснения").strip()[:300],
-                    "risk_usdt": risk,
-                    "provider": local_llm.model_label(),
-                }
-
-            for snap in snapshots:
-                pair = snap["pair"]
-                if pair in by_pair:
-                    decisions.append(by_pair[pair])
-                else:
-                    decisions.append({
+                if pair:
+                    by_pair[pair] = {
                         "pair": pair,
-                        "action": "HOLD",
-                        "confidence": 0.0,
-                        "reason": "модель не вернула решение по паре",
-                        "risk_usdt": policy.get("risk_usdt", 10),
+                        "action": "BUY" if _normalize_action(item.get("action")) == "BUY" else "HOLD",
+                        "confidence": _normalize_confidence(item.get("confidence")),
+                        "reason": str(item.get("reason") or "нет объяснения").strip()[:300],
                         "provider": local_llm.model_label(),
-                    })
-
+                    }
+            decisions = [by_pair.get(s["pair"]) or {
+                "pair": s["pair"], "action": "BUY",
+                "confidence": float(policy.get("min_confidence") or 0.5),
+                "reason": "модель не дала решения по паре, вход по техсигналу",
+                "provider": local_llm.model_label(),
+            } for s in snapshots]
             patch = data.get("policy_patch")
-            if patch is not None and not isinstance(patch, dict):
-                patch = None
-
-            return {"decisions": decisions, "policy_patch": patch, "ok": True}
+            return {"decisions": decisions, "policy_patch": patch if isinstance(patch, dict) else None, "ok": True}
         except Exception as e:
             logger.error("Trade cycle attempt %s: %s", attempt + 1, e)
             await asyncio.sleep(1)
 
-    fallback = []
-    min_conf = float(policy.get("min_confidence") or 0.5)
-    for snap in snapshots:
-        hint = snap.get("technical_signal") or "HOLD"
-        action = hint if hint in {"BUY", "SELL"} else "HOLD"
-        fallback.append({
-            "pair": snap["pair"],
-            "action": action,
-            "confidence": min_conf if action in {"BUY", "SELL"} else 0.0,
-            "reason": f"битый JSON/модель недоступна, tech hint={hint} ({local_llm.last_error or 'нет ответа'})",
-            "risk_usdt": policy.get("risk_usdt", 10),
+    return {
+        "decisions": [{
+            "pair": s["pair"], "action": "BUY", "confidence": float(policy.get("min_confidence") or 0.5),
+            "reason": f"модель недоступна ({local_llm.last_error or 'нет ответа'}), вход по техсигналу",
             "provider": local_llm.model_label(),
-        })
-    return {"decisions": fallback, "policy_patch": None, "ok": False}
+        } for s in snapshots],
+        "policy_patch": None,
+        "ok": False,
+    }
 
 
 async def analyze_closed_trade(trade_ctx: dict, policy: dict, retries=1) -> dict:
@@ -144,20 +117,18 @@ async def analyze_closed_trade(trade_ctx: dict, policy: dict, retries=1) -> dict
 {json.dumps(trade_ctx, ensure_ascii=False, default=str)}
 
 Политика сейчас:
-{json.dumps({k: policy.get(k) for k in ("aggression","adx_min","rsi_buy_max","require_volume","min_confidence","risk_usdt","atr_stop","atr_tp","max_daily_buys")}, ensure_ascii=False)}
+{json.dumps({k: policy.get(k) for k in POLICY_KEYS}, ensure_ascii=False)}
 
-Исход: {outcome} (pnl={pnl}).
+Исход: {outcome} (pnl={pnl}, уже за вычетом комиссий).
+Стратегия: пробой 1h в тренде 4h, выход только по стопу/трейлингу. Винрейт ~30% — это норма.
 
 Правила:
-- lesson: 1-2 предложения по-русски, без символа <.
-- После убытка обычно ужесточи фильтры (ниже aggression / выше adx_min / ниже rsi_buy_max / выше min_confidence). Не поднимай aggression после лосса.
-- После профита обычно policy_patch: null; меняй только при явном перекосе риска.
-- why в патче коротко по-русски, без <.
+- lesson: 1-2 предложения по-русски, без символа <. Что было в рынке и стоит ли что-то фильтровать.
+- policy_patch почти всегда null. Одиночный убыток — НЕ повод менять политику.
+- Допустимые поля патча: min_confidence, breakout_bars, max_daily_buys, why. Не поднимай агрессию после лосса.
 
 Верни ТОЛЬКО JSON:
 {{"lesson": "...", "policy_patch": null}}
-или
-{{"lesson": "...", "policy_patch": {{"aggression": 2, "adx_min": 20, "why": "..."}}}}
 """
 
     for attempt in range(retries + 1):
@@ -213,7 +184,7 @@ async def generate_daily_analytics(trades_summary, policy=None, silence_days=Non
         extra = (
             f"\nПолитика: aggression={policy.get('aggression')}, "
             f"тишина={silence_days if silence_days is not None else 'n/a'} дней.\n"
-            "Если сделок 0 и тишина >= 7 — в конце дай рекомендацию поднять aggression."
+            "Отсутствие сделок во флэте/даунтренде — это норма, не советуй поднимать агрессию только из-за тишины."
         )
     prompt = f"""Ты — главный аналитик торгового фонда. Подведи итоги торгового дня на основе списка сделок.
 Список сделок за сегодня (JSON):
@@ -222,8 +193,8 @@ async def generate_daily_analytics(trades_summary, policy=None, silence_days=Non
 
 Твоя задача:
 1. Кратко оцени общую эффективность (профит/убыток, винрейт).
-2. Выдели 1-2 ключевых момента (удачные входы или ошибки).
-3. Дай совет на завтра по агрессии.
+2. Выдели 1-2 ключевых момента (удачные входы или ошибки, причины выходов, доля комиссий).
+3. Дай короткий вывод на завтра. Помни: стратегия трендовая, винрейт ~30%, отсутствие сделок во флэте — норма.
 
 ВАЖНО: любые денежные суммы пиши ТОЛЬКО в формате из поля pnl_display, например «-0.02 USDT (-10 ₸)».
 Никогда не пиши голый USDT без тенге в скобках.
