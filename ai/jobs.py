@@ -54,11 +54,10 @@ def _scoring_prompt(job_title, company, description, history=None):
 {history_context}
 
 КРИТЕРИИ:
-1. Title ДОЛЖЕН быть developer/engineer/frontend ролью. Sales/Director/Support/Marketing/Community/PM — score 0, core_stack_match=false (даже если React упомянут в описании компании).
-2. Vue 3 / Nuxt 3 + TypeScript remote: 9-10. React + TS remote: 7-8. Generic frontend JS: 5-6.
-3. Backend/DevOps/QA/Mobile/Data — score 0.
-4. Middle/Senior — ок, 4+ года опыта.
-5. Remote Worldwide/CIS/Europe — отлично. On-site only вне Казахстана — score 0.
+1. В TITLE обязательно frontend/front-end/Vue/React/Nuxt/Angular (или fullstack+один из этих маркеров). Иначе score 0, core_stack_match=false.
+2. Node.js-only, backend, DevOps, QA, Mobile, Data, AI Engineer, generic Software Engineer без FE в title — score 0.
+3. Vue 3 / Nuxt 3 + TypeScript remote: 9-10. React + TS remote: 7-8. Generic frontend JS: 5-6.
+4. Middle/Senior — ок. Локацию бот уже проверил (строка «Локация:»), не снижай за неё оценку.
 
 Верни ТОЛЬКО JSON:
 {{
@@ -93,28 +92,31 @@ def _batch_scoring_prompt(jobs, history=None):
             f"Description:\n{job.get('description', '')[:1200]}"
         )
 
-    return f"""Оцени каждую FRONTEND вакансию для кандидата (Vue 3/Nuxt приоритет, React/TS вторично, remote).
-{cv_summary}
+    return f"""Ты оцениваешь вакансии для кандидата. Профиль:
+{cv_summary[:1800]}
 {history_context}
 
-ПРАВИЛА: если title не developer/engineer/frontend (sales, director, support, marketing) — score 0.
-Vue 3/Nuxt+TS remote: 9-10. React+TS remote: 7-8. On-site only вне KZ: 0.
+Все вакансии УЖЕ прошли фильтр ботом: это frontend-роли, формат и локация подходят
+(удалёнка по РФ/СНГ с любым городом работодателя, worldwide или Астана). НЕ снижай оценку за город
+работодателя или страну компании. Твоя задача — оценить совпадение стека и уровня.
+
+ШКАЛА score (0-10):
+- 9-10: Vue 3/Nuxt + TypeScript, Middle/Senior.
+- 7-8: React/Next + TypeScript, Middle/Senior; или Vue без явного TS.
+- 6: frontend без указанного стека (короткое описание) — НЕ отказ, просто нейтрально.
+- 4-5: fullstack, где frontend около половины; Angular; узкая ниша (3D/WebGL, игры, Electron).
+- 2-3: fullstack с бэкенд-доминантой; требуют 8+ лет или Staff/Principal.
+- 0-1: не frontend, Junior/стажировка, явное требование гражданства/резидентства не KZ, офис вне Астаны.
+core_stack_match=true, если в стеке есть Vue, React, Nuxt, Next или TypeScript (или стек не указан).
+verdict — одно короткое предложение по-русски: главный плюс и главный минус.
 
 {chr(10).join(blocks)}
 
-Верни ТОЛЬКО JSON-массив (по одному объекту на JOB index):
+Верни ТОЛЬКО JSON-массив, по одному объекту на каждый JOB index:
 [
-  {{
-    "index": 0,
-    "score": 0,
-    "is_worldwide": true,
-    "core_stack_match": true,
-    "matching_skills": [],
-    "missing_skills": [],
-    "location_reason": "...",
-    "verdict": "...",
-    "has_salary": false
-  }}
+  {{"index": 0, "score": 7, "is_worldwide": true, "core_stack_match": true,
+    "matching_skills": ["React", "TypeScript"], "missing_skills": [],
+    "location_reason": "remote", "verdict": "...", "has_salary": false}}
 ]"""
 
 
@@ -165,12 +167,11 @@ async def process_jobs_scoring_batch(jobs, history=None, use_cache=True):
     scored_slice = [None] * len(jobs_to_score)
     try:
         batch_results = await _score_batch_with_local(jobs_to_score, history)
-        if batch_results and any(r and r.get("score", 0) > 0 for r in batch_results):
+        if batch_results:
+            # Оценка модели (в т.ч. 0 = отказ) имеет приоритет; эвристика — только если модель
+            # пропустила вакансию. Раньше score 0 подменялся эвристикой и мусор проходил фильтр.
             for i, job in enumerate(jobs_to_score):
-                r = batch_results[i] if batch_results[i] else None
-                if not r or r.get("score", 0) <= 0:
-                    r = score_job_rules(job["title"], job["company"], job.get("description", ""))
-                scored_slice[i] = r
+                scored_slice[i] = batch_results[i]
     except Exception as e:
         logger.error("Batch scoring error: %s", e)
 

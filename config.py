@@ -54,6 +54,26 @@ JOB_AI_SCORE_LIMIT = int(os.getenv("JOB_AI_SCORE_LIMIT", "50"))
 JOB_AI_BATCH_SIZE = int(os.getenv("JOB_AI_BATCH_SIZE", "8"))
 JOB_RAW_QUEUE_LIMIT = int(os.getenv("JOB_RAW_QUEUE_LIMIT", "200"))
 JOB_SCORING_PROVIDER = os.getenv("JOB_SCORING_PROVIDER", "local").lower()
+
+# --- Jobs v2 ---
+def _csv(name, default):
+    return [x.strip() for x in os.getenv(name, default).split(",") if x.strip()]
+
+# Поисковые запросы по названию вакансии (hh, Хабр)
+JOB_QUERIES = _csv("JOB_QUERIES", "vue,frontend,react,фронтенд")
+# hh.ru закрыл анонимный API (403). С токеном приложения dev.hh.ru идём в API, без него — в веб-поиск.
+HH_ACCESS_TOKEN = os.getenv("HH_ACCESS_TOKEN", "").strip()
+HH_HOST = os.getenv("HH_HOST", "hh.kz").strip()
+# Доски ATS: ashby:<slug>, gh:<slug>, lever:<slug>
+JOB_ATS_BOARDS = _csv("JOB_ATS_BOARDS", ",".join([
+    "ashby:skelar", "ashby:ruby-labs", "ashby:kestra", "ashby:sensor-tower", "ashby:dressly",
+    "ashby:thirstysprout", "ashby:weave", "ashby:reo-dev", "ashby:oneleet", "ashby:onhires",
+    "ashby:n8n", "ashby:linear", "ashby:supabase", "ashby:posthog", "ashby:deel", "ashby:doist",
+    "gh:gitlab", "gh:remotecom", "gh:trivelta", "gh:vercel", "gh:canonical",
+    "lever:sporty", "lever:gohighlevel", "lever:allata",
+]))
+# Сканер карьерных страниц через Playwright: тяжёлый для Pi и почти не даёт релевантного.
+JOB_CAREER_PAGES = os.getenv("JOB_CAREER_PAGES", "False").lower() == "true"
 GEMINI_JOB_MODEL = os.getenv("GEMINI_JOB_MODEL", "gemini-2.0-flash-lite")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -69,6 +89,14 @@ YANDEX_MUSIC_TOKEN = os.getenv("YANDEX_MUSIC_TOKEN")
 YANDEX_MUSIC_WAVE_STATION = os.getenv("YANDEX_MUSIC_WAVE_STATION", "user:onyourwave")
 
 DB_PATH = "bot.db"
+
+# Google Sheets sync for job vacancies (optional; soft-disabled if unset)
+GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", "").strip()
+GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv(
+    "GOOGLE_SERVICE_ACCOUNT_FILE", "/root/bot/secrets/google-sa.json"
+).strip()
+GOOGLE_SHEETS_WORKSHEET = os.getenv("GOOGLE_SHEETS_WORKSHEET", "Vacancies").strip() or "Vacancies"
+
 
 GAMING_KEYWORDS = [
     "game", "gaming", "gamer", "games", "игра", "игры", "игровой", "геймер", "геймплей",
@@ -115,3 +143,10 @@ RSS_FEEDS = [
     "https://www.dualshockers.com/feed/",
     "https://www.digitaltrends.com/gaming/feed/",
 ]
+
+# Home Assistant API for telegram agent tools
+HA_URL = os.getenv("HA_URL", "http://127.0.0.1:8123").strip()
+HA_TOKEN = os.getenv("HA_TOKEN", "").strip()
+HA_USERNAME = os.getenv("HA_USERNAME", "").strip()
+HA_PASSWORD = os.getenv("HA_PASSWORD", "").strip()
+

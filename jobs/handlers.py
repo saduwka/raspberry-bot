@@ -34,11 +34,13 @@ async def _clear_job_list_messages(context, chat_id):
 
 def _format_vacancy_card(v, show_actions=True):
     vid, title, company, url, salary, score, verdict = v[0], v[1], v[2], v[3], v[4], v[6], v[7]
+    location = v[14] if len(v) > 14 and v[14] else ""
     match_emoji = "🟢" if score >= 8 else "🟡" if score >= 6 else "🔴"
     text = (
         f"{match_emoji} <b>{html.escape(title)}</b>\n"
-        f"🏢 {html.escape(company)}\n"
-        f"💰 {html.escape(salary)}\n"
+        f"🏢 {html.escape(company or '—')}\n"
+        + (f"📍 {html.escape(location)}\n" if location else "")
+        + f"💰 {html.escape(salary or 'Не указана')}\n"
         f"📊 Оценка: <b>{score}/10</b>\n\n"
         f"📝 <i>{html.escape(verdict[:500])}</i>\n\n"
         f"🔗 {html.escape(url)}"
@@ -60,7 +62,8 @@ def jobs_keyboard():
         [InlineKeyboardButton("📝 Мои отклики", callback_data="jobs_applied"),
          InlineKeyboardButton("📁 Архив", callback_data="jobs_archive_0")],
         [InlineKeyboardButton("📊 Статистика", callback_data="jobs_stats"),
-         InlineKeyboardButton("🔎 Текущий запрос", callback_data="jobs_query_show")],
+         InlineKeyboardButton("🛰 Источники", callback_data="jobs_sources")],
+        [InlineKeyboardButton("🔎 Текущий запрос", callback_data="jobs_query_show")],
         [InlineKeyboardButton("✏️ Изменить запрос", callback_data="jobs_query_edit"),
          InlineKeyboardButton("🕵️ Найти компании", callback_data="jobs_discovery_edit")],
     ])
@@ -289,20 +292,51 @@ async def dismiss_job_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.edit_text("📁 Вакансия перенесена в архив.")
 
 
+async def jobs_sources_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    last = await get_trade_state("job_sources_last")
+    if not last or not last.get("sources"):
+        await update.effective_message.reply_text("🛰 Источники ещё не запускались. Нажмите 🔄 Обновить.")
+        return
+    try:
+        from datetime import datetime, timedelta, timezone
+        at = datetime.fromisoformat(last["at"]).astimezone(timezone(timedelta(hours=5))).strftime("%d.%m %H:%M")
+    except Exception:
+        at = str(last.get("at"))
+    lines = []
+    for s in last["sources"]:
+        rej = ", ".join(f"{k} {v}" for k, v in (s.get("rejected") or {}).items())
+        status = "⚠️" if s.get("error") else ("✅" if s.get("relevant") else "▫️")
+        line = f"{status} <b>{html.escape(s['name'])}</b>: {s.get('relevant', 0)} из {s.get('found', 0)}"
+        if rej:
+            line += f"\n    <i>отсеяно: {html.escape(rej)}</i>"
+        if s.get("error"):
+            line += f"\n    <code>{html.escape(s['error'][:120])}</code>"
+        lines.append(line)
+    await update.effective_message.reply_text(
+        f"🛰 <b>Источники</b> (последний запуск {at})\n"
+        f"<i>подходящих по роли и локации / всего у источника</i>\n\n" + "\n".join(lines),
+        parse_mode="HTML",
+    )
+
+
 @admin_only
 async def job_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_msg = update.effective_message
     if not context.args:
-        current = await get_trade_state("job_search_query")
-        current = current if current else "Vue TypeScript Frontend (по умолчанию)"
+        from jobs.sources import load_queries
+        current = ", ".join(await load_queries())
         await target_msg.reply_text(
-            f"🔎 <b>Текущий поисковый запрос:</b>\n<code>{html.escape(current)}</code>\n\n"
-            f"Чтобы изменить, напишите: <code>/job_query React Middle/Senior</code>",
+            f"🔎 <b>Запросы по названию вакансии</b> (hh, Хабр):\n<code>{html.escape(current)}</code>\n\n"
+            f"Остальные источники фильтруются по роли автоматически.\n"
+            f"Изменить: <code>/job_query vue, react, frontend</code>\n"
+            f"Сбросить к стандартным: <code>/job_query default</code>",
             parse_mode="HTML",
         )
         return
 
     new_query = _normalize_search_query(" ".join(context.args))
+    if new_query.lower() in ("default", "сброс", "reset"):
+        new_query = ""
     await set_trade_state("job_search_query", new_query)
     await target_msg.reply_text(
         f"✅ <b>Запрос изменен!</b>\nТеперь бот ищет: <code>{html.escape(new_query)}</code>",
@@ -352,6 +386,8 @@ async def process_job_query_step(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     new_query = new_query.strip().strip('"').strip("'")
+    if new_query.lower() in ("default", "сброс", "reset"):
+        new_query = ""
     await set_trade_state("job_search_query", new_query)
     await update.message.reply_text(
         f"✅ <b>Запрос изменен!</b>\nТеперь бот ищет: <code>{html.escape(new_query)}</code>",
@@ -384,6 +420,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
     if data == "jobs_stats":
         await jobs_stats_handler(update, context)
         return True
+    if data == "jobs_sources":
+        await jobs_sources_handler(update, context)
+        return True
     if data == "jobs_archive_0" or data.startswith("jobs_archive_"):
         await list_archive_jobs_handler(update, context)
         return True
@@ -391,7 +430,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, da
         await job_query_handler(update, context)
         return True
     if data == "jobs_query_edit":
-        await query.message.reply_text("Введите новый поисковый запрос (например: React Middle/Senior):")
+        await query.message.reply_text("Введите запросы через запятую (например: vue, react, frontend). "
+                                       "Слово default вернёт стандартные:")
         return JOB_QUERY_INPUT
     if data == "jobs_discovery_edit":
         await query.message.reply_text("Опишите, какие компании искать (например: Финтех компании СНГ похожие на Каспи):")
