@@ -144,6 +144,8 @@ _MIGRATIONS = [
     ("job_vacancies", "applied_at", "applied_at TIMESTAMP"),
     ("job_vacancies", "follow_up_sent", "follow_up_sent INTEGER DEFAULT 0"),
     ("job_vacancies", "description", "description TEXT"),
+    ("job_vacancies", "location", "location TEXT"),
+    ("job_raw", "location", "location TEXT"),
 ]
 
 

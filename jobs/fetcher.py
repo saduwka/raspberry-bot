@@ -586,6 +586,39 @@ async def fetch_hn_jobs():
         return []
 
 async def fetch_all_jobs(progress_callback=None):
+    """Jobs v2: hh, Хабр, getmatch, DOU, Djinni, Remotive, Himalayas, WWR, ATS-доски.
+
+    Возвращает (vacancies, source_stats). Фильтры роли и локации применяются в jobs.sources.
+    """
+    from config import JOB_CAREER_PAGES
+    from jobs.sources import SOURCES, fetch_all_sources
+
+    done = 0
+    total = len(SOURCES) + (1 if JOB_CAREER_PAGES else 0)
+
+    async def _progress(name, relevant):
+        nonlocal done
+        done += 1
+        if progress_callback:
+            await progress_callback(done, total, f"{name}: {relevant}")
+
+    jobs, stats = await fetch_all_sources(_progress)
+    if JOB_CAREER_PAGES:
+        try:
+            extra = await asyncio.wait_for(fetch_career_page_jobs(), timeout=120)
+            for j in extra:
+                j.setdefault("location", "Карьерная страница")
+            jobs += [j for j in extra if passes_title_filter(j.get("title", ""))]
+            stats.append({"name": "Career pages", "found": len(extra), "relevant": len(extra), "error": "",
+                          "seconds": 0, "rejected": {}})
+        except Exception as e:
+            stats.append({"name": "Career pages", "found": 0, "relevant": 0, "error": str(e)[:100],
+                          "seconds": 0, "rejected": {}})
+        await _progress("Career pages", 0)
+    return jobs, stats
+
+
+async def fetch_all_jobs_legacy(progress_callback=None):
     """Агрегатор всех источников с использованием ИИ-расширения запросов (Параллельно)."""
     db_query = await get_trade_state("job_search_query")
     raw_query = (db_query.strip().strip('"').strip("'") if db_query else "Vue 3 Nuxt TypeScript Frontend Remote")

@@ -1,10 +1,12 @@
 import gc
 import html
 import logging
+from datetime import datetime, timezone
 
 from telegram.ext import ContextTypes
 
 from ai.jobs import process_jobs_scoring_batch
+from ai.job_role_filters import passes_title_filter, require_frontend_title
 from config import (
     ADMIN_ID,
     JOB_AI_BATCH_SIZE,
@@ -27,6 +29,8 @@ from jobs.repo import (
     save_job_raw_batch,
     save_vacancies_batch,
 )
+
+from trade.repo import set_trade_state
 
 logger = logging.getLogger(__name__)
 
@@ -75,27 +79,31 @@ def _normalize_search_query(query: str) -> str:
     return query.strip().strip('"').strip("'") if query else query
 
 
-def _format_job_verdict(result, source):
-    loc_prefix = "🌍 Worldwide" if result["is_worldwide"] else "📍 Restricted"
+def _format_job_verdict(result, source, location=""):
+    loc_prefix = f"📍 {location}" if location else ("🌍 Worldwide" if result["is_worldwide"] else "📍 Restricted")
     matching = ", ".join(result.get("matching_skills", [])[:4]) or "не указаны"
     missing = ", ".join(result.get("missing_skills", [])[:4]) or "нет критичных пробелов"
     return (
-        f"[{source}] [{loc_prefix}] {result['location_reason']}. {result['verdict']}. "
+        f"[{source}] [{loc_prefix}] {result['verdict']}. "
         f"Совпадения: {matching}. Пробелы: {missing}."
     )
 
 
-def _job_passes_filters(result):
+def _job_passes_filters(result, title: str = ""):
+    if title and not passes_title_filter(title):
+        return False
     if result["score"] < JOB_MIN_SCORE:
         return False
     if JOB_REQUIRE_WORLDWIDE and not result["is_worldwide"]:
         return False
-    if not result.get("core_stack_match", False):
+    # Title уже прошёл passes_title_filter (frontend-роль); core_stack_match модели учитываем только
+    # для эвристики — модель часто ставит false, когда стек просто не указан.
+    if result.get("scoring_mode") == "rules" and not result.get("core_stack_match", False):
         return False
     return True
 
 
-async def _score_pending_queue(history, status_text="", raw_added=0, fetch_count=0):
+async def _score_pending_queue(history, status_text="", raw_added=0, fetch_count=0, source_stats=None):
     pending_raw = await get_pending_raw_jobs(limit=JOB_AI_SCORE_LIMIT)
     pending_raw = sorted(pending_raw, key=get_vacancy_priority)
     target_vacancies = pending_raw[:JOB_AI_SCORE_LIMIT]
@@ -112,20 +120,22 @@ async def _score_pending_queue(history, status_text="", raw_added=0, fetch_count
                 scored_urls.append(v["url"])
                 mode = result.get("scoring_mode", "unknown")
                 scoring_modes[mode] = scoring_modes.get(mode, 0) + 1
-                if not _job_passes_filters(result):
+                if not _job_passes_filters(result, v.get("title", "")):
                     continue
                 mode_tag = {
                     "groq": "Groq", "gemini": "Gemini",
                     "local": "local/qwen3.5-coder",
                     "rules": "эвристика", "cache": "кеш",
                 }.get(mode, mode)
-                full_verdict = _format_job_verdict(result, f"{v.get('source', 'Unknown')} | {mode_tag}")
+                full_verdict = _format_job_verdict(result, f"{v.get('source', 'Unknown')} | {mode_tag}",
+                                                   v.get("location", ""))
                 passed_vacancies.append((
                     v["title"], v["company"], v["url"], v["salary_raw"],
                     1 if v.get("is_remote", True) else 0,
                     result["score"], full_verdict,
                     1 if result["has_salary"] else 0,
                     v.get("description", ""),
+                    v.get("location", ""),
                 ))
         except Exception as e:
             logger.error(f"Error scoring batch at offset {i}: {e}")
@@ -138,13 +148,26 @@ async def _score_pending_queue(history, status_text="", raw_added=0, fetch_count
 
     stats = await get_job_stats()
     mode_summary = ", ".join(f"{k}: {v}" for k, v in sorted(scoring_modes.items())) or "нет"
+    top = sorted(passed_vacancies, key=lambda x: -x[5])[:5]
+    top_lines = "\n".join(
+        f"• <b>{x[5]}/10</b> <a href=\"{html.escape(x[2])}\">{html.escape(x[0][:70])}</a> — "
+        f"{html.escape((x[1] or '—')[:30])}, <i>{html.escape((x[9] or '')[:40])}</i>"
+        for x in top
+    )
+    src_line = ""
+    if source_stats:
+        src_line = "\n<b>Источники:</b> " + " · ".join(
+            f"{s['name']} {'⚠️' if s.get('error') else ''}{s['relevant']}" for s in source_stats
+        ) + "\n"
     return new_count, (
-        f"💼 <b>Поиск завершен!</b>\n\n"
-        f"✅ Отобрано новых подходящих: <b>{new_count}</b>\n"
-        f"Проверено: {len(target_vacancies)} | В очереди: <b>{stats['raw_pending']}</b>\n"
-        f"Найдено в fetch: {fetch_count} | +в очередь: {raw_added}\n"
+        f"💼 <b>Поиск завершен</b>\n\n"
+        f"✅ Новых подходящих: <b>{new_count}</b>\n"
+        + (f"{top_lines}\n" if top_lines else "")
+        + f"{src_line}"
+        f"Проверено моделью: {len(target_vacancies)} | В очереди: <b>{stats['raw_pending']}</b>\n"
+        f"Новых после фильтров: {fetch_count} | +в очередь: {raw_added}\n"
         f"Скоринг: <code>{mode_summary}</code>\n\n"
-        f"Используйте /jobs или кнопку Список."
+        f"Список: /jobs"
     )
 
 
@@ -170,7 +193,9 @@ async def job_fetch_job(context: ContextTypes.DEFAULT_TYPE, message=None):
                     pass
 
         try:
-            vacancies = await fetch_all_jobs(progress_callback=update_progress if message else None)
+            vacancies, source_stats = await fetch_all_jobs(progress_callback=update_progress if message else None)
+            await set_trade_state("job_sources_last", {
+                "at": datetime.now(timezone.utc).isoformat(), "sources": source_stats})
         except Exception as e:
             logger.exception("Job fetch failed")
             err_msg = f"❌ <b>Ошибка поиска:</b> <code>{html.escape(str(e)[:200])}</code>"
@@ -200,12 +225,14 @@ async def job_fetch_job(context: ContextTypes.DEFAULT_TYPE, message=None):
             history,
             raw_added=raw_added,
             fetch_count=len(unseen_vacancies),
+            source_stats=source_stats,
         )
         
         if message:
-            await message.edit_text(final_msg, parse_mode="HTML")
+            await message.edit_text(final_msg, parse_mode="HTML", disable_web_page_preview=True)
         else:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=final_msg, parse_mode="HTML")
+            await context.bot.send_message(chat_id=ADMIN_ID, text=final_msg, parse_mode="HTML",
+                                           disable_web_page_preview=True)
             
     finally:
         # Обязательно очищаем кеш в памяти и вызываем GC

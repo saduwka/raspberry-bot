@@ -8,6 +8,88 @@ logger = logging.getLogger(__name__)
 _seen_vacancies_cache = None
 
 
+async def _vacancy_row_by_url(url: str):
+    async with connect() as db:
+        async with db.execute(
+            """
+            SELECT id, created_at, title, company, url, salary_raw, is_remote,
+                   score, match_verdict, dismissed, applied_at, location
+            FROM job_vacancies WHERE url = ?
+            """,
+            (url,),
+        ) as cursor:
+            return await cursor.fetchone()
+
+
+async def _vacancy_row_by_id(vacancy_id: int):
+    async with connect() as db:
+        async with db.execute(
+            """
+            SELECT id, created_at, title, company, url, salary_raw, is_remote,
+                   score, match_verdict, dismissed, applied_at, location
+            FROM job_vacancies WHERE id = ?
+            """,
+            (vacancy_id,),
+        ) as cursor:
+            return await cursor.fetchone()
+
+
+def _row_to_vacancy(row, status: str | None = None) -> dict:
+    dismissed = int(row[9] or 0)
+    applied_at = row[10]
+    if status is None:
+        if applied_at:
+            status = "applied"
+        elif dismissed:
+            status = "dismissed"
+        else:
+            status = "new"
+    return {
+        "id": row[0],
+        "created_at": row[1] or "",
+        "title": row[2] or "",
+        "company": row[3] or "",
+        "url": row[4] or "",
+        "salary": row[5] or "",
+        "remote": (row[11] if len(row) > 11 and row[11] else row[6]),
+        "score": row[7],
+        "verdict": row[8] or "",
+        "status": status,
+        "applied_at": applied_at or "",
+    }
+
+
+def _sync_vacancy_dict(vacancy: dict) -> None:
+    """Запись в Google Sheets в фоновом потоке: gspread синхронный, а при 429 ждёт 35 с —
+    event loop бота не блокируем. Порядок сохраняется (один поток-исполнитель)."""
+    try:
+        from jobs import sheets
+
+        if not sheets.is_configured():
+            return
+        _sheets_executor().submit(_safe_upsert, sheets, dict(vacancy))
+    except Exception:
+        logger.exception("sheets upsert ignored")
+
+
+_executor = None
+
+
+def _sheets_executor():
+    global _executor
+    if _executor is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sheets")
+    return _executor
+
+
+def _safe_upsert(sheets, vacancy: dict) -> None:
+    try:
+        sheets.upsert_vacancy(vacancy)
+    except Exception:
+        logger.exception("sheets upsert ignored")
+
+
 async def load_seen_vacancies_cache():
     global _seen_vacancies_cache
     async with connect() as db:
@@ -36,10 +118,13 @@ async def save_vacancy(title, company, url, salary_raw, is_remote, score, verdic
             )
             if _seen_vacancies_cache is not None:
                 _seen_vacancies_cache.add(url)
-            return True
         except Exception as e:
             logger.error("Error saving vacancy: %s", e)
             return False
+    row = await _vacancy_row_by_url(url)
+    if row:
+        _sync_vacancy_dict(_row_to_vacancy(row, status="new"))
+    return True
 
 
 async def save_vacancies_batch(vacancies):
@@ -48,24 +133,31 @@ async def save_vacancies_batch(vacancies):
     normalized = []
     for v in vacancies:
         row = list(v)
+        if len(row) < 10:
+            row.append(None)
         row[2] = normalize_job_url(row[2])
         normalized.append(tuple(row))
     async with connect(commit=True) as db:
         try:
             await db.executemany(
                 """
-                INSERT OR IGNORE INTO job_vacancies (title, company, url, salary_raw, is_remote, score, match_verdict, has_salary, description)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO job_vacancies (title, company, url, salary_raw, is_remote, score, match_verdict, has_salary, description, location)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 normalized,
             )
             if _seen_vacancies_cache is not None:
                 for v in normalized:
                     _seen_vacancies_cache.add(v[2])
-            return True
         except Exception as e:
             logger.error("Error saving vacancies batch: %s", e)
             return False
+
+    for v in normalized:
+        row = await _vacancy_row_by_url(v[2])
+        if row:
+            _sync_vacancy_dict(_row_to_vacancy(row))
+    return True
 
 
 async def get_vacancy_details(vacancy_id):
@@ -165,6 +257,7 @@ async def save_job_raw_batch(jobs):
             1 if j.get("is_remote", True) else 0,
             j.get("source", ""),
             j.get("description", ""),
+            j.get("location", ""),
         ))
     if not rows:
         return 0
@@ -174,8 +267,8 @@ async def save_job_raw_batch(jobs):
         await db.executemany(
             """
             INSERT OR IGNORE INTO job_raw
-            (title, company, url, salary_raw, is_remote, source, description, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+            (title, company, url, salary_raw, is_remote, source, description, location, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
             """,
             rows,
         )
@@ -188,10 +281,10 @@ async def get_pending_raw_jobs(limit=50):
     async with connect() as db:
         async with db.execute(
             """
-            SELECT title, company, url, salary_raw, is_remote, source, description
+            SELECT title, company, url, salary_raw, is_remote, source, description, location
             FROM job_raw
             WHERE status = 'pending'
-            ORDER BY created_at ASC
+            ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
             (limit,),
@@ -201,7 +294,7 @@ async def get_pending_raw_jobs(limit=50):
         {
             "title": r[0], "company": r[1], "url": r[2],
             "salary_raw": r[3], "is_remote": bool(r[4]),
-            "source": r[5], "description": r[6] or "",
+            "source": r[5], "description": r[6] or "", "location": r[7] or "",
         }
         for r in rows
     ]
@@ -278,8 +371,19 @@ async def save_job_score_cache(url, result):
 
 
 async def dismiss_vacancy(vacancy_id):
+    row = await _vacancy_row_by_id(vacancy_id)
     async with connect(commit=True) as db:
         await db.execute("UPDATE job_vacancies SET dismissed = 1 WHERE id = ?", (vacancy_id,))
+    if row and row[4]:
+        try:
+            from jobs import sheets
+
+            if not sheets.update_status(row[4], "dismissed"):
+                updated = await _vacancy_row_by_id(vacancy_id)
+                if updated:
+                    sheets.upsert_vacancy(_row_to_vacancy(updated, status="dismissed"))
+        except Exception:
+            logger.exception("sheets dismiss sync ignored")
 
 
 async def mark_vacancy_applied(vacancy_id):
@@ -292,6 +396,16 @@ async def mark_vacancy_applied(vacancy_id):
             """,
             (vacancy_id,),
         )
+    row = await _vacancy_row_by_id(vacancy_id)
+    if row and row[4]:
+        try:
+            from jobs import sheets
+
+            applied_at = row[10] or ""
+            if not sheets.update_status(row[4], "applied", applied_at=applied_at):
+                sheets.upsert_vacancy(_row_to_vacancy(row, status="applied"))
+        except Exception:
+            logger.exception("sheets apply sync ignored")
 
 
 async def get_pending_follow_ups(days=7):
