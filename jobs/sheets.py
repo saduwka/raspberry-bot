@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import threading
 from pathlib import Path
 from typing import Any
@@ -91,8 +92,18 @@ def _client_worksheet():
     return ws
 
 
+_headers_checked = False
+_next_row: int | None = None
+_cache_at = 0.0
+_CACHE_TTL = 600  # строки могли добавить вручную — перечитываем колонку URL раз в 10 минут
+
+
 def _ensure_headers(ws) -> None:
+    global _headers_checked
+    if _headers_checked:
+        return
     values = ws.row_values(1)
+    _headers_checked = True
     if not values:
         ws.update("A1", [HEADERS], value_input_option="RAW")
         return
@@ -100,8 +111,10 @@ def _ensure_headers(ws) -> None:
 
 
 def _rebuild_url_cache(ws) -> dict[str, int]:
-    global _url_row_cache
+    global _url_row_cache, _next_row, _cache_at
     urls = ws.col_values(URL_COL)
+    _cache_at = time.monotonic()
+    _next_row = len(urls) + 1
     cache: dict[str, int] = {}
     for idx, url in enumerate(urls[1:], start=2):
         if url:
@@ -191,6 +204,17 @@ def ensure_ready() -> bool:
 
 
 def upsert_vacancy(vacancy: dict[str, Any]) -> bool:
+    """Upsert с одним повтором при 429 (лимит Sheets API — 60 чтений/мин)."""
+    for attempt in range(2):
+        ok = _upsert_vacancy(vacancy)
+        if ok is not None:
+            return ok
+        time.sleep(35)
+    return False
+
+
+def _upsert_vacancy(vacancy: dict[str, Any]) -> bool | None:
+    global _next_row
     if not is_configured():
         return False
     url = str(vacancy.get("url") or "").strip()
@@ -200,7 +224,8 @@ def upsert_vacancy(vacancy: dict[str, Any]) -> bool:
         with _lock:
             ws = _client_worksheet()
             _ensure_headers(ws)
-            cache = _url_row_cache if _url_row_cache is not None else _rebuild_url_cache(ws)
+            fresh = _url_row_cache is not None and time.monotonic() - _cache_at < _CACHE_TTL
+            cache = _url_row_cache if fresh else _rebuild_url_cache(ws)
             row_idx = cache.get(url)
             if row_idx:
                 existing = ws.row_values(row_idx)
@@ -214,7 +239,9 @@ def upsert_vacancy(vacancy: dict[str, Any]) -> bool:
                 ws.update(f"A{row_idx}", [values], value_input_option="RAW")
             else:
                 values = _row_values(vacancy)
-                next_row = len(ws.col_values(URL_COL)) + 1
+                if _next_row is None:
+                    _rebuild_url_cache(ws)
+                next_row = _next_row
                 if next_row > ws.row_count:
                     ws.add_rows(next_row - ws.row_count + 50)
                 ws.update(
@@ -223,9 +250,13 @@ def upsert_vacancy(vacancy: dict[str, Any]) -> bool:
                     value_input_option="RAW",
                 )
                 cache[url] = next_row
+                _next_row = next_row + 1
             logger.info("sheets upsert url=%s status=%s", url[:80], values[9])
             return True
-    except Exception:
+    except Exception as e:
+        if "429" in str(e):
+            logger.warning("sheets quota hit, retry later url=%s", url[:80])
+            return None
         logger.exception("sheets upsert failed url=%s", url[:80])
         return False
 
@@ -260,3 +291,4 @@ def reset_client() -> None:
     with _lock:
         _worksheet = None
         _url_row_cache = None
+        globals()["_next_row"] = None

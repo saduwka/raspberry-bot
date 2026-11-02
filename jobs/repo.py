@@ -60,9 +60,31 @@ def _row_to_vacancy(row, status: str | None = None) -> dict:
 
 
 def _sync_vacancy_dict(vacancy: dict) -> None:
+    """Запись в Google Sheets в фоновом потоке: gspread синхронный, а при 429 ждёт 35 с —
+    event loop бота не блокируем. Порядок сохраняется (один поток-исполнитель)."""
     try:
         from jobs import sheets
 
+        if not sheets.is_configured():
+            return
+        _sheets_executor().submit(_safe_upsert, sheets, dict(vacancy))
+    except Exception:
+        logger.exception("sheets upsert ignored")
+
+
+_executor = None
+
+
+def _sheets_executor():
+    global _executor
+    if _executor is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sheets")
+    return _executor
+
+
+def _safe_upsert(sheets, vacancy: dict) -> None:
+    try:
         sheets.upsert_vacancy(vacancy)
     except Exception:
         logger.exception("sheets upsert ignored")

@@ -484,7 +484,14 @@ async def fetch_all_sources(progress_callback=None):
     for kept, st in done:
         stats_all.append(st.as_dict())
         for j in kept:
-            if j["url"] not in seen:
-                seen.add(j["url"])
-                results.append(j)
+            company = re.sub(r"\W+", "", (j.get("company") or "").lower())
+            title = re.sub(r"\W+", "", (j.get("title") or "").lower())
+            if company in ("тест", "test", "na", ""):
+                company = j["url"]  # нет нормальной компании — склеиваем только по URL
+            key = (company, title)
+            if j["url"] in seen or key in seen:
+                continue
+            seen.add(j["url"])
+            seen.add(key)
+            results.append(j)
     return results, stats_all
