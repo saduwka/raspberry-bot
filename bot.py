@@ -32,6 +32,7 @@ from system.backup import backup_db_job
 from system.handlers import process_scroll_text_step, show_system_menu
 from system.handlers import register as register_system
 from system.health import check_health_alert, get_stats
+from trade.handlers import register as register_trade
 from trade.handlers import show_trade_menu
 from trade.jobs import send_daily_trade_analytics, trade_job
 
@@ -48,6 +49,8 @@ def _setup_logging():
     console_handler.setFormatter(log_formatter)
     console_handler.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
+    for noisy in ("httpx", "httpcore", "apscheduler.executors.default"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 @admin_only
@@ -177,6 +180,7 @@ def main():
     register_system(app)
     register_news(app)
     register_jobs(app)
+    register_trade(app)
 
     from jobs.handlers import cover_letter_callback, dismiss_job_callback
 

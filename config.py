@@ -15,7 +15,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 TRADE_PAIRS = [p.strip() for p in os.getenv("TRADE_PAIRS", "BTC/USDT").split(",")]
 PAPER_MODE = os.getenv("PAPER_MODE", "True").lower() == "true"
-TRADE_TIMEFRAME = os.getenv("TRADE_TIMEFRAME", "5m")
+TRADE_TIMEFRAME = os.getenv("TRADE_TIMEFRAME", "1h")
 TRADE_INTERVAL_SECONDS = int(os.getenv("TRADE_INTERVAL_SECONDS", "300"))
 TRADE_QTY = float(os.getenv("TRADE_QTY", "0.001"))  # дефолт, если пара не найдена
 TRADE_QTY_MAP = {}
@@ -30,7 +30,7 @@ TRADE_TAKE_PROFIT_PCT = float(os.getenv("TRADE_TAKE_PROFIT_PCT", "0.03"))
 # Risk Management
 MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "5"))
 MAX_DAILY_LOSS_USDT = float(os.getenv("MAX_DAILY_LOSS_USDT", "100"))
-ENTRY_COOLDOWN_SECONDS = int(os.getenv("ENTRY_COOLDOWN_SECONDS", "900"))
+ENTRY_COOLDOWN_SECONDS = int(os.getenv("ENTRY_COOLDOWN_SECONDS", "3600"))
 MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "0.05")) # 5% от депо
 TRADE_RISK_PER_TRADE_USDT = float(os.getenv("TRADE_RISK_PER_TRADE_USDT", "10.0")) # Риск в долларах на сделку
 
@@ -39,6 +39,13 @@ WALLET_INITIAL_KZT = float(os.getenv("WALLET_INITIAL_KZT", "10000.0"))
 USDT_KZT_RATE = float(os.getenv("USDT_KZT_RATE", "500.0"))
 WALLET_MAX_POSITIONS = int(os.getenv("WALLET_MAX_POSITIONS", "2"))
 WALLET_MIN_ORDER_USDT = float(os.getenv("WALLET_MIN_ORDER_USDT", "5.0"))
+# Trader v2: комиссии/проскальзывание в симуляции, лимиты риска
+TRADE_HTF = os.getenv("TRADE_HTF", "4h")
+TRADE_FEE_PCT = float(os.getenv("TRADE_FEE_PCT", "0.1"))
+TRADE_SLIPPAGE_PCT = float(os.getenv("TRADE_SLIPPAGE_PCT", "0.05"))
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "5"))
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
+LOSS_PAUSE_HOURS = float(os.getenv("LOSS_PAUSE_HOURS", "12"))
 
 GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.2"))
 JOB_MIN_SCORE = int(os.getenv("JOB_MIN_SCORE", "6"))

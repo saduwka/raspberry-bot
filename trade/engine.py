@@ -1,401 +1,118 @@
+"""Движок трейдера v2: реальные свечи Binance + чистые индикаторы, без ccxt/pandas в процессе бота."""
+import gc
 import logging
-from config import (
-    BINANCE_API_KEY,
-    BINANCE_SECRET,
-    PAPER_MODE,
-    TRADE_QTY,
-    TRADE_TIMEFRAME,
-    TRADE_STOP_LOSS_PCT,
-    TRADE_TAKE_PROFIT_PCT,
-)
-from trade.repo import save_trade, set_trade_state, get_trade_state
+
+from config import TRADE_HTF, TRADE_TIMEFRAME
+from trade import strategy as st
+from trade.market import fetch_klines, fetch_price
+from trade.repo import save_trade, set_trade_state, get_trade_state, clear_pair_state
 
 logger = logging.getLogger(__name__)
 
-def _fetch_ohlcv_worker(symbol, timeframe, limit, api_key, secret, paper_mode):
-    """Child-process worker: ccxt+pandas live only here, then exit frees RAM."""
-    import asyncio
-    import ccxt.async_support as ccxt
-    import pandas as pd
 
-    async def _run():
-        exchange = ccxt.binance({
-            "apiKey": api_key,
-            "secret": secret,
-            "enableRateLimit": True,
-            "timeout": 20000,
-            "options": {"defaultType": "spot"},
-        })
-        try:
-            if paper_mode:
-                exchange.set_sandbox_mode(True)
-            last_err = None
-            for attempt in range(3):
-                try:
-                    ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-                    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-                    return df
-                except Exception as e:
-                    last_err = e
-                    if attempt == 2:
-                        raise
-                    await asyncio.sleep(1)
-            raise last_err
-        finally:
-            await exchange.close()
+async def analyze_pair(pair, sentiment=0.0, policy=None, timeframe=TRADE_TIMEFRAME, limit=150):
+    """Анализ по последней закрытой свече. Возвращает снимок, сигнал и чек-лист условий."""
+    from trade.policy import load_policy
 
-    return asyncio.run(_run())
-
-
-async def fetch_ohlcv(symbol, timeframe=TRADE_TIMEFRAME, limit=100):
-    """Получает свечи в отдельном процессе, чтобы не держать ccxt/pandas в bot."""
-    import asyncio
-    import multiprocessing as mp
-    from concurrent.futures import ProcessPoolExecutor
-
-    loop = asyncio.get_running_loop()
-    try:
-        ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
-            df = await loop.run_in_executor(
-                pool,
-                _fetch_ohlcv_worker,
-                symbol,
-                timeframe,
-                limit,
-                BINANCE_API_KEY,
-                BINANCE_SECRET,
-                PAPER_MODE,
-            )
-        return df
-    except Exception as e:
-        logger.error(f"Error fetching OHLCV after retries: {e}")
+    policy = policy or await load_policy()
+    ltf_c = await fetch_klines(pair, timeframe, limit=limit)
+    htf_c = await fetch_klines(pair, TRADE_HTF, limit=120)
+    if not ltf_c or len(ltf_c) < 70 or not htf_c:
+        logger.error("analyze_pair: нет данных для %s", pair)
         return None
-
-
-def _analyze_pair_worker(symbol, timeframe, limit, api_key, secret, paper_mode, sentiment, policy):
-    """Fetch + indicators + technical signal entirely in child process."""
-    import asyncio
-    import ccxt.async_support as ccxt
-    import pandas as pd
-    from ta.trend import EMAIndicator, ADXIndicator, SMAIndicator
-    from ta.momentum import RSIIndicator
-    from ta.volatility import AverageTrueRange
-
-    async def _fetch():
-        exchange = ccxt.binance({
-            "apiKey": api_key,
-            "secret": secret,
-            "enableRateLimit": True,
-            "timeout": 20000,
-            "options": {"defaultType": "spot"},
-        })
-        try:
-            if paper_mode:
-                exchange.set_sandbox_mode(True)
-            last_err = None
-            for attempt in range(3):
-                try:
-                    return await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-                except Exception as e:
-                    last_err = e
-                    if attempt == 2:
-                        raise
-                    await asyncio.sleep(1)
-            raise last_err
-        finally:
-            await exchange.close()
-
-    ohlcv = asyncio.run(_fetch())
-    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-
-    df["ema_fast"] = EMAIndicator(close=df["close"], window=5).ema_indicator()
-    df["ema_slow"] = EMAIndicator(close=df["close"], window=13).ema_indicator()
-    df["ema_trend"] = EMAIndicator(close=df["close"], window=50).ema_indicator()
-    df["rsi"] = RSIIndicator(close=df["close"], window=14).rsi()
-    adx_ind = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14)
-    df["adx"] = adx_ind.adx()
-    df["adx_pos"] = adx_ind.adx_pos()
-    df["adx_neg"] = adx_ind.adx_neg()
-    df["atr"] = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=14).average_true_range()
-    df["volume_sma"] = SMAIndicator(close=df["volume"], window=20).sma_indicator()
-
-    # inline get_signal logic (same as get_signal)
-    technical_signal = "HOLD"
-    if df is not None and len(df) >= 20:
-        adx_min = 20.0
-        rsi_buy_max = 60.0
-        require_volume = True
-        if policy:
-            adx_min = float(policy.get("adx_min", adx_min))
-            rsi_buy_max = float(policy.get("rsi_buy_max", rsi_buy_max))
-            require_volume = bool(policy.get("require_volume", True))
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        is_bullish = last["ema_fast"] > last["ema_slow"]
-        is_bearish = last["ema_fast"] < last["ema_slow"]
-        strong_trend = last["adx"] > adx_min
-        bullish_trend = last["adx_pos"] > last["adx_neg"]
-        bearish_trend = last["adx_neg"] > last["adx_pos"]
-        above_trend = last["close"] > last["ema_trend"]
-        below_trend = last["close"] < (last["ema_trend"] * 0.998)
-        high_volume = last["volume"] > last["volume_sma"]
-        volume_ok = high_volume if require_volume else True
-        ema_cross_up = prev["ema_fast"] <= prev["ema_slow"] and is_bullish
-        ema_cross_down = prev["ema_fast"] >= prev["ema_slow"] and is_bearish
-        if above_trend and strong_trend and bullish_trend and sentiment >= -0.1:
-            if (ema_cross_up or (is_bullish and volume_ok)) and last["rsi"] < rsi_buy_max:
-                technical_signal = "BUY"
-        if ema_cross_down or (is_bearish and bearish_trend) or below_trend:
-            if last["rsi"] > 75 or is_bearish:
-                technical_signal = "SELL"
-
-    last = df.iloc[-1]
-
-    def _f(v):
-        try:
-            x = float(v)
-            if x != x:  # NaN
-                return None
-            return x
-        except (TypeError, ValueError):
-            return None
-
+    ltf = st.compute(ltf_c)
+    htf = st.compute_htf(htf_c)
+    i = len(ltf_c) - 1
+    trend = st.htf_trend_at(htf, len(htf_c) - 1)
+    signal, reasons = st.entry_signal(ltf, i, trend, policy, sentiment)
+    checks = st.entry_checks(ltf, i, trend, policy, sentiment)
+    snap = st.snapshot(pair, ltf, i, trend, policy)
     return {
-        "signal": technical_signal,
-        "last_price": _f(last["close"]),
-        "atr": _f(last["atr"]),
-        "rsi": _f(last["rsi"]),
-        "adx": _f(last["adx"]),
-        "volume": _f(last["volume"]),
-        "ema_fast": _f(last["ema_fast"]),
-        "ema_slow": _f(last["ema_slow"]),
-        "ema_trend": _f(last["ema_trend"]),
-        "rows": len(df),
+        "signal": signal,
+        "reasons": reasons,
+        "checks": checks,
+        "snapshot": snap,
+        "candle_ts": ltf_c[-1]["ts"],
+        "last_price": snap["price"],
+        "atr": snap["atr"],
+        "rsi": snap["rsi"],
+        "adx": snap["adx"],
+        "htf_trend": trend,
+        "rows": len(ltf_c),
     }
 
 
-async def analyze_pair(symbol, sentiment=0, policy=None, timeframe=TRADE_TIMEFRAME, limit=100):
-    """OHLCV + indicators + signal in a child process (parent stays free of pandas/ccxt)."""
-    import asyncio
-    import multiprocessing as mp
-    from concurrent.futures import ProcessPoolExecutor
+async def live_price(pair, fallback=None):
+    price = await fetch_price(pair)
+    return price if price else fallback
 
-    loop = asyncio.get_running_loop()
+
+async def position_state(pair):
+    return {
+        "current": await get_trade_state("current_position", pair),
+        "entry_price": await get_trade_state("entry_price", pair),
+        "qty": await get_trade_state("position_qty", pair),
+        "highest": await get_trade_state("highest_price", pair),
+        "entry_atr": await get_trade_state("entry_atr", pair),
+    }
+
+
+async def open_long(pair, price, atr, policy, sentiment=0.0, reason="BREAKOUT"):
+    from trade.wallet import allocate_buy, calculate_buy_qty, can_open_position
+
+    can_buy, why = await can_open_position(pair)
+    if not can_buy:
+        return {"success": False, "reason": why}
+    stop_price = price - float(atr) * float(policy.get("atr_stop", 2.0))
+    qty, notional, info = await calculate_buy_qty(pair, price, stop_price, float(policy.get("risk_pct", 1.0)))
+    if qty <= 0:
+        return {"success": False, "reason": "Размер ордера ниже минимального порога"}
+    pos = await allocate_buy(pair, price, qty, extra={"entry_atr": float(atr), "stop_initial": stop_price})
+    await save_trade(pair=pair, side="BUY", price=pos["entry_price"], qty=qty, pnl=0.0,
+                     signal=f"V2_{reason}", sentiment=str(sentiment), fee=pos["fee_buy"],
+                     entry_price=pos["entry_price"], reason=reason)
+    await set_trade_state("current_position", "in_position", pair)
+    await set_trade_state("entry_price", pos["entry_price"], pair)
+    await set_trade_state("position_qty", qty, pair)
+    await set_trade_state("highest_price", pos["entry_price"], pair)
+    await set_trade_state("entry_atr", float(atr), pair)
+    return {"success": True, "price": pos["entry_price"], "qty": qty, "notional": notional,
+            "fee": pos["fee_buy"], "stop": stop_price, "sizing": info}
+
+
+async def close_long(pair, price, reason, sentiment=0.0):
+    from trade.wallet import release_sell
+
+    state = await position_state(pair)
     try:
-        ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
-            return await loop.run_in_executor(
-                pool,
-                _analyze_pair_worker,
-                symbol,
-                timeframe,
-                limit,
-                BINANCE_API_KEY,
-                BINANCE_SECRET,
-                PAPER_MODE,
-                float(sentiment or 0),
-                policy,
-            )
-    except Exception as e:
-        logger.error("analyze_pair failed for %s: %s", symbol, e)
-        return None
-
-
-def calc_indicators(df):
-    """Рассчитывает EMA, RSI, ADX (сила тренда), ATR (волатильность) и SMA объема."""
-    if df is None or df.empty:
-        return None
-        
-    from ta.trend import EMAIndicator, ADXIndicator, SMAIndicator
-    from ta.momentum import RSIIndicator
-    from ta.volatility import AverageTrueRange
-    
-    # Трендовые и осцилляторы
-    df['ema_fast'] = EMAIndicator(close=df['close'], window=5).ema_indicator()
-    df['ema_slow'] = EMAIndicator(close=df['close'], window=13).ema_indicator()
-    df['ema_trend'] = EMAIndicator(close=df['close'], window=50).ema_indicator()
-    df['rsi'] = RSIIndicator(close=df['close'], window=14).rsi()
-    
-    # Сила тренда (ADX)
-    adx_ind = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
-    df['adx'] = adx_ind.adx()
-    df['adx_pos'] = adx_ind.adx_pos()
-    df['adx_neg'] = adx_ind.adx_neg()
-    
-    # Волатильность (ATR)
-    df['atr'] = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range()
-    
-    # Объем
-    df['volume_sma'] = SMAIndicator(close=df['volume'], window=20).sma_indicator()
-    
-    return df
-
-def get_signal(df, sentiment=0, policy=None):
-    """Техническая подсказка. Пороги из policy, иначе как раньше (aggression 2)."""
-    if df is None or len(df) < 20:
-        return "HOLD"
-
-    adx_min = 20.0
-    rsi_buy_max = 60.0
-    require_volume = True
-    if policy:
-        adx_min = float(policy.get("adx_min", adx_min))
-        rsi_buy_max = float(policy.get("rsi_buy_max", rsi_buy_max))
-        require_volume = bool(policy.get("require_volume", True))
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    is_bullish = last["ema_fast"] > last["ema_slow"]
-    is_bearish = last["ema_fast"] < last["ema_slow"]
-    strong_trend = last["adx"] > adx_min
-    bullish_trend = last["adx_pos"] > last["adx_neg"]
-    bearish_trend = last["adx_neg"] > last["adx_pos"]
-
-    above_trend = last["close"] > last["ema_trend"]
-    below_trend = last["close"] < (last["ema_trend"] * 0.998)
-
-    high_volume = last["volume"] > last["volume_sma"]
-    volume_ok = high_volume if require_volume else True
-
-    ema_cross_up = prev["ema_fast"] <= prev["ema_slow"] and is_bullish
-    ema_cross_down = prev["ema_fast"] >= prev["ema_slow"] and is_bearish
-
-    if above_trend and strong_trend and bullish_trend and sentiment >= -0.1:
-        if (ema_cross_up or (is_bullish and volume_ok)) and last["rsi"] < rsi_buy_max:
-            return "BUY"
-
-    if ema_cross_down or (is_bearish and bearish_trend) or below_trend:
-        if last["rsi"] > 75 or is_bearish:
-            return "SELL"
-
-    return "HOLD"
-
-
-def get_risk_exit_signal(current_price, entry_price, atr, highest_price=None, policy=None):
-    if entry_price is None or atr is None:
-        return None
-
-    atr_stop = 2.0
-    atr_tp = 4.0
-    if policy:
-        atr_stop = float(policy.get("atr_stop", atr_stop))
-        atr_tp = float(policy.get("atr_tp", atr_tp))
-
-    stop_loss_distance = atr * atr_stop
-    initial_stop_loss = entry_price - stop_loss_distance
-
-    if highest_price is not None:
-        trailing_stop = highest_price - (atr * max(1.2, atr_stop * 0.75))
-        current_stop = max(initial_stop_loss, trailing_stop)
-    else:
-        current_stop = initial_stop_loss
-
-    take_profit_price = entry_price + (atr * atr_tp)
-
-    if current_price <= current_stop:
-        return "TRAILING_STOP" if highest_price and current_stop > initial_stop_loss else "STOP_LOSS_ATR"
-
-    if current_price >= take_profit_price:
-        return "TAKE_PROFIT_ATR"
-
-    return None
+        qty = float(state["qty"]) if state["qty"] is not None else None
+    except (TypeError, ValueError):
+        qty = None
+    result = await release_sell(pair, price, qty)
+    if not result.get("qty"):
+        await clear_pair_state([pair])
+        return {"success": False, "reason": "Позиция не найдена"}
+    await save_trade(pair=pair, side="SELL", price=result["exit_price"], qty=result["qty"], pnl=result["pnl"],
+                     signal=f"V2_{reason}", sentiment=str(sentiment), fee=result["fee_total"],
+                     entry_price=result["entry_price"], reason=reason)
+    await clear_pair_state([pair])
+    await set_trade_state("current_position", "none", pair)
+    return {"success": True, **result}
 
 
 async def execute_trade(signal, price, pair, sentiment_score=0, atr=None, policy=None):
-    """Исполняет сделку строго в рамках виртуального кошелька (10 000 ₸ / 20 USDT)."""
-    if signal == "HOLD":
-        return None
+    """Совместимость со старым API."""
+    from trade.policy import load_policy
 
-    from trade.wallet import (
-        allocate_buy,
-        calculate_buy_qty,
-        can_open_position,
-        release_sell,
-    )
-
-    logger.info("Executing %s for %s at %s (Sentiment: %s)", signal, pair, price, sentiment_score)
-
-    pnl = 0.0
-    entry_price = None
-    wallet_info = None
-
+    policy = policy or await load_policy()
     if signal == "BUY":
-        can_buy, reason = await can_open_position(pair)
-        if not can_buy:
-            logger.warning("BUY rejected by wallet for %s: %s", pair, reason)
-            return {"success": False, "reason": reason}
+        return await open_long(pair, price, atr, policy, sentiment_score)
+    if signal == "SELL":
+        return await close_long(pair, price, "MANUAL", sentiment_score)
+    return None
 
-        qty, cost = await calculate_buy_qty(pair, price)
-        if qty <= 0:
-            logger.warning("BUY rejected for %s: calculated qty is 0 or below minimum order", pair)
-            return {"success": False, "reason": "Размер ордера ниже минимального порога"}
-
-        trade_qty = qty
-        logger.info("Wallet allocated BUY for %s: qty=%s, cost=%s USDT", pair, trade_qty, cost)
-        wallet_info = await allocate_buy(pair, price, trade_qty)
-
-    elif signal == "SELL":
-        stored_qty = await get_trade_state("position_qty", pair)
-        entry_price_raw = await get_trade_state("entry_price", pair)
-        if entry_price_raw is not None:
-            try:
-                entry_price = float(entry_price_raw)
-            except (TypeError, ValueError):
-                entry_price = price
-        else:
-            entry_price = price
-
-        try:
-            trade_qty = float(stored_qty) if stored_qty is not None else 0.0
-        except (TypeError, ValueError):
-            trade_qty = 0.0
-
-        if trade_qty <= 0:
-            logger.warning("SELL received for %s but position_qty is 0 or not found", pair)
-            return {"success": False, "reason": "Позиция не найдена"}
-
-        wallet_info = await release_sell(pair, price, trade_qty)
-        pnl = wallet_info.get("pnl", (price - entry_price) * trade_qty)
-        logger.info("Wallet released SELL for %s: PnL=%s USDT, cash now=%s USDT",
-                    pair, pnl, wallet_info.get("cash_usdt"))
-    else:
-        return None
-
-    await save_trade(
-        pair=pair,
-        side=signal,
-        price=price,
-        qty=trade_qty,
-        pnl=pnl,
-        signal=f"AGGRESSIVE_{signal}",
-        sentiment=str(sentiment_score),
-    )
-
-    if signal == "BUY":
-        await set_trade_state("current_position", "in_position", pair)
-        await set_trade_state("entry_price", price, pair)
-        await set_trade_state("position_qty", trade_qty, pair)
-    else:
-        await set_trade_state("current_position", "none", pair)
-        await set_trade_state("entry_price", None, pair)
-        await set_trade_state("position_qty", None, pair)
-
-    return {
-        "success": True,
-        "pnl": pnl,
-        "entry_price": entry_price,
-        "price": price,
-        "qty": trade_qty,
-        "wallet_info": wallet_info,
-    }
 
 def release_heavy_libs():
-    """Best-effort trim after trade. Cannot unload numpy C-ext mid-process."""
-    import gc
     gc.collect()
     try:
         import ctypes
